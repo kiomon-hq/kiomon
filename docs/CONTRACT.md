@@ -37,6 +37,12 @@ sequences cannot appear even on a terminal.
 `2` and `1` are deliberately distinct. An agent that receives `2` can conclude a
 memory no longer exists; an agent that receives `1` should try again later.
 
+`4` is for a request whose *shape* was valid. Today the only thing that raises it is
+`--legs vector`, because this build has no embedder: the message names what to do
+instead, since an exit code that is a wall is not an answer. `--legs vector` is never
+answered from the lexical leg — the platform learned that the expensive way, and
+returning something other than what was asked for is undetectable by the caller.
+
 > clap's own exit code for a usage error is also `2`. The binary catches parse
 > failures and remaps them to `3` for exactly this reason, and
 > `crates/kiomon-cli/tests/cli.rs` asserts it.
@@ -148,7 +154,7 @@ stored. An unknown `--kind` is rejected with exit `3`.
 
 | Command | Promise |
 |---|---|
-| `search` | Ranked. Reports which retrieval legs ran and, when a leg degraded, says so rather than silently substituting another. Never answers a vector-only request from the lexical leg. |
+| `search` | Ranked. Reports which rung of the ladder answered, which legs ran, and how many rows were counted as retrievals. Never answers a vector-only request from the lexical leg: `--legs vector` with no embedder is exit `4`, not a lexical answer. |
 | `get` | One memory with its body and metadata. A missing id is exit `2`, never an empty success. `--relations` adds one query. |
 | `list` | **Unranked.** Ordered by strength by default, or by recency with `--recent`. `list` is not a search, and the two do not compete. An absent `--status` means `active`, so a bare `list` never mixes the review inbox into a library; `--status any` is how you ask for both. |
 
@@ -157,15 +163,63 @@ ordering, because a pinned memory the user cannot find is a bug report. It does 
 sort first under `--recent`: "newest first" with pinned rows hoisted to the top is not
 newest first. That is a change from what an earlier draft of this document implied.
 
-**The retrieval ladder.** A query is tried three ways and the first attempt with a
-non-empty result wins: the literal phrase, then all terms prefix-matched (`AND`),
-then any term prefix-matched (`OR`). The attempt that answered is reported in
-`--json`, so a caller can tell "nothing matches" from "nothing matches all of it".
+**The retrieval ladder.** A query is tried three ways, in order, and the first attempt
+that returns anything wins:
 
-**Ranking.** Reciprocal rank fusion, `k = 60`, `score = Σ 1/(k + rank)`. Pinned
-memories sort first under every `--sort`. A search records a retrieval against each
-result it returns unless `--no-record` is passed — that counter is what stretches a
-memory's decay clock, so it is mechanism rather than telemetry.
+| Rung | The query becomes |
+|---|---|
+| 1 | `"the whole query"` — the words as a phrase, in order |
+| 2 | `"t1"* AND "t2"* …` — every term, prefix-matched |
+| 3 | `"t1"* OR "t2"* …` — any term, prefix-matched |
+
+Every term is **quoted**, so no input is FTS5 syntax: `NEAR`, `*`, `-`, `(`, `)` and
+`"` in a query are text and not operators. Quoting is also why accents and CJK work —
+the hosted product's equivalent strips everything outside `[A-Za-z0-9_]`, which deletes
+a Japanese query outright and truncates `café` to `caf`.
+
+A query that cannot match — `!!!`, or pure punctuation — is not an error. It returns
+zero results at exit `0`, and `data.attempt` says which of the three facts it was:
+
+```json
+"attempt": {"outcome": "nothing_asked"}
+"attempt": {"outcome": "exhausted", "query": "\"zzz\"* OR \"qqq\"*"}
+"attempt": {"outcome": "matched", "rung": 2, "query": "\"deploy\"* AND \"fail\"*"}
+```
+
+`nothing_asked` is an empty query — no question was sent. `exhausted` is a corpus with
+no answer, and it carries the last and most forgiving expression that was tried, which
+is the diagnostic for "why did that not match". The distinction matters because the two
+call for different next moves.
+
+**Ranking.** Reciprocal rank fusion, `k = 60`, `score = Σ 1/(k + rank + 1)`, the same
+formula the hosted product uses. **`score` is only comparable within one response**: it
+is a function of position and not of similarity, so it is not a threshold, and the same
+memory can score differently in two searches. It is omitted from human output for that
+reason — the position already says it — and present in `--json` for callers that rank
+or deduplicate across a batch.
+
+**The window.** A search fetches the best `3 × limit` matches and cuts the page from
+that window after ordering. Two consequences, both real and both documented rather than
+discovered: a pinned memory ranked just outside the page can be hoisted onto it, and
+`--sort recent` means "the newest of the top `3 × limit` matches", not "the newest
+match in the corpus". `list` has no such rule — it is unranked and reads the corpus.
+
+**Pinning.** A pinned result sorts first under `relevance` and `strength`, and **not**
+under `recent`. "Newest first" with pinned rows hoisted to the top is not newest first.
+This is the same rule `list` follows and for the same reason.
+
+**Recording.** A search counts as a retrieval against every result it returns, unless
+`--no-record` is passed. That counter is not telemetry: `retrieval_count` and
+`last_retrieved_at` are the stretch factor on a memory's decay clock, so a memory that
+keeps being found is a memory that keeps mattering. `--json` reports how many rows moved
+in `data.recorded`, so a caller can tell a search that counted from one that did not.
+
+**Snippets.** A snippet comes from the full-text index, with `**` around the matched
+terms, and is **empty when the match was not in the body** — in the title, the tags or
+the excerpt, all of which are already fields of the row. An empty snippet is honest; a
+body opening that happens to sit under a title match reads as the place it matched.
+`--snippet-len` sets how many full-text tokens of context it carries, and `--full` is
+still what lets a long one through untruncated.
 
 ### Lifecycle
 
@@ -188,23 +242,29 @@ memory's decay clock, so it is mechanism rather than telemetry.
 
 ### A search result
 
+`search` and `list` return the same row; a search result is a list row with `score` and
+`snippet` added, and the two are the same struct so they cannot drift apart.
+
 ```json
 {
   "id": "k_01JC9W5K2Q",
+  "workspace_id": "default",
   "kind": "semantic",
   "kind_label": "Facts",
   "title": "Staging deploys need a manual migration",
   "excerpt": "…",
-  "snippet": "…run **migrations** before the deploy…",
   "tags": ["deploy", "staging"],
-  "source_url": null,
+  "source": "user_saved",
   "source_label": "saved",
+  "source_url": null,
   "confidence": 0.9,
   "strength": 0.84,
   "pinned": false,
   "status": "active",
-  "score": 0.0317,
-  "created_at": "2026-10-14T09:12:00Z"
+  "created_at": "2026-10-14T09:12:00Z",
+
+  "snippet": "Run **migrations** before the deploy; the pipeline does not do it.",
+  "score": 0.016393442
 }
 ```
 
@@ -212,6 +272,37 @@ memory's decay clock, so it is mechanism rather than telemetry.
 carries the writer's estimate of how reliable it is; a hit without one (an imported
 file) makes no such claim. Ranked order is not a statement about truth, and an agent
 should hedge on a low-confidence hit rather than treat it as settled.
+
+A `status` of anything but `active` can only appear on a `list`: a pending or archived
+memory is not in the full-text index at all, and the leg filters for `active` as well,
+so two independent mechanisms have to fail before a draft leaks into a search.
+
+### A search response
+
+`search`'s `data` is an object where `list`'s is an array, because a search has
+something to say about how it answered and a list does not.
+
+```json
+{
+  "ok": true,
+  "data": {
+    "results": [ …search result rows… ],
+    "query": "why did the deploy fail",
+    "attempt": {"outcome": "matched", "rung": 3, "query": "\"why\"* OR \"did\"* OR …"},
+    "requested_legs": "auto",
+    "legs": "fts",
+    "degraded": false,
+    "recorded": 10
+  },
+  "meta": {"contract_version": "1", "version": "0.1.0"}
+}
+```
+
+`requested_legs` and `legs` are both reported so a caller can tell what it asked for
+from what ran. With no embedder configured, `--legs auto` runs the lexical leg — that
+is the documented default and `degraded` stays `false`, because falling back to the only
+leg there is was not a degradation. `degraded` exists for the vector leg's reduced scan
+and is a constant `false` until there is an embedder.
 
 ### A listed memory
 

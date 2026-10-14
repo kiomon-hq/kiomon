@@ -22,7 +22,7 @@ use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use kiomon_core::{MemoryKind, Relation, Status};
+use kiomon_core::{Legs, MemoryKind, Relation, SearchSort, Status};
 
 /// A fast, local memory for your coding agent.
 ///
@@ -373,7 +373,7 @@ pub struct SearchArgs {
     pub workspace: Option<String>,
 
     /// Maximum results, 1–50.
-    #[arg(long, default_value_t = 10, value_name = "N")]
+    #[arg(long, default_value_t = 10, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=50))]
     pub limit: u16,
 
     /// Which retrieval legs to run. `auto` uses the vector leg when an embedder is
@@ -381,12 +381,15 @@ pub struct SearchArgs {
     #[arg(long, value_enum, default_value_t = LegsArg::Auto)]
     pub legs: LegsArg,
 
-    /// Ordering. Pinned memories sort first under every one of these.
+    /// Ordering. Pinned memories sort first under `relevance` and `strength`; `recent`
+    /// is honestly recent, and pinned rows do not jump it.
     #[arg(long, value_enum, default_value_t = SortArg::Relevance)]
     pub sort: SortArg,
 
-    /// Snippet length, in full-text tokens.
-    #[arg(long, default_value_t = 12, value_name = "TOKENS")]
+    /// Snippet length, in full-text tokens. Longer snippets cost nothing extra — the text
+    /// comes from the index — but `--full` is still what lets a long one through
+    /// untruncated, because the display width caps it either way.
+    #[arg(long, default_value_t = kiomon_core::DEFAULT_SNIPPET_TOKENS, value_name = "TOKENS", value_parser = clap::value_parser!(u16).range(1..=64))]
     pub snippet_len: u16,
 
     /// Do not count the retrieval against each result's decay clock.
@@ -652,6 +655,32 @@ pub enum LegsArg {
     Vector,
 }
 
+impl From<LegsArg> for Legs {
+    fn from(arg: LegsArg) -> Self {
+        match arg {
+            LegsArg::Auto => Self::Auto,
+            LegsArg::Fts => Self::Fts,
+            LegsArg::Vector => Self::Vector,
+        }
+    }
+}
+
+impl LegsArg {
+    /// The wire value, as reported in `--json` next to the legs that actually ran.
+    ///
+    /// `--legs auto` resolving to `fts` is the documented default without an embedder,
+    /// not a degradation — and a caller can only tell the two apart if it sees both what
+    /// it asked for and what it got.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fts => "fts",
+            Self::Vector => "vector",
+        }
+    }
+}
+
 /// How to order results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SortArg {
@@ -661,6 +690,16 @@ pub enum SortArg {
     Recent,
     /// Strongest first — the decay clock's opinion.
     Strength,
+}
+
+impl From<SortArg> for SearchSort {
+    fn from(arg: SortArg) -> Self {
+        match arg {
+            SortArg::Relevance => Self::Relevance,
+            SortArg::Recent => Self::Recent,
+            SortArg::Strength => Self::Strength,
+        }
+    }
 }
 
 /// How a task ended, for `outcome`.

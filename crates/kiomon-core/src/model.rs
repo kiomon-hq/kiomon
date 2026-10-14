@@ -781,6 +781,173 @@ pub enum ListSort {
     Recent,
 }
 
+/// Which retrieval legs a search is allowed to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Legs {
+    /// Every leg the build has. Falls back to lexical alone when no embedder is
+    /// configured, which is not a degradation — it is the documented default.
+    #[default]
+    Auto,
+    /// Lexical only. Never touches an embedder, so it is the mode that cannot be slow
+    /// because of the network.
+    Fts,
+    /// Vector only. An error, not a fallback, when there is no embedder: a request for
+    /// one thing is never answered with another.
+    Vector,
+}
+
+/// How search results are ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchSort {
+    /// The fused rank, with pinned memories hoisted. Default.
+    #[default]
+    Relevance,
+    /// Newest first, with no hoisting — the same promise `list --recent` makes and for
+    /// the same reason.
+    Recent,
+    /// Strongest first, with pinned hoisted.
+    Strength,
+}
+
+/// The default number of full-text tokens in a snippet.
+///
+/// Twelve is the platform's number: long enough to show a phrase in context, short
+/// enough that ten results are not a page of prose.
+pub const DEFAULT_SNIPPET_TOKENS: u16 = 12;
+
+/// How much wider than the page a ranked window is fetched.
+///
+/// Three, the platform's number and for the same reason: a row at fused rank 25 can
+/// still reach page one of ten when the page is reordered by strength or by pin, and it
+/// cannot reach a window it was never in. The consequence is documented rather than
+/// hidden — `--sort` cannot see past this window, so `--sort recent` means "the newest
+/// of the top 3×limit matches", not "the newest match in the corpus".
+pub const WINDOW_OVERFETCH: u32 = 3;
+
+/// What a search should return.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchQuery {
+    /// The user's query, verbatim. Sanitising it is [`crate::search`]'s job, not the
+    /// caller's, so a leg added later cannot forget to.
+    pub text: String,
+    /// Which workspaces to cover.
+    pub scope: Scope,
+    /// Restrict to these kinds. Empty means every kind.
+    pub kinds: Vec<MemoryKind>,
+    /// The most rows to return.
+    pub limit: u32,
+    /// How many full-text tokens of context each snippet carries.
+    pub snippet_tokens: u16,
+    /// The ordering.
+    pub sort: SearchSort,
+    /// Which legs to run.
+    pub legs: Legs,
+    /// Whether each returned row counts as a retrieval against its decay clock.
+    /// Default on: a search that returned a memory *is* the memory being used, and the
+    /// stretch factor that feeds decay is the reason this is not telemetry.
+    pub record: bool,
+}
+
+impl Default for SearchQuery {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            scope: Scope::One(DEFAULT_WORKSPACE.to_owned()),
+            kinds: Vec::new(),
+            limit: 10,
+            snippet_tokens: DEFAULT_SNIPPET_TOKENS,
+            sort: SearchSort::Relevance,
+            legs: Legs::Auto,
+            record: true,
+        }
+    }
+}
+
+/// What a search returned, and how it got there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchOutcome {
+    /// The page, already ordered.
+    pub hits: Vec<SearchHit>,
+    /// Which rung of the ladder answered, or why none did.
+    pub attempt: SearchAttempt,
+    /// The legs that ran. A `&'static str` rather than an enum because it is reported
+    /// verbatim in `--json` and the vocabulary is the contract's, not Rust's.
+    pub legs: &'static str,
+    /// True when a leg ran in a reduced form. Always false without an embedder: `auto`
+    /// falling back to lexical is the documented default, not a degradation.
+    pub degraded: bool,
+    /// How many rows had their retrieval counter moved. Zero under `--no-record`, and
+    /// zero when nothing matched.
+    pub recorded: usize,
+}
+
+/// Which rung of the query ladder answered, or why none did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum SearchAttempt {
+    /// There was nothing to search for: the query was empty, or held only whitespace, so
+    /// no query ran. Distinct from [`Self::Exhausted`] because "you asked for nothing"
+    /// and "nothing matched" call for different next moves.
+    NothingAsked,
+    /// Every rung was tried and every one came back empty.
+    Exhausted {
+        /// The last expression tried, which is the most forgiving one there is. Present
+        /// so a caller with no results can see exactly what was asked for.
+        query: String,
+    },
+    /// This rung matched, and its rows are the ones returned.
+    Matched {
+        /// Which rung, 1-based, counting from the most precise. See [`crate::search::Ladder`].
+        rung: u8,
+        /// The FTS5 expression that matched. Exposed because "why did that match" and
+        /// "why did that not" are the same question, and this is the answer to both.
+        query: String,
+    },
+}
+
+/// One ranked row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    /// The whole memory. Search needs the body anyway — for the snippet, which the
+    /// index produces — and a caller that gets an id then has to ask again.
+    pub memory: Memory,
+    /// The reciprocal-rank fusion score. **Only comparable within one response**: it is
+    /// a function of position, not of similarity, so it is not a threshold and two
+    /// searches' scores do not mean the same thing.
+    pub score: f32,
+    /// The match in context, with `**` around the matched terms. Empty when the matched
+    /// column produced nothing to show — see `search.rs`'s note on highlight markers for
+    /// why an unhighlighted snippet is dropped rather than shown.
+    pub snippet: String,
+}
+
+/// The wire shape of a [`SearchHit`]: a [`MemorySummaryJson`] plus the two fields only a
+/// ranked result has.
+///
+/// Flattened rather than retyped so a search row and a list row cannot drift apart:
+/// `docs/CONTRACT.md` promises that a search result *is* a list row with `score` and
+/// `snippet` added, and the only way to keep that promise is to make it the same struct.
+#[derive(Debug, Serialize)]
+pub struct SearchHitJson<'a> {
+    /// The memory, without its body or envelope.
+    #[serde(flatten)]
+    pub summary: MemorySummaryJson<'a>,
+    /// See [`SearchHit::score`].
+    pub score: f32,
+    /// See [`SearchHit::snippet`].
+    pub snippet: &'a str,
+}
+
+impl<'a> From<&'a SearchHit> for SearchHitJson<'a> {
+    fn from(hit: &'a SearchHit) -> Self {
+        Self {
+            summary: MemorySummaryJson::from(&hit.memory),
+            score: hit.score,
+            snippet: &hit.snippet,
+        }
+    }
+}
+
 /// What `list` should return.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListQuery {

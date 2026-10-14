@@ -234,18 +234,44 @@ fn diagnostics_never_reach_stdout() {
 
 #[test]
 fn unimplemented_commands_name_the_work_package_that_owns_them() {
+    // The table *is* the list of what does not work yet, asserted rather than assumed:
+    // when a work package lands, its row leaves this table and becomes a real test. A
+    // command that silently did nothing would fail here, and so would one that claimed to
+    // be finished before it was.
     let sandbox = Sandbox::new();
-    let out = run(&["search", "--db", &sandbox.db_arg(), "anything"]);
-    assert_eq!(code(&out), 1);
-    let text = stderr(&out);
-    assert!(text.contains("search"), "{text}");
-    assert!(text.contains("work package 2"), "{text}");
+    let db = sandbox.db_arg();
+    let cases: [(&str, &[&str], u8); 6] = [
+        ("review list", &["review", "list", "--db", &db], 4),
+        (
+            "outcome",
+            &["outcome", "success", "--item", "k_01:helpful", "--db", &db],
+            4,
+        ),
+        ("pin", &["pin", "k_01", "--db", &db], 4),
+        ("relate", &["relate", "k_01", "--db", &db], 5),
+        ("export", &["export", "--db", &db], 6),
+        ("import", &["import", "nothing.jsonl", "--db", &db], 6),
+    ];
+    for (name, args, wp) in cases {
+        let out = run(args);
+        assert_eq!(
+            code(&out),
+            1,
+            "`{name}` should be an internal not-implemented"
+        );
+        let text = stderr(&out);
+        assert!(text.contains(name), "`{name}`: {text}");
+        assert!(
+            text.contains(&format!("work package {wp}")),
+            "`{name}` should name work package {wp}: {text}"
+        );
+    }
 }
 
 #[test]
 fn the_json_failure_envelope_is_exactly_one_document_on_stdout() {
     let sandbox = Sandbox::new();
-    let value = json(&["search", "--db", &sandbox.db_arg(), "--json", "anything"]);
+    let value = json(&["review", "list", "--db", &sandbox.db_arg(), "--json"]);
     assert_eq!(value["ok"], serde_json::json!(false));
     assert_eq!(value["error"]["code"], serde_json::json!("unimplemented"));
     assert!(value["error"]["message"].is_string());
@@ -259,7 +285,7 @@ fn the_json_failure_envelope_is_exactly_one_document_on_stdout() {
 #[test]
 fn quiet_does_not_suppress_an_error() {
     let sandbox = Sandbox::new();
-    let out = run(&["--quiet", "search", "--db", &sandbox.db_arg(), "anything"]);
+    let out = run(&["--quiet", "review", "list", "--db", &sandbox.db_arg()]);
     assert_eq!(code(&out), 1);
     assert!(
         stderr(&out).contains("kiomon: "),
@@ -273,7 +299,7 @@ fn global_flags_are_accepted_after_the_subcommand_too() {
     // Agents build command lines by appending, and clap only does this for `global`
     // arguments. Asserting it means the property is not lost to a future refactor.
     let sandbox = Sandbox::new();
-    let out = run(&["search", "--db", &sandbox.db_arg(), "anything", "--json"]);
+    let out = run(&["review", "list", "--db", &sandbox.db_arg(), "--json"]);
     assert_eq!(code(&out), 1);
     let value: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
     assert_eq!(value["error"]["code"], serde_json::json!("unimplemented"));
@@ -795,4 +821,473 @@ fn a_helper_type_is_not_needed_for_the_path_assertion() {
     // developer's real database.
     let sandbox = Sandbox::new();
     assert!(!Path::new(&sandbox.db_arg()).exists());
+}
+
+// ---------------------------------------------------------------------------
+// WP2 — search, and the JSON contract that goes with it
+// ---------------------------------------------------------------------------
+
+/// Seed a searchable corpus: one English memory, one Japanese, one accented.
+fn searchable() -> Sandbox {
+    let sandbox = Sandbox::new();
+    add(
+        &sandbox,
+        &[
+            "--kind",
+            "semantic",
+            "--title",
+            "Staging deploys need a manual migration",
+            "--body",
+            "Run migrations before the deploy; the pipeline does not do it.",
+            "--tag",
+            "deploy",
+        ],
+    );
+    add(
+        &sandbox,
+        &[
+            "--kind",
+            "reference",
+            "--title",
+            "日本語のメモ",
+            "--body",
+            "これは日本語のテストです。",
+        ],
+    );
+    add(
+        &sandbox,
+        &[
+            "--kind",
+            "procedural",
+            "--title",
+            "Café closing routine",
+            "--body",
+            "The café closes at nine: count the till, then lock up.",
+        ],
+    );
+    sandbox
+}
+
+#[test]
+fn a_search_finds_what_was_written_and_exits_zero() {
+    let sandbox = searchable();
+    let out = run(&["search", "--db", &sandbox.db_arg(), "migration"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("Staging deploys need a manual migration"),
+        "{text}"
+    );
+    assert!(
+        text.contains("**migrations**"),
+        "the snippet must show the match: {text}"
+    );
+}
+
+#[test]
+fn a_search_that_finds_nothing_still_exits_zero_and_explains_itself() {
+    // The distinction the contract spends an exit code on: "no results" is an answer, not
+    // a failure. What the caller *does* get is the expression that was tried last.
+    let sandbox = searchable();
+    let out = run(&["search", "--db", &sandbox.db_arg(), "onomatopoeia zzz"]);
+    assert_eq!(code(&out), 0);
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+    let text = stderr(&out);
+    assert!(text.contains("nothing matched"), "{text}");
+    assert!(
+        text.contains("\"onomatopoeia\"* OR \"zzz\"*"),
+        "the note must name what was actually asked: {text}"
+    );
+}
+
+#[test]
+fn the_search_json_carries_every_field_the_contract_documents() {
+    let sandbox = searchable();
+    let value = json(&["search", "--db", &sandbox.db_arg(), "--json", "migration"]);
+
+    assert_eq!(value["ok"], serde_json::json!(true));
+    for field in [
+        "query",
+        "attempt",
+        "requested_legs",
+        "legs",
+        "degraded",
+        "recorded",
+    ] {
+        assert!(
+            value["data"].get(field).is_some(),
+            "`data.{field}` is documented in docs/CONTRACT.md and must be present: {value}"
+        );
+    }
+    assert_eq!(value["data"]["query"], serde_json::json!("migration"));
+    assert_eq!(value["data"]["requested_legs"], serde_json::json!("auto"));
+    assert_eq!(value["data"]["legs"], serde_json::json!("fts"));
+    assert_eq!(value["data"]["degraded"], serde_json::json!(false));
+    assert_eq!(
+        value["data"]["attempt"]["outcome"],
+        serde_json::json!("matched")
+    );
+    assert_eq!(value["data"]["attempt"]["rung"], serde_json::json!(1));
+    assert_eq!(value["data"]["recorded"], serde_json::json!(1));
+
+    let results = value["data"]["results"]
+        .as_array()
+        .expect("results is a list");
+    assert_eq!(results.len(), 1);
+    let hit = &results[0];
+    // Every field a `list` row has, plus `score` and `snippet` — the contract says a
+    // search result *is* a list row with two fields added, so both halves are asserted
+    // here against the same list `docs/CONTRACT.md` carries.
+    for field in [
+        "id",
+        "workspace_id",
+        "kind",
+        "kind_label",
+        "title",
+        "excerpt",
+        "tags",
+        "source",
+        "source_label",
+        "source_url",
+        "confidence",
+        "strength",
+        "pinned",
+        "status",
+        "created_at",
+        "score",
+        "snippet",
+    ] {
+        assert!(
+            hit.get(field).is_some(),
+            "`results[].{field}` is missing: {hit}"
+        );
+    }
+    assert!(
+        hit["snippet"].as_str().unwrap().contains("**migrations**"),
+        "{hit}"
+    );
+    assert!(hit["score"].as_f64().unwrap() > 0.0, "{hit}");
+    assert!(hit["body"].is_null(), "a result row carries no body: {hit}");
+}
+
+#[test]
+fn a_search_that_asks_for_nothing_reports_that_rather_than_no_match() {
+    let sandbox = searchable();
+    let value = json(&["search", "--db", &sandbox.db_arg(), "--json", ""]);
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert_eq!(
+        value["data"]["attempt"],
+        serde_json::json!({"outcome": "nothing_asked"})
+    );
+    assert_eq!(value["data"]["results"], serde_json::json!([]));
+
+    let empty = json(&["search", "--db", &sandbox.db_arg(), "--json", "zzz"]);
+    assert_eq!(
+        empty["data"]["attempt"]["outcome"],
+        serde_json::json!("exhausted")
+    );
+}
+
+#[test]
+fn search_pipes_safely_because_stdout_is_one_document_and_nothing_else() {
+    // The property, not the tool: `jq` is not a build dependency, but the reason
+    // `kiomon search | jq` works is that stdout holds exactly one newline-terminated JSON
+    // document and every diagnostic went to stderr. Both halves are asserted, and the
+    // search is one that has something to say on stderr.
+    let sandbox = searchable();
+    let out = run(&["search", "--db", &sandbox.db_arg(), "--json", "zzz"]);
+    assert_eq!(code(&out), 0);
+    let text = stdout(&out);
+    assert_eq!(text.lines().count(), 1, "{text:?}");
+    assert!(text.starts_with('{') && text.ends_with("}\n"), "{text:?}");
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("stdout parses as JSON");
+    assert_eq!(parsed["data"]["results"], serde_json::json!([]));
+    assert!(
+        stderr(&out).contains("nothing matched"),
+        "the diagnostic belongs on stderr: {}",
+        stderr(&out)
+    );
+
+    // And the human path keeps stdout for the answer too.
+    let human = run(&["search", "--db", &sandbox.db_arg(), "zzz"]);
+    assert!(stdout(&human).is_empty(), "{}", stdout(&human));
+}
+
+#[test]
+fn the_search_exit_codes_are_the_contract_codes() {
+    let sandbox = searchable();
+    let db = sandbox.db_arg();
+
+    // 0 — found, and 0 — nothing found. Neither is a failure.
+    assert_eq!(code(&run(&["search", "--db", &db, "migration"])), 0);
+    assert_eq!(code(&run(&["search", "--db", &db, "zzz"])), 0);
+
+    // 2 — the workspace does not exist. Distinct from 1 on purpose.
+    let missing = run(&["search", "--db", &db, "--workspace", "nowhere", "migration"]);
+    assert_eq!(code(&missing), 2, "{}", stderr(&missing));
+    assert!(stderr(&missing).contains("nowhere"), "{}", stderr(&missing));
+
+    // 3 — the arguments were rejected.
+    for args in [
+        vec!["search", "--db", &db, "--limit", "0", "migration"],
+        vec!["search", "--db", &db, "--limit", "51", "migration"],
+        vec!["search", "--db", &db, "--kind", "nonsense", "migration"],
+        vec!["search", "--db", &db, "--snippet-len", "0", "migration"],
+    ] {
+        let out = run(&args);
+        assert_eq!(code(&out), 3, "{args:?}: {}", stderr(&out));
+    }
+
+    // 4 — the request was valid and this build cannot serve it.
+    let vector = run(&["search", "--db", &db, "--legs", "vector", "migration"]);
+    assert_eq!(code(&vector), 4, "{}", stderr(&vector));
+    assert!(
+        stderr(&vector).contains("--legs fts"),
+        "{}",
+        stderr(&vector)
+    );
+    let as_json = json(&[
+        "search",
+        "--db",
+        &db,
+        "--json",
+        "--legs",
+        "vector",
+        "migration",
+    ]);
+    assert_eq!(as_json["ok"], serde_json::json!(false));
+    assert_eq!(as_json["error"]["code"], serde_json::json!("config"));
+}
+
+#[test]
+fn a_japanese_and_an_accented_query_both_find_their_memory() {
+    // End to end, through the binary, because this is the acceptance criterion the hosted
+    // product's regex sanitizer fails: `[^\w\s]` is ASCII-only, so it deletes a Japanese
+    // query outright and truncates an accented one to `caf`.
+    let sandbox = searchable();
+    let db = sandbox.db_arg();
+
+    let japanese = run(&["search", "--db", &db, "日本語"]);
+    assert_eq!(code(&japanese), 0);
+    assert!(
+        stdout(&japanese).contains("日本語のメモ"),
+        "{}",
+        stdout(&japanese)
+    );
+
+    for query in ["café", "cafe", "CAFÉ"] {
+        let accented = run(&["search", "--db", &db, query]);
+        assert_eq!(code(&accented), 0);
+        assert!(
+            stdout(&accented).contains("Café closing routine"),
+            "`{query}` must reach the memory: {}",
+            stdout(&accented)
+        );
+    }
+}
+
+#[test]
+fn search_filters_and_the_page_size_are_respected() {
+    let sandbox = searchable();
+    let db = sandbox.db_arg();
+    // A second memory the same query reaches, so a filter has something to remove.
+    add(
+        &sandbox,
+        &[
+            "--kind",
+            "semantic",
+            "--title",
+            "Deploy checklist",
+            "--body",
+            "Deploy the migration, then verify.",
+        ],
+    );
+
+    let all = json(&["search", "--db", &db, "--json", "deploy"]);
+    assert!(
+        all["data"]["results"].as_array().unwrap().len() > 1,
+        "{all}"
+    );
+
+    let only_reference = json(&[
+        "search",
+        "--db",
+        &db,
+        "--json",
+        "--kind",
+        "reference",
+        "deploy",
+    ]);
+    assert!(
+        only_reference["data"]["results"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "no `reference` memory mentions deploy: {only_reference}"
+    );
+
+    let one = json(&["search", "--db", &db, "--json", "--limit", "1", "deploy"]);
+    assert_eq!(one["data"]["results"].as_array().unwrap().len(), 1);
+    assert_eq!(one["data"]["recorded"], serde_json::json!(1));
+}
+
+#[test]
+fn a_search_counts_as_a_retrieval_and_no_record_stops_it() {
+    // `retrieval_count` is the decay clock's stretch factor, so this is the mechanism and
+    // not telemetry — which is why it is asserted through `get` rather than trusted.
+    let sandbox = searchable();
+    let db = sandbox.db_arg();
+    let id = json(&["search", "--db", &db, "--json", "migration"])["data"]["results"][0]["id"]
+        .as_str()
+        .expect("an id")
+        .to_owned();
+
+    let before = json(&["get", "--db", &db, "--json", &id]);
+    assert_eq!(before["data"]["retrieval_count"], serde_json::json!(1));
+    assert!(before["data"]["last_retrieved_at"].is_string(), "{before}");
+
+    let quiet = json(&["search", "--db", &db, "--json", "--no-record", "migration"]);
+    assert_eq!(quiet["data"]["recorded"], serde_json::json!(0));
+    let after = json(&["get", "--db", &db, "--json", &id]);
+    assert_eq!(
+        after["data"]["retrieval_count"],
+        serde_json::json!(1),
+        "`--no-record` must leave the decay clock alone"
+    );
+}
+
+#[test]
+fn search_output_is_bounded_and_shows_the_match_on_a_second_line() {
+    let sandbox = Sandbox::new();
+    add(
+        &sandbox,
+        &[
+            "--kind",
+            "semantic",
+            "--title",
+            &format!("Deploy note {}", "padded pads a fair bit ".repeat(20)),
+            "--body",
+            &format!("deploy {}", "padding ".repeat(400)),
+        ],
+    );
+
+    let out = run(&["search", "--db", &sandbox.db_arg(), "deploy"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert_eq!(
+        text.lines().count(),
+        2,
+        "a result line and a snippet: {text:?}"
+    );
+    assert!(
+        text.lines().next().unwrap().ends_with('…'),
+        "the default path truncates: {text:?}"
+    );
+    for line in text.lines() {
+        assert!(
+            line.chars().count() < 200,
+            "a bounded field must stay bounded: {} chars",
+            line.chars().count()
+        );
+    }
+
+    // Two different bounds, two different flags, and neither stands in for the other:
+    // `--full` raises the *width* a field may take, and `--snippet-len` raises how many
+    // full-text tokens of context `snippet()` returns. A snippet is a window, so `--full`
+    // alone still shows twelve tokens of it.
+    let full = run(&["search", "--db", &sandbox.db_arg(), "--full", "deploy"]);
+    let full_text = stdout(&full);
+    assert_eq!(full_text.lines().count(), 2, "{full_text:?}");
+    assert!(
+        !full_text.lines().next().unwrap().contains('…'),
+        "`--full` must stop cutting the title: {full_text:?}"
+    );
+
+    // Both flags, because a snippet is bounded twice over: the token window is
+    // `--snippet-len`'s job and the display width is `--full`'s, and the narrower of the
+    // two wins. That is why `--snippet-len 40` on its own still ends in an ellipsis.
+    let wider = run(&[
+        "search",
+        "--db",
+        &sandbox.db_arg(),
+        "--full",
+        "--snippet-len",
+        "40",
+        "deploy",
+    ]);
+    let wider_snippet = stdout(&wider)
+        .lines()
+        .nth(1)
+        .expect("a snippet line")
+        .chars()
+        .count();
+    assert!(
+        wider_snippet > 150,
+        "forty tokens must reach past twelve: {wider_snippet} chars"
+    );
+
+    let capped = run(&[
+        "search",
+        "--db",
+        &sandbox.db_arg(),
+        "--snippet-len",
+        "40",
+        "deploy",
+    ]);
+    let capped_snippet = stdout(&capped)
+        .lines()
+        .nth(1)
+        .expect("a snippet line")
+        .chars()
+        .count();
+    assert!(
+        // `out::DEFAULT_WIDTH` is 120 and the snippet is indented by three; the bin's
+        // modules are not reachable from an integration test, so the number is repeated
+        // here and the `--full` case above is what proves it is the width doing the cutting.
+        capped_snippet <= 124,
+        "without `--full` the display width still caps it: {capped_snippet} chars"
+    );
+}
+
+#[test]
+fn a_title_only_match_shows_no_snippet_at_all() {
+    // FTS5 would happily return the opening of the body, unhighlighted, under a title
+    // match — text that reads as the place it matched. An empty snippet is honest.
+    let sandbox = Sandbox::new();
+    add(
+        &sandbox,
+        &[
+            "--kind",
+            "semantic",
+            "--title",
+            "Kubernetes rollouts",
+            "--body",
+            "Nothing about that word appears in this body.",
+        ],
+    );
+    let out = run(&["search", "--db", &sandbox.db_arg(), "kubernetes"]);
+    assert_eq!(code(&out), 0);
+    assert_eq!(
+        stdout(&out).lines().count(),
+        1,
+        "no snippet, so no second line: {:?}",
+        stdout(&out)
+    );
+
+    let value = json(&["search", "--db", &sandbox.db_arg(), "--json", "kubernetes"]);
+    assert_eq!(
+        value["data"]["results"][0]["snippet"],
+        serde_json::json!("")
+    );
+}
+
+#[test]
+fn a_search_can_be_ordered_by_recency_or_strength() {
+    let sandbox = searchable();
+    let db = sandbox.db_arg();
+    for sort in ["relevance", "recent", "strength"] {
+        let out = run(&["search", "--db", &db, "--sort", sort, "deploy"]);
+        assert_eq!(code(&out), 0, "`--sort {sort}`: {}", stderr(&out));
+        assert!(!stdout(&out).is_empty(), "`--sort {sort}` found nothing");
+    }
 }

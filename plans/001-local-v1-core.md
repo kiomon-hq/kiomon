@@ -368,11 +368,17 @@ local brain silently rots.
 Port of `SearchService.sanitizeFtsQuery`, widened into a ladder because a local
 user typing a sentence must not get zero results:
 
-| Attempt | Query | When |
+| Rung | Query | When |
 |---|---|---|
 | 1 | `"phrase"` (quoted literal) | always tried first |
 | 2 | `"t1"* AND "t2"* AND …` | all terms, prefix-matched |
-| 3 | `"t1"* OR "t2"* OR …` | if attempt 2 is empty |
+| 3 | `"t1"* OR "t2"* OR …` | if rung 2 is empty |
+
+Built by `search::Ladder` and asserted against this table character for character in
+`search::tests::the_ladder_looks_like_the_documented_table`, so the design and the
+expressions cannot drift apart. A query with no terms is not an error and not an empty
+set of rungs: it is `attempt: nothing_asked`, which is a different fact from
+`exhausted` and takes no query to establish.
 
 First attempt with a non-empty ranked window wins. `legs`/`attempt` are reported in
 `--json` so an agent can tell *why* it got what it got. Terms are FTS5-quoted
@@ -435,9 +441,11 @@ above everything because the platform promises it, and because a pinned memory t
 user cannot find is a bug report.
 
 **Retrieval is recorded.** Every returned row gets `retrieval_count += 1` and
-`last_retrieved_at = now`, batched in the same transaction as the read's follow-up
-(lazily, only above `--record` / default on for `search`, off for `list`). This is
-what feeds the decay stretch factor, so it is not telemetry — it is the mechanism.
+`last_retrieved_at = now`, in one transaction with one statement. On by default for
+`search` and off for `list`; `--no-record` turns it off, and `--json` reports `recorded`
+so a caller can tell the two apart. This feeds the decay stretch factor, so it is not
+telemetry — it is the mechanism. The recording is WP2's; the stretch factor it exists
+for is WP4's.
 
 ### 4.4 What search returns (the row shape)
 
@@ -464,6 +472,14 @@ MCP server is a thin adapter and the docs are shared:
 
 `snippet()` comes from FTS5 (`snippet(memory_fts, 2, '**', '**', '…', 12)`) — zero
 extra cost, no text processing in Rust.
+
+> **"Zero extra cost" was wrong, and wrong by 34 ms.** `snippet()` is evaluated in the
+> select list, so SQLite computes it for every matching row *before* the `ORDER BY` and
+> `LIMIT` discard most of them. It is now a query of its own, run for the page rather
+> than the window, and it is still FTS5's snippet — no text processing in Rust. §8 has
+> the measurements. The row shape it serves is `MemorySummaryJson` plus `score` and
+> `snippet`, so a search result *is* a list row with two fields added and the two cannot
+> drift apart.
 
 ---
 
@@ -776,8 +792,8 @@ design: the ruler has to exist before there is anything worth measuring.
 |---|---|---|
 | **WP0** | ✅ **DONE** 2026-10-14 | Commit `e951d23`. Skeleton, CI, licence, hygiene, and the full CLI surface. `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` green. |
 | **WP1** | ✅ **DONE** 2026-10-14 | Database, pragmas, migration applier, integrity checks, store (`add`/`get`/`update`/`list`/`forget`/`stats`), ids, content hash, metadata envelope, write gate, workspace resolution, and the CLI verbs `init`, `doctor`, `stats`, `add`, `update`, `get`, `list`, `forget`. **158 tests**, clippy clean. `init`/`add`/`get`/`list`/`stats`/`forget`/`doctor` exercised end to end against real database files in `crates/kiomon-cli/tests/cli.rs`. |
-| WP2 | ⬜ NEXT — `search`, the ladder, `--json` row shapes | |
-| WP3 | ⬜ TODO — and it inherits a measured baseline; see below | |
+| **WP2** | ✅ **DONE** 2026-10-14 | `search.rs` (the quoted ladder, the ranked window, the snippet query, the retrieval record), `fuse.rs` (RRF, ported from `rrf.ts`), the filter and ordering flags, `docs/CONTRACT.md` §Reading rewritten as v1, and the `--json` shapes for a search. **204 tests** (`cargo test --workspace`), clippy clean, `cargo fmt --check` clean. Exit codes 0/2/3/4 each asserted through the binary, `search | jq`'s property asserted rather than assumed. |
+| WP3 | ⬜ NEXT — and it inherits a measured baseline and four corrections; see below | |
 | WP4–WP8 | ⬜ TODO | |
 
 ### The numbers so far, and what they cost
@@ -804,7 +820,110 @@ Binary **2 974 KiB** against the 6 MB budget; **33** transitive crates against t
 60-crate budget; ~8.7 KiB stored per 5 KB memory, which is the full-text index's
 second copy of the text plus overhead.
 
-Three of those need a decision that only WP3's harness should make:
+### WP2's numbers, and the four things WP2 found
+
+Same machine and same reading rule as above — subtract the 8.9 ms spawn floor. **10 000
+memories, 47 MiB, one memory in seven mentioning `deploy`**, so a query for it has a
+real ranking problem rather than a scan. The corpus is generated rather than collected,
+which is the weakest thing about these numbers and WP3's first thing to fix.
+
+| Command | p50 | p95 | Budget (§7) |
+|---|---|---|---|
+| `search deploy` | 26.0 ms | 31.8 ms | — |
+| `search` (five-word sentence, rung 3) | 30.8 ms | 35.6 ms | p95 ≤ 60 ms ✅ |
+| `search` (no match at all) | 12.7 ms | 14.6 ms | — |
+| `search --no-record` | 21.5 ms | 24.6 ms | — |
+| `search --kind semantic` | 29.0 ms | 37.9 ms | — |
+| `search --workspace '*'` | 29.8 ms | 36.7 ms | — |
+| `search --limit 50` | 48.1 ms | **63.7 ms** | — ⚠ |
+| `list` (20) | 12.6 ms | 16.2 ms | — |
+| `stats` | 14.1 ms | 21.0 ms | — |
+
+Each search is roughly 17 ms of work over the floor: about 9 ms for the ranked window,
+under 1 ms for the snippets, and the rest for the row loads and the retrieval record. At
+`--limit 50` the window is 150 rows and the p95 crosses the gate, which the contract now
+says out loud rather than leaving to be found.
+
+1. **The plan was wrong about `snippet()`, and the error was 34 ms.** §4.4 says
+   "`snippet()` comes from FTS5 — zero extra cost, no text processing in Rust". It is
+   not free. `snippet()` is an FTS5 auxiliary evaluated in the select list, and SQLite
+   evaluates a select list for every row the `WHERE` clause admits — *before* the
+   `ORDER BY` and `LIMIT` that throw most of them away. So one query ranking and
+   snippetting at once tokenised 9 000 matching bodies to keep ten: **47 ms against
+   13 ms** for the same query without it. The snippet is now a statement of its own, run
+   for the page and not the window, because a `MATCH` inside an `IN` list is re-evaluated
+   per rowid — measured at 0.8 ms per row, linear, which is exactly why the page and not
+   the window is the right thing to ask about. 34 ms → 0.3 ms.
+2. **The first write in a process is not a property of the code.** A search records a
+   retrieval, so a search is a write. Measured on the volume this repository lives on,
+   the first write in a fresh process cost **47–145 ms** and the connection close another
+   **49–105 ms**, against **2.9–5.9 ms** and 6 ms for the same binary on the same
+   database file copied to `C:`. Same code, same SQLite, same 49 MiB file, forty times
+   apart. Every benchmark here therefore runs on `C:`, and **WP3 must record the volume
+   and not only the machine** — a budget can be met or missed by which disk the harness
+   happened to use, and that is a bigger effect than anything §7 is trying to measure.
+3. **The first corpus could not measure anything.** Its bodies were drawn from the same
+   twenty-nine words, so *every* term matched all ten thousand memories and `deploy`
+   matched 10 000 rows. A corpus like that cannot tell a ranking from a scan — it was
+   found by printing the match counts, not by suspecting the generator. The corpus now
+   gives each memory its own vocabulary out of a three-thousand-word pool, with `deploy`
+   in one memory in seven. WP3 must assert the shape of its corpus, or the harness will
+   report a number that means nothing.
+4. **Rank-fusion scores compress to nothing with one leg.** `1/61`, `1/62`, `1/63`: the
+   ordering is exactly bm25's, but the magnitudes carry no information. RRF is still the
+   right call — it is what makes the score's *meaning* survive the vector leg arriving in
+   WP7 — but the contract now says the score is only comparable within one response, and
+   the human output omits it entirely rather than printing three meaningless decimals.
+
+Two smaller corrections:
+
+- **`record_retrieval` is one statement with an `IN` list, not one per id.** 0.29 ms for
+  ten against 0.76 ms for ten of their own, and a page can be fifty. Both plans are an
+  index search on the unique id, so the saving is per-statement overhead and not a better
+  plan — worth saying, because "batch the writes" is usually advice about a plan change
+  and here it is not.
+- **`refresh` the corpus's `ANALYZE`.** The probe ran it and the applier's own corpus did
+  not, and the two disagreed about the join order. Nothing depends on the difference
+  today; WP3 should decide whether `analyze` belongs in the migration applier.
+
+### WP2's acceptance criteria
+
+| Criterion | Result |
+|---|---|
+| A table-driven test proves the ladder picks the first non-empty attempt and reports which | ✅ eight rows in `search::tests::the_ladder_takes_the_first_rung_that_returns_anything`, covering rung 1, rung 2, rung 3, exhaustion and punctuation-only, each asserting the rung *and* the hit count |
+| CJK and accented queries return hits (the platform's sanitizer's failure case) | ✅ `日本語` reaches `日本語のメモ` through rung 2, `café`/`cafe`/`CAFÉ` all reach `Café hours`, asserted both in the library and through the binary. The failure case is pinned too: a Japanese *suffix* is unreachable, because `unicode61` does not segment CJK, and §10 records the trigger |
+| `--json` output parses and every documented field is present | ✅ `the_search_json_carries_every_field_the_contract_documents` walks both lists from the document itself rather than from the struct |
+| Exit codes 0/2/3/4 each asserted | ✅ `the_search_exit_codes_are_the_contract_codes`: 0 found *and* 0 not-found, 2 for an unknown workspace, 3 for four rejected arguments, 4 for `--legs vector` |
+| `search \| jq` works | ✅ asserted as the property and not the tool: stdout is one newline-terminated JSON document, every diagnostic is on stderr, and the human path keeps stdout for the answer |
+
+### Where WP2 contradicted the plan
+
+- **§4.1's ladder is as designed, and the rung-1/rung-2 split earns its keep for a
+  reason the plan did not name.** For a single term the two rungs are different
+  expressions (`"deploy"` and `"deploy"*`), and that is what makes the ladder more than
+  a fallback: `deploy` as a phrase finds the token, and `deploy*` finds `deploys`.
+- **§4.4's row shape gained `workspace_id`**, because `list` carries it and the contract
+  now promises that a search result *is* a list row with two fields added — a promise
+  that is enforced by `SearchHitJson` flattening `MemorySummaryJson` rather than by
+  retyping it.
+- **§4.3's "pinned ranks above everything" is now "above `relevance` and `strength`"**,
+  for the reason WP1 gave when `list --recent` was corrected: a recency view that
+  silently reorders itself is not a recency view.
+- **§4.2's `VECTOR_SCAN_LIMIT` and `degraded` are declared but unused**, which is what
+  WP7 is for. `degraded` is a documented constant `false` rather than an absent field,
+  so the shape does not change when there is an embedder to degrade.
+- **`retrieval_count` recording moved from §5.3's neighbourhood into WP2**, because §4.3
+  puts it on the read path and the decay clock it feeds is WP4's. The *stretch factor*
+  that consumes it is still WP4's.
+- **A snippet marks every term in the expression, including stop words.** Searching
+  "why did the deploy fail" highlights the three `the`s in the body as well as `deploy`,
+  because that is what FTS5's `snippet()` does: it marks what matched, and `the` did
+  match. Suppressing it needs a stop-word list, and a stop-word list is a language
+  commitment this project has not made — `unicode61` is deliberately language-neutral
+  and §10 is where the trigger for changing that belongs. Left as it is, noted so the
+  next reader does not file it as a bug.
+
+Three of the older WP1 findings need a decision that only WP3's harness should make:
 
 - **`list --workspace '*'` at 55.7 ms** is a full scan plus a sort of the corpus. The
   unscoped ordering `pinned DESC, strength DESC, id DESC` has no matching index, and

@@ -4,10 +4,13 @@
 //!
 //! `list` is deliberately not a search: it is unranked, it does not touch the retrieval
 //! counters, and its ordering is a fact about the rows rather than an opinion about the
-//! query. `search` — the ranked path, and the one the whole performance budget exists for
-//! — arrives with WP2.
+//! query. `search` is the ranked path, and the one the whole performance budget exists
+//! for.
 
-use kiomon_core::{ExitCode, ListQuery, ListSort, MemoryKind, MemorySummaryJson, Result, Status};
+use kiomon_core::{
+    ExitCode, ListQuery, ListSort, MemoryKind, MemorySummaryJson, Result, SearchAttempt,
+    SearchHitJson, SearchQuery, Status,
+};
 
 use super::{open, pending, read_scope};
 use crate::cli::{Cli, GetArgs, ListArgs, SearchArgs};
@@ -17,9 +20,63 @@ use crate::out;
 ///
 /// # Errors
 ///
-/// Always [`Error::Unimplemented`], until WP2.
-pub fn search(_cli: &Cli, _args: &SearchArgs) -> Result<ExitCode> {
-    pending("search", 2)
+/// Returns [`kiomon_core::Error::Config`] for `--legs vector`, which this build cannot
+/// serve, and [`kiomon_core::Error::NotFound`] for an unknown workspace.
+pub fn search(cli: &Cli, args: &SearchArgs) -> Result<ExitCode> {
+    let db = open(cli)?;
+    let scope = read_scope(&db, args.workspace.as_deref())?;
+
+    let outcome = db.search(&SearchQuery {
+        text: args.query.clone(),
+        scope,
+        kinds: args.kind.iter().copied().map(MemoryKind::from).collect(),
+        limit: u32::from(args.limit),
+        snippet_tokens: args.snippet_len,
+        sort: args.sort.into(),
+        legs: args.legs.into(),
+        record: !args.no_record,
+    })?;
+
+    let width = if cli.full {
+        usize::MAX
+    } else {
+        out::DEFAULT_WIDTH
+    };
+
+    // The three ways a search can come back with nothing are three different facts, and
+    // an agent's next move differs for each, so they are three different warnings. None of
+    // them is an error: exit 0 with no results is the right answer to "is there anything
+    // about X", and a non-zero code would teach an agent to retry a question that was
+    // already answered.
+    if outcome.hits.is_empty() {
+        match &outcome.attempt {
+            SearchAttempt::NothingAsked => {
+                out::warn(cli.quiet, "the query was empty, so nothing was searched.");
+            }
+            SearchAttempt::Exhausted { query } => out::warn(
+                cli.quiet,
+                &format!("nothing matched, on any of the three query forms. The last was {query}"),
+            ),
+            // Unreachable: a rung that matched returns at least one row. A leg that
+            // returned rows and a table read that could not find them would do it, which
+            // is what the check in `search` is for.
+            SearchAttempt::Matched { .. } => {}
+        }
+    }
+
+    if cli.json {
+        let response = out::SearchResponse::new(&outcome, &args.query, args.legs.as_str());
+        out::emit(true, response, |_| {})?;
+    } else {
+        let hits: Vec<SearchHitJson<'_>> = outcome.hits.iter().map(SearchHitJson::from).collect();
+        for (index, hit) in hits.iter().enumerate() {
+            // `index + 1` because a person counting results starts at one, and because
+            // the MCP handler numbers them the same way — the two are meant to read alike.
+            println!("{}", out::search_line(index + 1, hit, width));
+        }
+    }
+
+    Ok(ExitCode::Success)
 }
 
 /// `kiomon get`

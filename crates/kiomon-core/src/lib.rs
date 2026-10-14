@@ -29,10 +29,11 @@
 //! | [`hash`] | text normalisation and the idempotence key |
 //! | [`metadata`] | the per-kind envelope, and its fail-open rule |
 //! | [`db`] | opening, pragmas, migrations, integrity checks |
-//! | [`store`] | add, get, update, list, forget, stats |
+//! | [`store`] | add, get, update, list, forget, stats, retrieval counts |
 //! | [`gate`] | which writes activate and which wait for review |
 //! | [`config`] | where the database lives |
-//! | `search` / `fuse` | the retrieval ladder and rank fusion *(WP2)* |
+//! | [`search`] | the query ladder, the ranked window, and the record of it |
+//! | [`fuse`] | reciprocal rank fusion |
 //! | `lifecycle` / `decay` | the review inbox, feedback, and forgetting *(WP4)* |
 //! | `links` | typed edges and the auto-link pass *(WP5)* |
 //! | `import` | JSONL and markdown in and out *(WP6)* |
@@ -61,11 +62,13 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod fuse;
 pub mod gate;
 pub mod hash;
 pub mod id;
 pub mod metadata;
 pub mod model;
+pub mod search;
 pub mod store;
 
 #[cfg(test)]
@@ -73,12 +76,16 @@ pub(crate) mod testing;
 
 pub use db::{Database, Integrity};
 pub use error::{Error, ExitCode, Result};
+pub use fuse::{RRF_K, fuse, rrf_score};
 pub use gate::{AUTOPROMOTE_THRESHOLD, Verdict};
 pub use model::{
-    AddOutcome, ForgetOutcome, KindCount, ListQuery, ListSort, MAX_TAGS, Memory, MemoryJson,
-    MemoryKind, MemoryPatch, MemorySummaryJson, NewMemory, Relation, ReviewMode, Scope, Stats,
-    Status, StatusCount, UpdateOutcome, Workspace, source_label,
+    AddOutcome, DEFAULT_SNIPPET_TOKENS, ForgetOutcome, KindCount, Legs, ListQuery, ListSort,
+    MAX_TAGS, Memory, MemoryJson, MemoryKind, MemoryPatch, MemorySummaryJson, NewMemory, Relation,
+    ReviewMode, Scope, SearchAttempt, SearchHit, SearchHitJson, SearchOutcome, SearchQuery,
+    SearchSort, Stats, Status, StatusCount, UpdateOutcome, WINDOW_OVERFETCH, Workspace,
+    source_label,
 };
+pub use search::{LADDER_RUNGS, Ladder};
 
 /// The version of the CLI and JSON contract this build speaks.
 ///

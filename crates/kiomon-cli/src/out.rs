@@ -17,7 +17,9 @@
 
 use serde::Serialize;
 
-use kiomon_core::{Error, ExitCode, Memory, MemorySummaryJson, Result};
+use kiomon_core::{
+    Error, ExitCode, Memory, MemorySummaryJson, Result, SearchAttempt, SearchHitJson, SearchOutcome,
+};
 
 /// How wide a field may be on the human path before it is truncated.
 pub const DEFAULT_WIDTH: usize = 120;
@@ -148,6 +150,47 @@ where
     Ok(())
 }
 
+/// The `data` block of a `search` response.
+///
+/// An object rather than the bare array `list` returns, and the asymmetry is the point:
+/// a search has opinions about how it answered — which rung of the ladder, which legs,
+/// whether it recorded the read — and a caller that cannot see them cannot tell a query
+/// that found nothing from a query that was never asked.
+#[derive(Debug, Serialize)]
+pub struct SearchResponse<'a> {
+    /// The page, in the order it is meant to be read.
+    pub results: Vec<SearchHitJson<'a>>,
+    /// The query as it was given, before any of it became an FTS5 expression. Echoed so a
+    /// caller parsing a batch of responses does not have to pair them up itself.
+    pub query: &'a str,
+    /// Which rung answered, or why none did.
+    pub attempt: &'a SearchAttempt,
+    /// What `--legs` asked for.
+    pub requested_legs: &'static str,
+    /// What actually ran.
+    pub legs: &'static str,
+    /// See [`SearchOutcome::degraded`].
+    pub degraded: bool,
+    /// How many rows had their retrieval counter moved.
+    pub recorded: usize,
+}
+
+impl<'a> SearchResponse<'a> {
+    /// Shape a search outcome for the wire.
+    #[must_use]
+    pub fn new(outcome: &'a SearchOutcome, query: &'a str, requested_legs: &'static str) -> Self {
+        Self {
+            results: outcome.hits.iter().map(SearchHitJson::from).collect(),
+            query,
+            attempt: &outcome.attempt,
+            requested_legs,
+            legs: outcome.legs,
+            degraded: outcome.degraded,
+            recorded: outcome.recorded,
+        }
+    }
+}
+
 /// A warning for the user, on stderr. Suppressed by `--quiet`, because it is not a
 /// failure — it is something the command did differently from what was asked.
 pub fn warn(quiet: bool, message: &str) {
@@ -197,6 +240,24 @@ pub fn summary_line(memory: &MemorySummaryJson<'_>, width: usize) -> String {
         line.push_str(&marks.join(" · "));
     }
     line
+}
+
+/// One ranked result: the summary line, and under it the match in context.
+///
+/// The score is deliberately **not** printed. It is a reciprocal-rank sum, so it is a
+/// function of position rather than of similarity: with one leg it is `1/61` for the
+/// first row and `1/64` for the fourth, and showing those to a person invites them to read
+/// meaning into three decimal places that are not there. The position already says it.
+/// `--json` carries the score, and `docs/CONTRACT.md` says what it is and is not. The
+/// hosted product's tool handler makes the same call for the same reason.
+#[must_use]
+pub fn search_line(number: usize, hit: &SearchHitJson<'_>, width: usize) -> String {
+    let mut out = format!("{number}. {}", summary_line(&hit.summary, width));
+    if !hit.snippet.is_empty() {
+        out.push_str("\n   ");
+        out.push_str(&truncate(hit.snippet, width));
+    }
+    out
 }
 
 /// The full record, for `get`.
