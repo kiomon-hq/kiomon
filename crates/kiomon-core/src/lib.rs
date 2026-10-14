@@ -34,6 +34,7 @@
 //! | [`config`] | where the database lives |
 //! | [`search`] | the query ladder, the ranked window, and the record of it |
 //! | [`fuse`] | reciprocal rank fusion |
+//! | [`bench`] | the measurement corpus, so a number has a shape to mean |
 //! | `lifecycle` / `decay` | the review inbox, feedback, and forgetting *(WP4)* |
 //! | `links` | typed edges and the auto-link pass *(WP5)* |
 //! | `import` | JSONL and markdown in and out *(WP6)* |
@@ -59,6 +60,7 @@
 
 #![doc(html_root_url = "https://docs.rs/kiomon-core")]
 
+pub mod bench;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -74,6 +76,7 @@ pub mod store;
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub use bench::{BodyClass, BodyMix, CorpusReport, CorpusSpec, Probe};
 pub use db::{Database, Integrity};
 pub use error::{Error, ExitCode, Result};
 pub use fuse::{RRF_K, fuse, rrf_score};

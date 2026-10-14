@@ -39,7 +39,7 @@ use crate::id;
 use crate::metadata;
 use crate::model::{
     AddOutcome, ForgetOutcome, KindCount, ListQuery, ListSort, Memory, MemoryKind, MemoryPatch,
-    NewMemory, Relation, Scope, Stats, Status, StatusCount, UpdateOutcome,
+    NewMemory, Relation, ReviewMode, Scope, Stats, Status, StatusCount, UpdateOutcome,
 };
 
 /// Every column a [`Memory`] needs, in one place so a query cannot half-populate a row.
@@ -100,93 +100,57 @@ impl Database {
     /// One transaction. Either the memory exists and is indexed, or an identical one
     /// already did and its id comes back with `duplicate: true`, or nothing was written
     /// at all. There is no state in which half a memory is stored.
-    ///
     /// # Errors
     ///
     /// Returns [`Error::Invalid`] for an empty title, a confidence or importance outside
     /// `0.0..=1.0`, or more than [`MAX_TAGS`] tags. Returns [`Error::NotFound`] when the
     /// workspace does not exist.
     pub fn add(&self, new: &NewMemory) -> Result<AddOutcome> {
-        let title = new.title.trim();
-        if title.is_empty() {
-            return Err(Error::Invalid(
-                "a memory needs a title; pass --title, or --from-file to take one from a file"
-                    .to_owned(),
-            ));
-        }
-        check_unit_range("--confidence", new.confidence)?;
-        check_unit_range("--importance", Some(new.importance))?;
-        if new.source.trim().is_empty() {
-            return Err(Error::Invalid(
-                "--source needs a value; omit it to record a `user_saved` memory".to_owned(),
-            ));
-        }
-
-        let mut warnings = Vec::new();
-        let tags = metadata::normalize_tags(&new.tags).map_err(Error::Invalid)?;
-        let validated = metadata::validate(new.kind, new.memory_metadata.as_ref());
-        warnings.extend(validated.warning);
-
         let workspace = self.resolve_workspace(&new.workspace_id)?;
-        let content_hash = hash::content_hash(new.kind, title, &new.body);
-
         let transaction = self.conn().unchecked_transaction()?;
+        let outcome = insert_one(&transaction, &workspace.id, workspace.review_mode, new)?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
 
-        if !new.force {
-            if let Some(existing) =
-                find_duplicate_near(&transaction, &workspace.id, &content_hash, new)
+    /// Save many memories, in one transaction, through the same insert path as one.
+    ///
+    /// Returns how many rows were **written**: a memory whose content already exists
+    /// comes back as a duplicate and is not counted. The caller knows the difference
+    /// between "a hundred thousand memories" and "a hundred thousand attempts".
+    ///
+    /// One transaction because this is a bulk write by definition — the corpus generator
+    /// and, later, `import` — and because a per-row transaction would make the harness
+    /// measure the ruler instead of the code. The insert itself is [`insert_one`], so a
+    /// generated memory is validated, deduped and gated exactly like a typed one.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`insert_one`] returns for the first row it refuses.
+    pub(crate) fn insert_many(&self, news: &[NewMemory]) -> Result<usize> {
+        let mut resolved: Option<(String, ReviewMode)> = None;
+        let transaction = self.conn().unchecked_transaction()?;
+        let mut written = 0;
+        for new in news {
+            // Resolving a workspace is a query, and a bulk write has one workspace in it
+            // almost every time — so remember the last answer and ask again only when the
+            // question changes.
+            if resolved
+                .as_ref()
+                .is_none_or(|(id, _)| id != &new.workspace_id)
             {
-                transaction.commit()?;
-                return Ok(AddOutcome {
-                    id: existing.id,
-                    workspace_id: existing.workspace_id,
-                    status: existing.status,
-                    duplicate: true,
-                    warnings,
-                });
+                let workspace = self.resolve_workspace(&new.workspace_id)?;
+                resolved = Some((workspace.id, workspace.review_mode));
+            }
+            let (workspace_id, review_mode) = resolved
+                .as_ref()
+                .expect("the workspace was resolved immediately above");
+            if !insert_one(&transaction, workspace_id, *review_mode, new)?.duplicate {
+                written += 1;
             }
         }
-
-        let status = gate::decide(&new.source, new.confidence, workspace.review_mode).status();
-        let new_id = id::new_memory_id()?;
-
-        transaction.execute(
-            INSERT_MEMORY_SQL,
-            params![
-                new_id,
-                workspace.id,
-                new.kind,
-                title,
-                new.excerpt,
-                new.body,
-                encode_tags(&tags),
-                metadata::tags_text(&tags),
-                validated.value.to_string(),
-                new.source.trim(),
-                new.source_url,
-                new.confidence,
-                new.importance,
-                status,
-                content_hash,
-            ],
-        )?;
-
-        // Provenance is wired at activation, never for a draft: a `derived_from` edge
-        // from a memory nobody has approved would point at something retrieval cannot
-        // return.
-        if status == Status::Active && !new.derived_from.is_empty() {
-            warnings.extend(link_derived_from(&transaction, &new_id, &new.derived_from)?);
-        }
-
         transaction.commit()?;
-
-        Ok(AddOutcome {
-            id: new_id,
-            workspace_id: workspace.id,
-            status,
-            duplicate: false,
-            warnings,
-        })
+        Ok(written)
     }
 
     /// The memory that already holds this content, if there is one.
@@ -587,6 +551,98 @@ impl Database {
 // Free functions over a connection, so code inside a transaction is the same code as
 // code outside one.
 // ---------------------------------------------------------------------------
+
+/// Save one memory, against whatever transaction the caller is holding.
+///
+/// The single insert path. [`Database::add`] wraps it in a transaction of its own, the
+/// corpus generator wraps a hundred thousand of them in one, and any future bulk import
+/// does the same — so validation, dedupe, the write gate and the activation-time
+/// provenance all happen identically however the memory got here. A second insert path
+/// is how a corpus stops being made of the same memories a user would make.
+///
+/// # Errors
+///
+/// Returns [`Error::Invalid`] for an empty title, a confidence or importance outside
+/// `0.0..=1.0`, or more than [`MAX_TAGS`] tags. Returns [`Error::Database`] if the insert
+/// fails.
+fn insert_one(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    review_mode: ReviewMode,
+    new: &NewMemory,
+) -> Result<AddOutcome> {
+    let title = new.title.trim();
+    if title.is_empty() {
+        return Err(Error::Invalid(
+            "a memory needs a title; pass --title, or --from-file to take one from a file"
+                .to_owned(),
+        ));
+    }
+    check_unit_range("--confidence", new.confidence)?;
+    check_unit_range("--importance", Some(new.importance))?;
+    if new.source.trim().is_empty() {
+        return Err(Error::Invalid(
+            "--source needs a value; omit it to record a `user_saved` memory".to_owned(),
+        ));
+    }
+
+    let mut warnings = Vec::new();
+    let tags = metadata::normalize_tags(&new.tags).map_err(Error::Invalid)?;
+    let validated = metadata::validate(new.kind, new.memory_metadata.as_ref());
+    warnings.extend(validated.warning);
+
+    let content_hash = hash::content_hash(new.kind, title, &new.body);
+
+    if !new.force {
+        if let Some(existing) = find_duplicate_near(transaction, workspace_id, &content_hash, new) {
+            return Ok(AddOutcome {
+                id: existing.id,
+                workspace_id: existing.workspace_id,
+                status: existing.status,
+                duplicate: true,
+                warnings,
+            });
+        }
+    }
+
+    let status = gate::decide(&new.source, new.confidence, review_mode).status();
+    let new_id = id::new_memory_id()?;
+
+    transaction.execute(
+        INSERT_MEMORY_SQL,
+        params![
+            new_id,
+            workspace_id,
+            new.kind,
+            title,
+            new.excerpt,
+            new.body,
+            encode_tags(&tags),
+            metadata::tags_text(&tags),
+            validated.value.to_string(),
+            new.source.trim(),
+            new.source_url,
+            new.confidence,
+            new.importance,
+            status,
+            content_hash,
+        ],
+    )?;
+
+    // Provenance is wired at activation, never for a draft: a `derived_from` edge from a
+    // memory nobody has approved would point at something retrieval cannot return.
+    if status == Status::Active && !new.derived_from.is_empty() {
+        warnings.extend(link_derived_from(transaction, &new_id, &new.derived_from)?);
+    }
+
+    Ok(AddOutcome {
+        id: new_id,
+        workspace_id: workspace_id.to_owned(),
+        status,
+        duplicate: false,
+        warnings,
+    })
+}
 
 /// The duplicate lookup, against any connection so it can see uncommitted rows.
 fn find_duplicate_near(

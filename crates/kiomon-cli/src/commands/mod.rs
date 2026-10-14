@@ -14,6 +14,7 @@
 //! by raising an error would print a second document on the JSON path — breaking the
 //! one-document rule — so the conclusion is a return value instead.
 
+pub mod bench;
 pub mod lifecycle;
 pub mod portability;
 pub mod read;
@@ -35,6 +36,7 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Init(args) => setup::init(cli, args),
         Command::Doctor(args) => setup::doctor(cli, args),
         Command::Stats(args) => setup::stats(cli, args),
+        Command::Bench(args) => bench::bench(cli, args),
 
         Command::Add(args) => write::add(cli, args),
         Command::Update(args) => write::update(cli, args),

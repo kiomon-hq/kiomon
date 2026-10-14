@@ -75,6 +75,9 @@ pub enum Command {
     /// Show how much is in the brain, by kind and status.
     Stats(StatsArgs),
 
+    /// Measure this build on this machine: retrieval, writes, and the plan's budget.
+    Bench(BenchArgs),
+
     /// Save one memory.
     Add(AddArgs),
     /// Change an existing memory.
@@ -137,6 +140,62 @@ pub struct DoctorArgs {
     /// Print the resolved paths and configuration without the checks.
     #[arg(long)]
     pub paths_only: bool,
+}
+
+/// `kiomon bench`
+#[derive(Debug, Args)]
+pub struct BenchArgs {
+    /// Corpus sizes to measure, comma-separated. Each is built once and reused.
+    ///
+    /// One thousand and ten thousand by default. One hundred thousand is not among them
+    /// because that corpus is 1.9 GiB and takes about a hundred seconds to build, and a
+    /// ruler nobody picks up because it is heavy is not a ruler.
+    #[arg(long, value_name = "N", value_delimiter = ',')]
+    pub sizes: Vec<usize>,
+
+    /// Where the corpora live. Defaults to `kiomon-bench` in the system temp directory,
+    /// which is on the system volume rather than beside the source tree: a database's
+    /// write cost can differ forty-fold between two disks, so the corpus's path is a
+    /// measurement parameter rather than an implementation detail.
+    #[arg(long, value_name = "DIR")]
+    pub corpus: Option<PathBuf>,
+
+    /// Build the corpus again even if a database of the right size is already there.
+    #[arg(long)]
+    pub rebuild: bool,
+
+    /// Samples per command. A median and a 95th percentile need enough of them to mean
+    /// anything, and every one is its own process.
+    ///
+    /// Fifty by default, and the number is not arbitrary. This host interrupts a spawn
+    /// somewhere between once in forty and once in ninety — with a delay of five to twenty
+    /// times the median, measured on `--version`, which opens no file and prints one line —
+    /// and a 95th percentile over thirty samples is the 29th, so a single interruption
+    /// decides the gate. At fifty the percentile has two samples of slack; at two hundred
+    /// it has ten, which is what CI uses. A gate read at too few samples is a gate that
+    /// fails on the weather.
+    #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=2000))]
+    pub runs: u32,
+
+    /// Run the whole suite this many times and report how far the medians moved.
+    ///
+    /// The plan's reproducibility criterion as a number: three runs on one machine must
+    /// agree within fifteen percent, or the harness is measuring the machine's mood
+    /// rather than the code.
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=10))]
+    pub repeat: u32,
+
+    /// Apply the plan's performance budget, and exit `1` if any part of it is missed.
+    #[arg(long)]
+    pub gate: bool,
+
+    /// Open the database, report what the platform offers about it, and exit.
+    ///
+    /// The probe the harness times to measure `open` on its own. It is public because a
+    /// reader who wants to know what opening their own brain costs should not have to
+    /// read the harness to find out how to ask.
+    #[arg(long)]
+    pub open: bool,
 }
 
 /// `kiomon stats`

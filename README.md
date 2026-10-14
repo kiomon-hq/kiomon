@@ -40,42 +40,60 @@ does far less.
 ## The numbers
 
 A local memory system is only worth using if it is not the slow part of the loop. These
-are measured, not asserted, and they are read the same way the plan's §7 budget is read:
-**subtract the process-spawn floor**, because on Windows spawning the process at all costs
-about 9 ms.
+are measured by `kiomon bench`, which ships in the binary, so you can run it against your
+own machine instead of believing this one.
 
-One developer machine — Intel Core i5-9300H, Windows, `--release`, warm OS cache,
-**10 000 memories of about a kilobyte** (47 MiB), one in seven of them mentioning
-`deploy`.
+Read it the way the plan's §7 budget is read: **`work` is `total` minus the process-spawn
+floor**, because on Windows spawning the process at all costs about 8 ms and on Linux about
+1 ms. The budget is written against `work`, since a gate read on `total` compares operating
+systems rather than code.
 
-| | p50 | p95 |
-|---|---|---|
-| `kiomon --version` (the spawn floor) | 8.9 ms | 11.0 ms |
-| `kiomon search "deploy"` | 26.0 ms | 31.8 ms |
-| `kiomon search` (a whole sentence, five terms) | 30.8 ms | 35.6 ms |
-| `kiomon search --limit 50` | 48.1 ms | 63.7 ms |
-| `kiomon list` (20) | 12.6 ms | 16.2 ms |
-| `kiomon stats` | 14.1 ms | 21.0 ms |
-| `kiomon get <id>` | 12.8 ms | 15.9 ms |
-| `kiomon add` | 12.5 ms | 14.8 ms |
+One developer machine — Intel Core i5-9300H, Windows, `--release`, warm cache — with a
+**generated corpus of 10 000 memories, 197 MiB**, bodies 60 % short / 30 % medium / 10 %
+long, and one memory in seven containing the word `deploy`.
 
-Binary **2.9 MiB** from **33** transitive crates. The plan's budget is `search` p95 ≤ 60 ms
-and `add` p50 ≤ 15 ms: both hold for the default page, and `--limit 50` crosses the gate at
-p95 because the ranked window grows with the page. That is written down rather than rounded
-off.
+| | work p50 | work p95 | total p50 |
+|---|---|---|---|
+| `kiomon --version` (the spawn floor, no work at all) | — | — | 8.2 ms |
+| `kiomon bench --open` | 2.0 ms | 5.2 ms | 10.2 ms |
+| `kiomon add` | 3.0 ms | 6.6 ms | 11.2 ms |
+| `kiomon get <id>` | 2.5 ms | 6.1 ms | 10.6 ms |
+| `kiomon list` (20) | 2.9 ms | 7.7 ms | 11.1 ms |
+| `kiomon stats` | 4.4 ms | 8.8 ms | 12.4 ms |
+| `kiomon search "timeout"` (40 rows matched) | 13.3 ms | 19.8 ms | 21.6 ms |
+| `kiomon search "flaky"` (250 rows) | 15.5 ms | 21.3 ms | 23.7 ms |
+| **`kiomon search "deploy"` (1 446 rows)** | **26.8 ms** | **38.9 ms** | 34.9 ms |
+| `kiomon search "deploy" --no-record` | 18.0 ms | 26.3 ms | 26.4 ms |
+| `kiomon search "deploy" --limit 50` | 21.9 ms | 33.1 ms | 30.5 ms |
 
-Three caveats, because a number without them is a claim:
+Binary **3.2 MiB** from **33** transitive crates. The plan's gates are `open` p50 ≤ 5 ms,
+`add` p95 ≤ 40 ms and `search` p95 ≤ 60 ms at ten thousand memories: all met, with the
+first write to a brand-new database file the one number that is genuinely expensive —
+**16.6 ms**, against 3 ms for the next write into the same file.
 
-- **There is no bench harness yet** — that is WP3, and these are one machine's numbers
-  rather than a benchmark.
-- **The corpus is generated, not collected.** It gives each memory its own vocabulary out
-  of a three-thousand-word pool, so a query for a common term matches one memory in seven.
-  The first attempt drew every body from the same twenty-nine words and measured a corpus
-  in which every term matched every memory — which cannot tell a ranking from a scan. See
-  the plan.
+Four things worth knowing before quoting any of these:
+
+- **A search's cost is the number of rows it has to rank, and `--limit` does not bound it.**
+  Forty matches cost 13 ms and 1 446 cost 27 ms, while `--limit 50` costs about the same as
+  `--limit 10` — the window is what the ranking reads, not the page. At **100 000
+  memories** (1.9 GiB) a common term matches 14 457 rows and takes **187 ms**. The plan's
+  60 ms gate is written for ten thousand, where it holds; the number to watch as a brain
+  grows is the match count, not the row count.
+- **`kiomon search` records what it returned, and that is a write.** It costs 8.8 ms of the
+  26.8, and that counter is what stretches a memory's decay clock. `--no-record` is there
+  for callers that only want to look.
+- **The corpus is generated, not collected.** It models size, distribution and
+  selectivity — not English, and not the vocabulary you actually write down.
 - **The volume matters more than the machine.** The same binary on the same database file
-  spent 47–145 ms on its first write on one drive and 2.9–5.9 ms on another. These numbers
-  are from the fast one.
+  spent 47–145 ms on its first write on one drive and 2.9–5.9 ms on another. `kiomon bench`
+  prints the corpus's path for exactly this reason, and its default is the system volume.
+
+One more caveat that is about the machine and not the code: **p95 on a general-purpose
+computer measures the computer.** On this laptop a 200 ms interruption arrives roughly once
+in a few hundred spawns and lands on `--version` — which opens nothing and prints one line —
+as readily as on a search. That is why the gates are read at two hundred samples per row
+(with ten samples of slack at the 95th percentile) and why the medians are the numbers to
+compare. `kiomon bench --repeat 3` prints each pass's median beside the verdict.
 
 ## What it does
 
@@ -90,6 +108,7 @@ Three caveats, because a number without them is a claim:
 | **Feedback** | *(WP4)* `rate` and `outcome` credit move a memory's strength, so the corpus gets sharper instead of just bigger. |
 | **Workspaces** | isolation is a `WHERE` clause. `--workspace` stays where you point it; `--workspace '*'` is an explicit opt-in to every workspace. |
 | **Agent-grade CLI** | every command takes `--json`, exit codes are stable and documented, and diagnostics never pollute stdout — so `kiomon search … \| jq` always works. A search reports which of its three query forms answered, and which legs ran, so an agent can see *why* it got what it got. |
+| **Measured, not asserted** | `kiomon bench` measures this build on your machine: cold-process timings per command, the corpus's shape, the process-spawn floor, and the plan's budget applied as a pass or a fail. It ships in the binary so the numbers above are falsifiable. |
 | **Yours** | `export` to JSONL and `import` back. The brain is a file you own and can read. |
 
 ## What it deliberately is not
@@ -141,6 +160,7 @@ kiomon list                               # unranked: strongest first, one line 
 kiomon get k_01JC9W5K2Q                   # the whole memory
 kiomon doctor                             # integrity, schema version, index agreement
 kiomon stats
+kiomon bench --gate                       # measure this machine against the budget
 ```
 
 Every command takes `--json`, and `--quiet` on a command that has nothing to say. A `2`

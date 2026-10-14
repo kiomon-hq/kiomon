@@ -1291,3 +1291,204 @@ fn a_search_can_be_ordered_by_recency_or_strength() {
         assert!(!stdout(&out).is_empty(), "`--sort {sort}` found nothing");
     }
 }
+
+// ---------------------------------------------------------------------------
+// bench
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bench_open_reports_the_database_it_opened_and_nothing_else() {
+    let sandbox = Sandbox::new();
+    add(&sandbox, &["--kind", "semantic", "--title", "a memory"]);
+    let db = sandbox.db_arg();
+
+    let value = json(&["bench", "--db", &db, "--open", "--json"]);
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert_eq!(value["data"]["path"].as_str(), Some(db.as_str()));
+    assert_eq!(
+        value["data"]["schema_version"],
+        serde_json::json!(kiomon_core::Database::target_schema_version()),
+        "the probe reports the version the file is at, not the one the build wants"
+    );
+
+    // The human path prints nothing at all, because the harness times this probe and a
+    // print at ten thousand rows would be a measurement of the print.
+    let out = run(&["bench", "--db", &db, "--open"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(stdout(&out), "", "the open probe must not write to stdout");
+}
+
+#[test]
+fn bench_measures_a_corpus_and_reports_what_it_built() {
+    let sandbox = Sandbox::new();
+    let corpus = sandbox.dir.join("corpus");
+    let corpus_arg = corpus.display().to_string();
+
+    let value = json(&[
+        "bench",
+        "--sizes",
+        "100",
+        "--runs",
+        "1",
+        "--corpus",
+        &corpus_arg,
+        "--quiet",
+        "--json",
+    ]);
+    let data = &value["data"];
+    assert_eq!(value["ok"], serde_json::json!(true), "{value}");
+    assert_eq!(data["reports"].as_array().map(Vec::len), Some(1));
+    let report = &data["reports"][0];
+
+    // The shape is the deliverable: a corpus whose bodies are all one size cannot find the
+    // defects a mixed one does.
+    assert_eq!(report["corpus"]["size"], serde_json::json!(100));
+    let classes = report["corpus"]["classes"]
+        .as_array()
+        .expect("the size classes");
+    let counts: Vec<i64> = classes
+        .iter()
+        .map(|class| class["memories"].as_i64().expect("a count"))
+        .collect();
+    assert_eq!(counts, vec![60, 30, 10], "60 / 30 / 10 was asked for");
+
+    // Every probe query says how many rows it matched, and one of them is planted to match
+    // nothing — a corpus that cannot express "no results" cannot measure an empty search.
+    let probes = report["corpus"]["probes"].as_array().expect("the probes");
+    let matches: Vec<i64> = probes
+        .iter()
+        .map(|probe| probe["matches"].as_i64().expect("a count"))
+        .collect();
+    assert!(
+        matches.windows(2).any(|pair| pair[0] > pair[1]),
+        "the planted terms must span more than one selectivity: {matches:?}"
+    );
+    assert!(
+        matches.contains(&0),
+        "one planted term must match nothing: {matches:?}"
+    );
+
+    // The rows, and the two numbers on every one of them.
+    let rows = report["rows"].as_array().expect("the rows");
+    assert!(rows.len() >= 12, "only {} rows: {rows:?}", rows.len());
+    for row in rows {
+        assert!(row["total_p50_ms"].is_number(), "{row}");
+        assert!(row["work_p50_ms"].is_number(), "{row}");
+        assert!(
+            row["work_p50_ms"].as_f64().expect("a number")
+                <= row["total_p50_ms"].as_f64().expect("a number"),
+            "work cannot exceed total: {row}"
+        );
+    }
+    assert!(
+        rows.iter().any(|row| row["label"] == "open"),
+        "the open row is the one that decides the daemon question"
+    );
+
+    // The gates, and the ones this build cannot answer.
+    let gates = report["gates"].as_array().expect("the gates");
+    let labels: Vec<&str> = gates
+        .iter()
+        .map(|gate| gate["label"].as_str().expect("a label"))
+        .collect();
+    assert!(labels.contains(&"open"));
+    assert!(labels.contains(&"add"));
+    assert!(labels.contains(&"search common"));
+    assert!(
+        report["rejected"]
+            .as_array()
+            .expect("the deferred gates")
+            .iter()
+            .any(|line| line.as_str().is_some_and(|line| line.contains("embedder"))),
+        "the hybrid gate is deferred, and a budget with a silent hole in it is worse than one \
+         that names the hole"
+    );
+}
+
+#[test]
+fn a_second_bench_run_reuses_the_corpus_rather_than_building_it_again() {
+    let sandbox = Sandbox::new();
+    let corpus = sandbox.dir.join("corpus");
+    let corpus_arg = corpus.display().to_string();
+    let args = [
+        "bench",
+        "--sizes",
+        "50",
+        "--runs",
+        "1",
+        "--corpus",
+        &corpus_arg,
+        "--quiet",
+        "--json",
+    ];
+
+    let first = json(&args);
+    assert_eq!(first["data"]["reports"][0]["corpus"]["reused"], false);
+    let second = json(&args);
+    assert_eq!(
+        second["data"]["reports"][0]["corpus"]["reused"], true,
+        "a corpus of the right size must be measured, not rebuilt"
+    );
+    assert_eq!(
+        second["data"]["reports"][0]["corpus"]["body_bytes"],
+        first["data"]["reports"][0]["corpus"]["body_bytes"],
+        "the reused corpus must be the same one, to the byte"
+    );
+
+    // And a rebuild really rebuilds: the same seed must produce the same bytes, or two runs
+    // of two builds are not measuring the same input.
+    let rebuilt = json(
+        &args
+            .iter()
+            .copied()
+            .chain(["--rebuild"])
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(rebuilt["data"]["reports"][0]["corpus"]["reused"], false);
+    assert_eq!(
+        rebuilt["data"]["reports"][0]["corpus"]["body_bytes"],
+        first["data"]["reports"][0]["corpus"]["body_bytes"],
+        "the same seed must build the same corpus"
+    );
+}
+
+#[test]
+fn bench_gate_is_the_plan_s_limits_and_a_missed_gate_is_an_exit_code() {
+    let sandbox = Sandbox::new();
+    let corpus = sandbox.dir.join("corpus");
+    let corpus_arg = corpus.display().to_string();
+    let out = run(&[
+        "bench",
+        "--sizes",
+        "50",
+        "--runs",
+        "1",
+        "--corpus",
+        &corpus_arg,
+        "--quiet",
+        "--gate",
+        "--json",
+    ]);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&out)).expect("one JSON document on stdout");
+
+    // A tiny corpus on any machine this runs on meets every gate the plan defines for this
+    // build, so the *passing* exit code is 0. The failing path is `evaluate`'s, and it is
+    // asserted where it lives rather than by trying to make a fast machine slow.
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(
+        value["data"]["gates_passed"],
+        serde_json::json!(true),
+        "{value}"
+    );
+    for gate in value["data"]["reports"][0]["gates"]
+        .as_array()
+        .expect("the gates")
+    {
+        assert_eq!(gate["passed"], serde_json::json!(true), "{gate}");
+        assert!(
+            gate["limit_ms"].as_f64().expect("a limit") > 0.0,
+            "a gate without a limit is not a gate: {gate}"
+        );
+    }
+}

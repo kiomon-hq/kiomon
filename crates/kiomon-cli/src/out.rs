@@ -321,6 +321,617 @@ pub fn render_memory(memory: &Memory, width: usize) -> String {
     out.trim_end().to_owned()
 }
 
+// ---------------------------------------------------------------------------
+// bench
+// ---------------------------------------------------------------------------
+
+/// One command's samples, in milliseconds.
+///
+/// The samples are kept rather than reduced to a mean, because a mean of a bimodal
+/// distribution is a number that describes no run that ever happened. Every statistic the
+/// report prints is derived from the same list, and the list's worst member is printed
+/// too.
+#[derive(Debug, Clone, Serialize)]
+pub struct Sample {
+    /// Each cold-process sample, in milliseconds.
+    pub samples: Vec<f64>,
+}
+
+impl Sample {
+    /// The median, by nearest rank.
+    #[must_use]
+    pub fn p50(&self) -> f64 {
+        self.rank(0.5)
+    }
+
+    /// The 95th percentile, by nearest rank.
+    ///
+    /// Nearest rank rather than an interpolated quantile: with fifteen samples an
+    /// interpolated p95 is a number between the largest two and describes neither, and
+    /// this project would rather report a sample that happened.
+    #[must_use]
+    pub fn p95(&self) -> f64 {
+        self.rank(0.95)
+    }
+
+    /// The smallest sample, or zero if there are none.
+    #[must_use]
+    pub fn min(&self) -> f64 {
+        self.samples.iter().copied().fold(f64::INFINITY, f64::min)
+    }
+
+    /// The largest sample, or zero if there are none.
+    #[must_use]
+    pub fn max(&self) -> f64 {
+        self.samples
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    /// How far the samples spread, as a fraction of the median.
+    ///
+    /// A command whose worst sample is twice its median is one whose median nobody should
+    /// plan against, and this is how the report says so instead of averaging it away.
+    /// (The plan's *reproducibility* criterion is about run-to-run agreement and needs
+    /// `--repeat`; this is the within-run version, which is the one a single run can see.)
+    #[must_use]
+    pub fn spread(&self) -> f64 {
+        let median = self.p50();
+        if median <= 0.0 || self.samples.is_empty() {
+            return 0.0;
+        }
+        (self.max() - self.min()) / median
+    }
+
+    fn rank(&self, percentile: f64) -> f64 {
+        if self.samples.is_empty() {
+            return 0.0;
+        }
+        let mut sorted = self.samples.clone();
+        sorted.sort_by(f64::total_cmp);
+        // A sample count, so the conversions are exact for any run a person would sit
+        // through; the lint is about the general case and this is not it.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let index = ((sorted.len() as f64 * percentile).ceil() as usize)
+            .saturating_sub(1)
+            .min(sorted.len() - 1);
+        sorted[index]
+    }
+}
+
+impl From<Vec<f64>> for Sample {
+    fn from(samples: Vec<f64>) -> Self {
+        Self { samples }
+    }
+}
+
+/// One row of the report: a command, and what it cost.
+///
+/// The raw samples are kept and pooled across `--repeat` passes rather than reduced
+/// pass-by-pass, because the host this was developed on moves by more than the plan's
+/// whole reproducibility budget in the time it takes to run the suite twice. Sixty
+/// samples pooled are a better estimate than three medians averaged, and the per-pass
+/// medians are kept beside them so a reader can see the drift rather than be told about
+/// it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Row {
+    /// What was run, in the report's own vocabulary.
+    pub label: String,
+    /// The query, for the rows that are searches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// How many rows the query matched, for the rows that are searches.
+    pub matches: i64,
+    /// How many samples one pass took.
+    pub runs: usize,
+    /// How many passes were pooled.
+    pub passes: usize,
+    /// The median of every sample, spawn included.
+    pub total_p50_ms: f64,
+    /// The 95th percentile, spawn included.
+    pub total_p95_ms: f64,
+    /// The median of `total − floor`, sampled in the same pass.
+    pub work_p50_ms: f64,
+    /// The 95th percentile of `total − floor`, sampled in the same pass.
+    pub work_p95_ms: f64,
+    /// The fastest sample, spawn included.
+    pub min_ms: f64,
+    /// The slowest sample, spawn included.
+    pub max_ms: f64,
+    /// `(max − min) / median`, on the raw totals.
+    pub spread: f64,
+    /// The work median from each pass, when there was more than one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pass_work_p50_ms: Vec<f64>,
+    /// Whether the passes agreed within the plan's fifteen percent. `None` for one pass,
+    /// because one pass cannot disagree with itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reproducible: Option<bool>,
+    /// Every sample, kept for the merge and never serialized.
+    #[serde(skip)]
+    pub total_ms: Vec<f64>,
+    /// The spawn floor sampled alongside each of them.
+    #[serde(skip)]
+    pub floor_ms: Vec<f64>,
+}
+
+impl Row {
+    /// An empty row, ready for samples.
+    ///
+    /// Every statistic is zero until [`Row::summarise`] has run, and `summarise` is called
+    /// once, after all the samples are in — never once per sample. Two places computing the
+    /// same median is two places to disagree about it.
+    #[must_use]
+    pub fn empty(label: String, query: Option<String>, matches: i64) -> Self {
+        Self {
+            label,
+            query,
+            matches,
+            runs: 0,
+            passes: 1,
+            total_p50_ms: 0.0,
+            total_p95_ms: 0.0,
+            work_p50_ms: 0.0,
+            work_p95_ms: 0.0,
+            min_ms: 0.0,
+            max_ms: 0.0,
+            spread: 0.0,
+            pass_work_p50_ms: Vec::new(),
+            reproducible: None,
+            total_ms: Vec::new(),
+            floor_ms: Vec::new(),
+        }
+    }
+
+    /// The work samples: what each sample cost with the floor it was measured against
+    /// subtracted, paired by position.
+    ///
+    /// Paired by position rather than by mean because the floor and the command move
+    /// together: a sample taken while the machine was busy should be compared with a
+    /// floor taken while it was busy, not with the quiet average. Where the floor has
+    /// fewer samples than the row — it is sampled once per pass and a row is sampled
+    /// `--runs` times per pass — the floor samples are reused, which is right, because
+    /// each pass has one floor and every row in that pass shares it.
+    #[must_use]
+    pub fn work_samples(&self) -> Vec<f64> {
+        if self.floor_ms.is_empty() {
+            return self.total_ms.clone();
+        }
+        self.total_ms
+            .iter()
+            .enumerate()
+            .map(|(index, total)| (total - self.floor_ms[index % self.floor_ms.len()]).max(0.0))
+            .collect()
+    }
+
+    /// Fill in every statistic from the raw samples.
+    pub(crate) fn summarise(&mut self) {
+        let total = Sample::from(self.total_ms.clone());
+        let work = Sample::from(self.work_samples());
+        self.total_p50_ms = round(total.p50());
+        self.total_p95_ms = round(total.p95());
+        self.work_p50_ms = round(work.p50());
+        self.work_p95_ms = round(work.p95());
+        self.min_ms = round(total.min());
+        self.max_ms = round(total.max());
+        self.spread = round(total.spread());
+    }
+}
+
+/// Merge `--repeat` passes into one report.
+///
+/// The rows are the same commands in the same order every pass, so they are matched by
+/// label rather than by position: a pass that measured one row fewer would otherwise
+/// shift every number in the report onto the wrong command, silently.
+pub(crate) fn merge_passes(passes: &[Vec<Row>]) -> (Vec<Row>, Vec<GateResult>) {
+    let Some(mut merged) = passes.first().cloned() else {
+        return (Vec::new(), Vec::new());
+    };
+    for row in &mut merged {
+        row.passes = passes.len();
+        row.total_ms.clear();
+        row.floor_ms.clear();
+        row.pass_work_p50_ms = passes
+            .iter()
+            .filter_map(|pass| {
+                pass.iter()
+                    .find(|candidate| candidate.label == row.label)
+                    .map(|candidate| round(Sample::from(candidate.work_samples()).p50()))
+            })
+            .collect();
+        for pass in passes {
+            if let Some(candidate) = pass.iter().find(|candidate| candidate.label == row.label) {
+                row.total_ms.extend(&candidate.total_ms);
+                // The floor is the same list for every row in a pass, and pooling it once
+                // per row keeps the positional pairing intact.
+                row.floor_ms.extend(&candidate.floor_ms);
+            }
+        }
+        let lowest = row
+            .pass_work_p50_ms
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let highest = row
+            .pass_work_p50_ms
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        row.reproducible = Some(lowest > 0.0 && highest / lowest <= 1.15);
+        row.summarise();
+    }
+    let gates = evaluate(&merged);
+    (merged, gates)
+}
+
+/// Which percentile a gate reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Percentile {
+    /// The median.
+    P50,
+    /// The 95th.
+    P95,
+}
+
+/// One line of the plan's §7 budget, as code.
+///
+/// Absolute rather than a ratio against the last run, and the plan says why: a ratio gate
+/// on a shared runner is a flaky-test generator. Absolute gates are noisy too — which is
+/// why they read `work`, and why the report prints the spread next to them — but a gate
+/// that occasionally fails loudly is worth more than one that never fails at all.
+pub(crate) struct Gate {
+    /// The row it reads.
+    pub(crate) label: &'static str,
+    /// Which percentile of that row.
+    pub(crate) percentile: Percentile,
+    /// The most it may be, in milliseconds.
+    pub(crate) limit_ms: f64,
+}
+
+/// The gates, exactly as the plan states them.
+///
+/// The hybrid-search gate is **absent rather than passing**: there is no embedder until
+/// WP7, and a gate that cannot fail is not a gate. `bench --gate` says so out loud rather
+/// than leaving the reader to notice the omission.
+pub(crate) const GATES: &[Gate] = &[
+    Gate {
+        label: "open",
+        percentile: Percentile::P50,
+        limit_ms: 5.0,
+    },
+    Gate {
+        label: "add",
+        percentile: Percentile::P95,
+        limit_ms: 40.0,
+    },
+    Gate {
+        label: "search common",
+        percentile: Percentile::P95,
+        limit_ms: 60.0,
+    },
+];
+
+/// Evaluate the plan's gates against the rows.
+fn evaluate(rows: &[Row]) -> Vec<GateResult> {
+    GATES
+        .iter()
+        .map(|gate| {
+            let row = rows.iter().find(|row| row.label == gate.label);
+            let measured = row.map(|row| match gate.percentile {
+                Percentile::P50 => row.work_p50_ms,
+                Percentile::P95 => row.work_p95_ms,
+            });
+            GateResult {
+                label: gate.label,
+                percentile: match gate.percentile {
+                    Percentile::P50 => "p50",
+                    Percentile::P95 => "p95",
+                },
+                limit_ms: gate.limit_ms,
+                measured_ms: measured,
+                passed: measured.is_some_and(|value| value <= gate.limit_ms),
+            }
+        })
+        .collect()
+}
+
+/// One line of the plan's budget, and what this run measured against it.
+#[derive(Debug, Clone, Serialize)]
+pub struct GateResult {
+    /// The row it reads.
+    pub label: &'static str,
+    /// Which percentile of that row.
+    pub percentile: &'static str,
+    /// The most it may be.
+    pub limit_ms: f64,
+    /// What it was, or `None` if the row is missing.
+    pub measured_ms: Option<f64>,
+    /// Whether it was met.
+    pub passed: bool,
+}
+
+impl GateResult {
+    /// The gate as a line of the human report.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let measured = self.measured_ms.map_or_else(
+            || "not measured".to_owned(),
+            |value| format!("{value:.2} ms"),
+        );
+        format!(
+            "  {} {} {} ≤ {:.2} ms",
+            if self.passed { "PASS" } else { "FAIL" },
+            self.label,
+            measured,
+            self.limit_ms
+        )
+    }
+}
+
+/// One corpus, fully measured.
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchReport {
+    /// What was measured: its size, its shape, its path, and how many rows each probe
+    /// query matches.
+    pub corpus: kiomon_core::bench::CorpusReport,
+    /// The spawn floor every `work` figure was derived from.
+    pub spawn_floor: Sample,
+    /// The rows.
+    pub rows: Vec<Row>,
+    /// The plan's gates.
+    pub gates: Vec<GateResult>,
+    /// This process's peak resident set, where the platform reports one.
+    pub peak_rss_kb: Option<u64>,
+    /// What the plan asks of this build that this build cannot answer yet.
+    pub rejected: Vec<&'static str>,
+}
+
+/// The `data` block of a `bench` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchResponse {
+    /// The directory the corpora are in, which is on some volume or other — and which
+    /// volume it is happens to be one of the largest variables in the whole report.
+    pub corpus_dir: String,
+    /// The operating system and architecture, because a spawn floor is a property of one.
+    pub os: String,
+    /// The processor count, which decides how much of this runs while other things do.
+    pub cpus: usize,
+    /// The size of the binary that was measured.
+    pub binary_bytes: Option<u64>,
+    /// Every corpus, largest last.
+    pub reports: Vec<BenchReport>,
+    /// Whether every gate was met.
+    pub gates_passed: bool,
+}
+
+impl BenchResponse {
+    pub(crate) fn new(
+        reports: Vec<BenchReport>,
+        dir: &std::path::Path,
+        binary_bytes: Option<u64>,
+    ) -> Self {
+        let gates_passed = reports
+            .iter()
+            .all(|report| report.gates.iter().all(|gate| gate.passed));
+        Self {
+            corpus_dir: dir.display().to_string(),
+            os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            cpus: std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
+            binary_bytes,
+            reports,
+            gates_passed,
+        }
+    }
+}
+
+/// What `bench --open` reports.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenProbe {
+    /// The database that was opened.
+    pub path: String,
+    /// Its schema version, read from the file header.
+    pub schema_version: u32,
+    /// Peak resident set, where the platform reports one.
+    pub peak_rss_kb: Option<u64>,
+}
+
+/// The human report.
+///
+/// A table rather than prose, with the spawn floor and the corpus's shape *above* the
+/// numbers they qualify. A benchmark's two most important numbers are what it measured and
+/// what it subtracted, and a reader who has to scroll to find them will not.
+///
+/// Assembled with `writeln!` into a `String` whose writer cannot fail, so every `Result` is
+/// discarded on purpose rather than handled.
+#[must_use]
+pub fn render_bench(response: &BenchResponse) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "kiomon bench — {} on {} ({} cpus), binary {}",
+        env!("CARGO_PKG_VERSION"),
+        response.os,
+        response.cpus,
+        response
+            .binary_bytes
+            .map_or_else(|| "unknown".to_owned(), kib)
+    );
+    let _ = writeln!(out, "corpus volume: {}\n", response.corpus_dir);
+    for report in &response.reports {
+        out.push_str(&render_report(report));
+    }
+    let _ = writeln!(
+        out,
+        "gates (the plan's budget, read against the column that is work and not wall time)"
+    );
+    for report in &response.reports {
+        let _ = writeln!(out, "  at {} memories", report.corpus.size);
+        for gate in &report.gates {
+            let _ = writeln!(out, "{}", gate.line());
+        }
+    }
+    let _ = writeln!(out, "\nnot measured by this build");
+    for line in response
+        .reports
+        .first()
+        .map_or(&[][..], |report| &report.rejected)
+    {
+        let _ = writeln!(out, "  {line}");
+    }
+    let _ = writeln!(
+        out,
+        "\n{}\n\nThe gates read `work`: `total` minus the {:.2} ms this platform spends spawning a \
+         process at all. `total` is what a user pays; `work` is what the code is answerable for.",
+        if response.gates_passed {
+            "every gate the plan defines for this build was met"
+        } else {
+            "a gate was missed; CI fails on this, and so should a release"
+        },
+        response
+            .reports
+            .last()
+            .map_or(0.0, |report| report.spawn_floor.p50()),
+    );
+    out
+}
+
+/// One corpus's table.
+fn render_report(report: &BenchReport) -> String {
+    use std::fmt::Write as _;
+    let corpus = &report.corpus;
+    let mut out = String::new();
+    let _ = writeln!(out, "{} memories", corpus.size);
+    let _ = writeln!(
+        out,
+        "  corpus: {:.1} MiB on disk, {:.2} KiB mean body, built in {:.1} s{}",
+        mib(corpus.disk_bytes),
+        mean_kib(corpus.mean_body_bytes()),
+        corpus.seconds,
+        if corpus.reused { " (reused)" } else { "" }
+    );
+    out.push_str("  shape:  ");
+    for class in &corpus.classes {
+        let _ = write!(
+            out,
+            "{} {} ({:.0}% asked, {:.0}% built, {:.0} B mean)   ",
+            class.class.as_str(),
+            class.memories,
+            class.target_percent,
+            class.actual_percent(corpus.size as u64),
+            class
+                .mean_bytes()
+                .map_or(0.0, |mean| mean_kib(mean) * 1024.0),
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\n  spawn floor: {:.2} ms p50, {:.2} ms p95",
+        report.spawn_floor.p50(),
+        report.spawn_floor.p95()
+    );
+    let _ = writeln!(out, "  what a query had to rank");
+    for probe in &corpus.probes {
+        let _ = writeln!(
+            out,
+            "    {:<9} {:>7} rows   {:>8}   {}",
+            probe.name, probe.matches, probe.planted, probe.query
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  command                          work p50  work p95   total p50     min     max   spread"
+    );
+    for row in &report.rows {
+        let _ = writeln!(
+            out,
+            "  {:<30} {:>8.2} {:>9.2} {:>11.2} {:>7.2} {:>7.2} {:>7.0}%{}",
+            row.label,
+            row.work_p50_ms,
+            row.work_p95_ms,
+            row.total_p50_ms,
+            row.min_ms,
+            row.max_ms,
+            row.spread * 100.0,
+            render_passes(row),
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  peak resident set: {}",
+        report
+            .peak_rss_kb
+            .map_or_else(|| "not reported on this platform".to_owned(), kib)
+    );
+    out.push('\n');
+    out
+}
+
+/// How the `--repeat` passes agreed, or nothing when there was only one.
+///
+/// The pass medians are printed and not just the verdict, because "not reproducible"
+/// without the numbers behind it is an accusation the reader cannot check — and because the
+/// *shape* of the drift is the diagnosis: three medians climbing together is a machine
+/// heating up, while 21, 26, 24 is a machine with something else running on it.
+fn render_passes(row: &Row) -> String {
+    if row.pass_work_p50_ms.len() < 2 {
+        return String::new();
+    }
+    let medians = row
+        .pass_work_p50_ms
+        .iter()
+        .map(|value| format!("{value:.1}"))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    format!(
+        "  passes {medians}{}",
+        if row.reproducible == Some(false) {
+            " — over 15% apart"
+        } else {
+            ""
+        }
+    )
+}
+
+/// A byte count as kibibytes or mebibytes, whichever reads better.
+fn kib(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", mib(bytes))
+    } else {
+        format!("{:.0} KiB", mean_kib(bytes))
+    }
+}
+
+/// Byte counts and body sizes, as floats.
+///
+/// A corpus is nowhere near 2^53 bytes and a body is nowhere near it either, so the
+/// conversions are exact for every number this file will ever format. The lint is about the
+/// general case, and this is not the general case.
+#[allow(clippy::cast_precision_loss)]
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+/// Bytes as kibibytes.
+#[allow(clippy::cast_precision_loss)]
+fn mean_kib(bytes: u64) -> f64 {
+    bytes as f64 / 1024.0
+}
+
+/// Two decimal places.
+///
+/// The timer is better than that and the machine is not: run-to-run variance here is
+/// percent-level, so a third decimal is a digit nobody measured. Rounding is how the
+/// report avoids implying precision it does not have.
+fn round(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

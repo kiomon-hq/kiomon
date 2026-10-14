@@ -26,5 +26,12 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # ULID crate plus its `rand` tree, and the format is 40 lines with tests.
 getrandom = "0.4"
 
+# A bench target with no harness and no dependency: it prints its own table. See the top
+# of `benches/store.rs` for why this is not Criterion, and `plans/001-local-v1-core.md`
+# §8 WP3 for the measurement that decided it.
+[[bench]]
+name = "store"
+harness = false
+
 [lints]
 workspace = true

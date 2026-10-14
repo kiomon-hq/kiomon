@@ -81,6 +81,54 @@ jobs:
         with:
           command: check licenses bans sources
 
+  bench:
+    # The plan's §7 budget, enforced rather than asserted. It runs on Linux and on one
+    # runner, because the gates are absolute numbers and absolute numbers are a property of
+    # a machine: on Windows the process spawn alone costs 9 ms, which would fail `open ≤ 5 ms`
+    # before any code ran.
+    #
+    # `--runs 200` is the sample count that makes a 95th percentile a tail statistic rather
+    # than a coin flip. At fifty samples the percentile is the 48th, so one interruption from
+    # whatever else is on the runner decides the gate; at two hundred there are ten samples
+    # of slack. See the plan for the measurement that settled it.
+    name: performance budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Measure, and fail if the budget is missed
+        run: |
+          set -o pipefail
+          ./target/release/kiomon bench --sizes 1000,10000 --runs 200 --repeat 1 --gate --json \
+            | tee bench.json
+      - name: Publish the numbers as an artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench
+          path: bench.json
+          if-no-files-found: error
+      - name: Put the numbers in the log, where a regression is visible in a diff
+        if: always()
+        run: |
+          [ -f bench.json ] || exit 0
+          python3 - <<'EOF'
+          import json
+          with open("bench.json", encoding="utf-8") as handle:
+              data = json.load(handle)["data"]
+          for report in data["reports"]:
+              corpus = report["corpus"]
+              print(f"\n{corpus['size']} memories, {corpus['disk_bytes'] / 1048576:.1f} MiB")
+              for row in report["rows"]:
+                  print(f"  {row['label']:<24} work p50 {row['work_p50_ms']:7.2f} ms  "
+                        f"p95 {row['work_p95_ms']:7.2f} ms  matched {row['matches']}")
+              for gate in report["gates"]:
+                  print(f"  {'PASS' if gate['passed'] else 'FAIL'} {gate['label']} "
+                        f"{gate['percentile']} <= {gate['limit_ms']} ms")
+          EOF
+
   audit:
     name: security advisories
     runs-on: ubuntu-latest

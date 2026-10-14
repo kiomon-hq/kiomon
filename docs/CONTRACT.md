@@ -34,6 +34,9 @@ sequences cannot appear even on a terminal.
 | `3` | Invalid arguments: unknown flag, conflicting options, a bad value, a missing required one. | Fix the command line. Retrying is pointless. |
 | `4` | The request was valid and the environment cannot serve it: no embedder configured for `--legs vector`, an unwritable database directory, an unparseable config file. | Fix the environment or the configuration. |
 
+`1` is also what `bench --gate` returns when a performance gate is missed: the run
+succeeded and the answer is no.
+
 `2` and `1` are deliberately distinct. An agent that receives `2` can conclude a
 memory no longer exists; an agent that receives `1` should try again later.
 
@@ -238,6 +241,53 @@ still what lets a long one through untruncated.
 |---|---|
 | `export` | Streams JSONL (or markdown) as it reads, so a large brain exports without loading into memory. Exported ids are stable and are preserved by `import`. |
 
+### Measurement
+
+| Command | Promise |
+|---|---|
+| `bench` | Measures **this build on this machine**, at corpus sizes you choose, against the performance budget in `plans/001-local-v1-core.md` §7. `--gate` applies the budget and exits `1` if any part of it is missed. It is the only command that exists for this project's benefit rather than a user's, and it ships so that the numbers in the README are ones you can falsify rather than ones you have to believe. |
+
+**What a number means.** Every row is reported twice:
+
+| Column | What it is |
+|---|---|
+| `total` | Wall clock for a cold process: spawn, open, work, exit. What a user pays. |
+| `work` | `total` minus the spawn floor, measured moments before it. What the code is answerable for. |
+
+The budget reads `work`, because the floor is a property of the operating system: about
+9 ms on Windows against about 1 ms on Linux. A `open ≤ 5 ms` gate read on `total` is
+unreachable on Windows before any code runs, and a gate read on `total` across two
+platforms is comparing two operating systems.
+
+**The corpus.** Generated, deterministic from a seed, and *described in the report*
+rather than assumed: how many bodies are short, medium and long, and how many rows each
+probe query actually matched. A query that matches everything measures a scan, and a
+benchmark that does not say how many rows it ranked is a benchmark that cannot be
+compared with another. Three probe terms are planted at known frequencies — one in seven,
+one in forty, one in two hundred and fifty — plus a phrase, a Japanese term, an accented
+term, and one term that is in nothing at all.
+
+**The corpus's path is a measurement parameter.** `--corpus` defaults to the system temp
+directory, and the report prints where it went, because a database's write cost can differ
+by a factor of forty between two disks holding the same file. Two machines being compared
+should be compared on the same kind of volume, and the report is how you can tell whether
+they were.
+
+**`--repeat`.** One pass is always run and discarded before the measured ones, which is
+what makes every figure a warm-cache figure: building the corpus writes hundreds of
+megabytes that the kernel is still flushing when the first sample would otherwise run.
+`--repeat N` then runs the suite N times and reports each pass's median beside the verdict,
+so a reader can see whether the drift is a machine heating up or something else running
+on it.
+
+**Exit code `1` on a missed gate**, which is the same code `doctor` uses for "the run
+finished and the answer is no". CI fails on it.
+
+**`--open`** opens the database and reports its path, its schema version and the process's
+peak resident set where the platform reports one, then exits. It is the probe the harness
+times to measure opening on its own, and it is public because a reader who wants to know
+what opening their own brain costs should not have to read the harness to find out.
+
 ## Output shapes
 
 ### A search result
@@ -370,6 +420,10 @@ See [the envelope](#the-json-envelope). `error.message` is for a human; branch o
 | Changing output on the *human* path | Not breaking, but say so in the pull request anyway — people grep it. |
 
 ## What is not in version 1
+
+`bench` is a developer tool that ships. It measures this machine, not a promise: the
+numbers in the README are one laptop's, they are labelled as such, and `kiomon bench` is
+how you get yours.
 
 - `kiomon mcp` (stdio MCP server) — v1.1. It wraps this contract, and the tool names
   will be the command names.
