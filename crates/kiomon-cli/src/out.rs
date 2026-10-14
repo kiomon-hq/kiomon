@@ -2,19 +2,25 @@
 
 //! Everything that writes to a stream, and the only module that decides an exit code.
 //!
-//! Two rules, both asserted in `tests/cli.rs`:
+//! Three rules, all asserted in `tests/cli.rs`:
 //!
-//! - **stdout carries the answer and nothing else.** Progress, warnings and
-//!   diagnostics go to stderr, so `kiomon search … | jq` is always safe. This is why
-//!   the library never prints: the decision about which stream a message belongs on
-//!   is made here, once, where the contract is.
+//! - **stdout carries the answer and nothing else.** Progress, warnings and diagnostics
+//!   go to stderr, so `kiomon search … | jq` is always safe. This is why the library
+//!   never prints: the decision about which stream a message belongs on is made here,
+//!   once, where the contract is.
 //! - **A parse failure exits 3, not clap's 2.** The contract spends 2 on "not found"
-//!   (see [`kiomon_core::ExitCode`]), and letting clap's own default through would
-//!   make an unknown flag indistinguishable from a missing memory.
+//!   (see [`kiomon_core::ExitCode`]), and letting clap's own default through would make
+//!   an unknown flag indistinguishable from a missing memory.
+//! - **Human output is bounded.** A four-kilobyte body must not become a four-kilobyte
+//!   line in an agent's context window, so every field is truncated to
+//!   [`DEFAULT_WIDTH`] characters unless `--full` was asked for.
 
 use serde::Serialize;
 
-use kiomon_core::{Error, ExitCode, Result};
+use kiomon_core::{Error, ExitCode, Memory, MemorySummaryJson, Result};
+
+/// How wide a field may be on the human path before it is truncated.
+pub const DEFAULT_WIDTH: usize = 120;
 
 /// The `meta` block on every `--json` response.
 ///
@@ -40,11 +46,6 @@ impl Meta {
 }
 
 /// The success envelope: `{"ok":true,"data":…,"meta":…}`.
-///
-/// Nothing constructs this in a non-test build until WP1 lands the first command that
-/// succeeds. It is here from WP0 because the JSON contract is reviewed as a whole, and
-/// `out::tests` asserts its shape.
-#[allow(dead_code, reason = "the first success path is WP1")]
 #[derive(Debug, Serialize)]
 pub struct Success<T> {
     /// Always `true`. Present so a caller can branch on one field.
@@ -58,7 +59,6 @@ pub struct Success<T> {
 impl<T> Success<T> {
     /// Wrap a value in the success envelope.
     #[must_use]
-    #[allow(dead_code, reason = "the first success path is WP1")]
     pub const fn new(data: T) -> Self {
         Self {
             ok: true,
@@ -101,8 +101,8 @@ pub fn parse_failure(err: &clap::Error) -> std::process::ExitCode {
 
 /// Print a failure and return its exit code.
 ///
-/// `--quiet` never suppresses an error: the flag means "stop telling me things I
-/// already know", and a failure is not one of those.
+/// `--quiet` never suppresses an error: the flag means "stop telling me things I already
+/// know", and a failure is not one of those.
 pub fn report(json: bool, err: &Error) -> std::process::ExitCode {
     if json {
         let body = Failure {
@@ -132,7 +132,6 @@ pub fn report(json: bool, err: &Error) -> std::process::ExitCode {
 ///
 /// Returns [`Error::Internal`] if `data` cannot be serialized. That is a bug in the
 /// response type rather than a user error, so it is reported as one.
-#[allow(dead_code, reason = "the first success path is WP1")]
 pub fn emit<T, F>(json: bool, data: T, human: F) -> Result<()>
 where
     T: Serialize,
@@ -149,13 +148,126 @@ where
     Ok(())
 }
 
+/// A warning for the user, on stderr. Suppressed by `--quiet`, because it is not a
+/// failure — it is something the command did differently from what was asked.
+pub fn warn(quiet: bool, message: &str) {
+    if !quiet {
+        eprintln!("kiomon: {message}");
+    }
+}
+
+/// Cut a string to `width` characters, marking that it was cut.
+///
+/// Counts characters rather than bytes, because slicing a UTF-8 string at a byte offset
+/// panics and an agent writing about a Turkish city should not be able to crash `list`.
+#[must_use]
+pub fn truncate(text: &str, width: usize) -> String {
+    if width == 0 || text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
+/// One memory, one line, for `list` and (later) `search`.
+///
+/// The line leads with the id because an agent's next move is almost always
+/// `kiomon get <id>`, and the suffix carries only the things that change what that move
+/// is: a status that is not `active`, a pin, tags.
+#[must_use]
+pub fn summary_line(memory: &MemorySummaryJson<'_>, width: usize) -> String {
+    let mut line = format!(
+        "{}  {:<8}  {}",
+        memory.id,
+        memory.kind_label,
+        truncate(memory.title, width)
+    );
+    let mut marks: Vec<String> = Vec::new();
+    if memory.status != "active" {
+        marks.push(memory.status.to_owned());
+    }
+    if memory.pinned {
+        marks.push("pinned".to_owned());
+    }
+    if !memory.tags.is_empty() {
+        marks.push(memory.tags.join(", "));
+    }
+    if !marks.is_empty() {
+        line.push_str("  · ");
+        line.push_str(&marks.join(" · "));
+    }
+    line
+}
+
+/// The full record, for `get`.
+#[must_use]
+pub fn render_memory(memory: &Memory, width: usize) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "# {}", memory.title);
+    let _ = writeln!(
+        out,
+        "{}  ·  {}  ·  {}  ·  workspace {}",
+        memory.id,
+        memory.kind_label(),
+        memory.status,
+        memory.workspace_id
+    );
+
+    let mut facts: Vec<String> = vec![
+        format!("created {}", memory.created_at),
+        format!("strength {:.2}", memory.strength),
+    ];
+    if let Some(confidence) = memory.confidence {
+        facts.push(format!("confidence {confidence:.2}"));
+    }
+    if memory.pinned {
+        facts.push("pinned".to_owned());
+    }
+    if memory.retrieval_count > 0 {
+        facts.push(format!("retrieved {}x", memory.retrieval_count));
+    }
+    let _ = writeln!(out, "{}", facts.join("  ·  "));
+
+    let mut provenance: Vec<String> = vec![memory.source_label().to_owned()];
+    if let Some(url) = &memory.source_url {
+        provenance.push(url.clone());
+    }
+    if !memory.tags.is_empty() {
+        provenance.push(format!("tags: {}", memory.tags.join(", ")));
+    }
+    let _ = writeln!(out, "{}", provenance.join("  ·  "));
+
+    if !memory
+        .memory_metadata
+        .as_object()
+        .is_none_or(serde_json::Map::is_empty)
+    {
+        let _ = writeln!(
+            out,
+            "metadata: {}",
+            truncate(&memory.memory_metadata.to_string(), width)
+        );
+    }
+
+    if !memory.excerpt.is_empty() {
+        let _ = writeln!(out, "\n{}", truncate(&memory.excerpt, width));
+    }
+    if !memory.body.is_empty() {
+        let _ = writeln!(out, "\n{}", truncate(&memory.body, width));
+    }
+    out.trim_end().to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn the_success_envelope_has_the_documented_shape() {
-        let json = serde_json::to_value(Success::new(serde_json::json!({"id": "k_01"}))).unwrap();
+        let json = serde_json::to_value(Success::new(json!({"id": "k_01"}))).unwrap();
         assert_eq!(json["ok"], serde_json::json!(true));
         assert_eq!(json["data"]["id"], serde_json::json!("k_01"));
         assert_eq!(
@@ -180,5 +292,16 @@ mod tests {
         assert_eq!(json["error"]["code"], serde_json::json!("not_found"));
         assert!(json["error"]["message"].is_string());
         assert!(json["meta"]["contract_version"].is_string());
+    }
+
+    #[test]
+    fn truncation_counts_characters_and_says_when_it_cut() {
+        assert_eq!(truncate("short", 20), "short");
+        assert_eq!(truncate("exactlyten", 10), "exactlyten");
+        assert_eq!(truncate("abcdefghij", 5), "abcd…");
+        // A multi-byte string must not panic, which is the whole reason this counts
+        // characters rather than bytes.
+        assert_eq!(truncate("İstanbul İstanbul", 5), "İsta…");
+        assert_eq!(truncate("anything", 0), "anything");
     }
 }

@@ -65,11 +65,21 @@ caller can parse the error instead of guessing from stderr.
 
 | Flag | Meaning |
 |---|---|
-| `--db <PATH>` | The database to use. Beats `$KIOMON_DB`, which beats the config file. |
+| `--db <PATH>` | The database to use. Beats `$KIOMON_DB`, which beats the platform default path. |
 | `--json` | Emit one JSON document on stdout. |
 | `-q`, `--quiet` | Suppress non-error diagnostics on stderr. Never suppresses an error. |
+| `--full` | Print whole field values instead of truncating them to fit a line. |
 
-All three are accepted before *or* after the subcommand.
+All four are accepted before *or* after the subcommand.
+
+**Human output is bounded** so a four-kilobyte body cannot become a four-kilobyte line in
+an agent's context window: `list` truncates each title to 120 characters unless `--full`
+is passed, and `get` truncates the body the same way. The `--json` path is never
+truncated — a machine asked for the field and gets the field.
+
+**Environment.** `$KIOMON_DB` overrides the default database path and `$KIOMON_WORKSPACE`
+overrides what an absent `--workspace` means — still exactly one workspace, never all of
+them. There is no config file yet; the embedder (v1.1) is the first thing that needs one.
 
 ## `--workspace` semantics
 
@@ -77,7 +87,7 @@ The single most consequential default in the tool:
 
 | Value | Meaning |
 |---|---|
-| absent | The **configured default workspace**. Never every workspace. |
+| absent | The **default workspace** — `$KIOMON_WORKSPACE` if set, else `default`. Never every workspace. |
 | `<name>` | Exactly that workspace. |
 | `'*'` | **Explicitly** every workspace. Honoured by `search`, `list`, `stats`, `export`, and `decay --all-workspaces`. |
 
@@ -110,9 +120,9 @@ Every command is listed in `kiomon --help`. This section records what each one
 
 | Command | Promise |
 |---|---|
-| `init` | Creates the database, applies the schema, and ensures the default workspace exists. Idempotent: running it twice is not an error. |
-| `doctor` | Reports the resolved database path, the schema version, and the result of SQLite's `integrity_check`, `foreign_key_check` and FTS `integrity-check`. A failure here is a `1`. |
-| `stats` | Counts by kind and status. Reads counters, not rows. |
+| `init` | Creates the database, applies the schema, and ensures the default workspace exists. **Idempotent**: running it twice is not an error, and it never resets an existing workspace's review mode. `--workspace <NAME>` also creates that workspace; its id is the name slugged (`Client: Acme` → `client-acme`). |
+| `doctor` | Reports the resolved path, the schema version, and the result of SQLite's `integrity_check`, `foreign_key_check` and FTS `integrity-check`, plus whether the full-text index agrees with the active memories. **Exit 0 when healthy, 1 when not** — and the report is printed either way. `--paths-only` skips the checks. Note that the checks are O(corpus): around 300 ms for a 43 MiB brain. |
+| `stats` | Counts by kind and status, in one grouped query. `--kind` filters every number it reports, so the parts still sum to the total. |
 
 ### Writing
 
@@ -140,7 +150,12 @@ stored. An unknown `--kind` is rejected with exit `3`.
 |---|---|
 | `search` | Ranked. Reports which retrieval legs ran and, when a leg degraded, says so rather than silently substituting another. Never answers a vector-only request from the lexical leg. |
 | `get` | One memory with its body and metadata. A missing id is exit `2`, never an empty success. `--relations` adds one query. |
-| `list` | **Unranked.** Ordered by strength, or by `created_at` with `--recent`. `list` is not a search, and the two do not compete. |
+| `list` | **Unranked.** Ordered by strength by default, or by recency with `--recent`. `list` is not a search, and the two do not compete. An absent `--status` means `active`, so a bare `list` never mixes the review inbox into a library; `--status any` is how you ask for both. |
+
+**Pinning and ordering.** A pinned memory sorts first under the default (strength)
+ordering, because a pinned memory the user cannot find is a bug report. It does **not**
+sort first under `--recent`: "newest first" with pinned rows hoisted to the top is not
+newest first. That is a change from what an earlier draft of this document implied.
 
 **The retrieval ladder.** A query is tried three ways and the first attempt with a
 non-empty result wins: the literal phrase, then all terms prefix-matched (`AND`),
@@ -198,14 +213,55 @@ carries the writer's estimate of how reliable it is; a hit without one (an impor
 file) makes no such claim. Ranked order is not a statement about truth, and an agent
 should hedge on a low-confidence hit rather than treat it as settled.
 
+### A listed memory
+
+`list` returns the same shape as a search result, without `score` and without `snippet`:
+
+```json
+{
+  "id": "k_01JC9W5K2Q",
+  "workspace_id": "default",
+  "kind": "semantic",
+  "kind_label": "Facts",
+  "title": "Staging deploys need a manual migration",
+  "excerpt": "",
+  "tags": ["deploy", "staging"],
+  "source": "user_saved",
+  "source_label": "saved",
+  "source_url": null,
+  "confidence": 0.9,
+  "strength": 1.0,
+  "pinned": false,
+  "status": "active",
+  "created_at": "2026-10-14T09:12:00Z"
+}
+```
+
+The body and the metadata envelope are **not** in a list row — a caller browsing does not
+need them, and an agent paying for tokens certainly does not. `get` is how you ask for the
+whole memory.
+
 ### An added memory
 
 ```json
-{"id":"k_01JC9W5K2Q","status":"active","duplicate":false,"links":3,"workspace":"default"}
+{"id":"k_01JC9W5K2Q","workspace_id":"default","status":"active","duplicate":false,"warnings":[]}
 ```
 
-`duplicate: true` means nothing was written and `id` is the memory that already
-existed. It is a success, and it is the answer to "my agent saved this twice".
+`duplicate: true` means nothing was written and `id` is the memory that already existed.
+It is a success, and it is the answer to "my agent saved this twice". **The status travels
+with it** because a duplicate that is `pending_approval` or `archived` is a duplicate the
+caller has to act on, and a reply saying only `duplicate: true` leaves it with no lever.
+
+`warnings` carries anything the write discarded — metadata of the wrong shape, a
+`derived_from` id that does not exist — and the same lines are printed on stderr.
+
+### What `add` does with a bad envelope
+
+Metadata that does not typecheck **degrades to `{}` and the memory is still written**,
+with the reason in `warnings`. Losing an agent's careful `entities` list is annoying;
+losing the memory it was attached to, because the list was a string instead of an array,
+would be much worse. `--metadata` and the individual `--entities`/`--claims`/`--domain`
+flags are mutually exclusive: two ways to say the same thing, never both.
 
 ### An error
 

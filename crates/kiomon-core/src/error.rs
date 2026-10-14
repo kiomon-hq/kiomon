@@ -110,6 +110,16 @@ pub enum Error {
     /// The filesystem said no.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// SQLite said no.
+    ///
+    /// Its own variant rather than folded into [`Error::Internal`] because a database
+    /// failure is the one failure whose message is worth reading verbatim: "database is
+    /// locked", "no such table: memories", "disk I/O error" each name a different
+    /// action, and a caller that sees them flattened into "internal error" has no way
+    /// to tell a corrupted file from a lock held by another process.
+    #[error("database error: {0}")]
+    Database(String),
 }
 
 impl Error {
@@ -122,7 +132,7 @@ impl Error {
             Self::Invalid(_) => "invalid_args",
             Self::Config(_) => "config",
             Self::Unimplemented { .. } => "unimplemented",
-            Self::Internal(_) | Self::Io(_) => "internal",
+            Self::Internal(_) | Self::Io(_) | Self::Database(_) => "internal",
         }
     }
 
@@ -133,8 +143,21 @@ impl Error {
             Self::NotFound(_) => ExitCode::NotFound,
             Self::Invalid(_) => ExitCode::InvalidArgs,
             Self::Config(_) => ExitCode::Config,
-            Self::Unimplemented { .. } | Self::Internal(_) | Self::Io(_) => ExitCode::Internal,
+            Self::Unimplemented { .. } | Self::Internal(_) | Self::Io(_) | Self::Database(_) => {
+                ExitCode::Internal
+            }
         }
+    }
+}
+
+/// Every SQLite failure becomes [`Error::Database`], with SQLite's own message intact.
+///
+/// The conversion is blanket rather than per-call-site on purpose: a call site that
+/// wants different handling must say so explicitly with `map_err`, and the places that
+/// do are exactly the ones where a missing row means `NotFound` rather than a fault.
+impl From<rusqlite::Error> for Error {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Database(err.to_string())
     }
 }
 
@@ -180,5 +203,15 @@ mod tests {
             .code(),
             "unimplemented"
         );
+    }
+
+    #[test]
+    fn a_sqlite_failure_keeps_its_own_message() {
+        // "database is locked" and "disk I/O error" name different actions, so the
+        // message must survive the conversion rather than being replaced by a generic
+        // one.
+        let err = Error::from(rusqlite::Error::QueryReturnedNoRows);
+        assert!(err.to_string().contains("database error"), "{err}");
+        assert_eq!(err.exit_code(), ExitCode::Internal);
     }
 }

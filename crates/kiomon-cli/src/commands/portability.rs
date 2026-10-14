@@ -6,16 +6,20 @@
 //! tool keeps. It is also the migration path: the hosted product's documents and the
 //! local store share the memory vocabulary, so a JSONL export is readable by both.
 //!
-//! The stream is line-oriented and written as it is read, not collected into a
-//! `Vec` first: a 100 MB brain must export without needing 100 MB of memory, and the
-//! plan's §8 WP6 acceptance criterion asserts exactly that.
+//! When it lands, the stream is line-oriented and written as it is read, never collected
+//! into a `Vec` first: a large brain must export without needing its own size in memory,
+//! which is what §8 WP6's acceptance criterion asserts.
 
-use kiomon_core::Result;
+use kiomon_core::{ExitCode, Result};
 
 use super::pending;
 use crate::cli::{Cli, ExportArgs};
 
-/// Write the brain out as JSONL or markdown.
-pub fn export(_cli: &Cli, _args: &ExportArgs) -> Result<()> {
+/// `kiomon export`
+///
+/// # Errors
+///
+/// Always [`kiomon_core::Error::Unimplemented`], until WP6.
+pub fn export(_cli: &Cli, _args: &ExportArgs) -> Result<ExitCode> {
     pending("export", 6)
 }

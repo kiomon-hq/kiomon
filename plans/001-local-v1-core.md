@@ -211,7 +211,17 @@ applied on every open, not only at `init`, because `journal_mode`/`mmap_size` ar
 per-connection for some builds — the cost is microseconds and the failure mode of
 forgetting is a 10× latency surprise on someone else's machine.
 
-### 3.2 Schema (`migrations/0001_init.sql`)
+### 3.2 Schema
+
+> **The shipped schema is `crates/kiomon-core/migrations/0001_init.sql`**, and it is the
+> authority. The sketch below is the design as argued, kept because it records what was
+> intended and therefore where the differences came from. Four of them, all forced by
+> WP1 and all recorded in §8: `memory_fts` is a plain FTS5 table rather than an
+> external-content one (so a pending draft can be absent from it without
+> `integrity-check` calling that corruption); `tags_text` exists only so the index has a
+> column to weight; the schema version is `PRAGMA user_version` rather than a `meta`
+> row; and there are two indexes — `idx_mem_stats`, `idx_mem_order` — that exist for
+> measured reasons and that nothing in the design predicted.
 
 ```sql
 -- Integer rowid is required: FTS5 external-content tables address their content
@@ -577,9 +587,10 @@ Write
 Read
   kiomon search <query> [--kind k1,k2] [--workspace <w>] [--limit 10]
                [--legs auto|fts|vector] [--sort relevance|recent|strength]
-               [--snippet-len 12] [--json]
+               [--snippet-len 12] [--no-record] [--json]
   kiomon get <id> [--relations] [--json]
-  kiomon list [--kind] [--status] [--tag] [--workspace] [--limit] [--json]
+  kiomon list [--kind] [--status active|pending_approval|archived|any] [--tag]
+              [--workspace <w>|'*'] [--limit 20] [--recent] [--json]
 
 Lifecycle
   kiomon pin|unpin <id>...
@@ -656,6 +667,14 @@ flaky-test generator):
 | `add` p95 | ≤ 40 ms |
 | `search` p95 (fts) | ≤ 60 ms |
 | `search` p95 (hybrid, local embedder) | ≤ 250 ms |
+
+> **The budget measures work, not wall time, and WP1 showed why.** Process spawn alone
+> is 8.6 ms on Windows, so a `search` that does nothing costs 8.6 ms and a `search` that
+> does everything allowed costs 8.6 + `open` + the query. The harness must therefore
+> report the spawn floor alongside the command time, or a fast machine and a slow
+> machine will be compared as if the difference were the database's. It must also report
+> the corpus's *body-size mix*: every measurement that mattered in WP1 only appeared
+> because the bodies were 5 KB rather than 200 bytes.
 
 CI additionally publishes the bench output as a job artifact so a regression is
 visible in the diff even when it is under the gate.
@@ -755,14 +774,136 @@ design: the ruler has to exist before there is anything worth measuring.
 
 | WP | Status | Evidence |
 |---|---|---|
-| **WP0** | ✅ **DONE** 2026-10-14 | Skeleton, CI, licence, hygiene, and the full CLI surface. `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` are all green (34 tests). `cargo build --release` produces a **777 KiB** binary against the 6 MB budget, from **22** transitive crates against the 60 crate budget — both without `rusqlite`, which WP1 adds. |
-| WP1 | ⬜ TODO | |
-| WP2 | ⬜ TODO | |
-| WP3 | ⬜ TODO | |
+| **WP0** | ✅ **DONE** 2026-10-14 | Commit `e951d23`. Skeleton, CI, licence, hygiene, and the full CLI surface. `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` green. |
+| **WP1** | ✅ **DONE** 2026-10-14 | Database, pragmas, migration applier, integrity checks, store (`add`/`get`/`update`/`list`/`forget`/`stats`), ids, content hash, metadata envelope, write gate, workspace resolution, and the CLI verbs `init`, `doctor`, `stats`, `add`, `update`, `get`, `list`, `forget`. **158 tests**, clippy clean. `init`/`add`/`get`/`list`/`stats`/`forget`/`doctor` exercised end to end against real database files in `crates/kiomon-cli/tests/cli.rs`. |
+| WP2 | ⬜ NEXT — `search`, the ladder, `--json` row shapes | |
+| WP3 | ⬜ TODO — and it inherits a measured baseline; see below | |
 | WP4–WP8 | ⬜ TODO | |
 
-WP0's acceptance criteria were met, and two decisions were made while meeting them
-that the plan did not anticipate:
+### The numbers so far, and what they cost
+
+Measured on one developer machine — Intel Core i5-9300H, Windows, `--release`, warm
+OS cache, **5 000 memories with 5 KB bodies (43.5 MiB)**. The command times include
+process spawn, which alone is **8.6 ms** on this platform and is therefore most of
+what a fast command costs. Read the difference, not the total.
+
+| Command | p50 | p95 | Budget (§7) |
+|---|---|---|---|
+| `--version` (spawn only) | 8.6 ms | 11.3 ms | — |
+| `add` | 12.5 ms | 14.8 ms | p50 ≤ 15, p95 ≤ 40 ✅ |
+| `get` | 11.6 ms | 14.7 ms | — |
+| `init` (re-open, idempotent) | 12.1 ms | 16.3 ms | — |
+| `list` (20) | 14.8 ms | 25.3 ms | — |
+| `list --recent` (20) | 14.2 ms | 23.0 ms | — |
+| `stats` | 14.3 ms | 19.5 ms | — |
+| `list --workspace '*'` (20) | **55.7 ms** | **91.9 ms** | — ⚠ |
+| `doctor` | 262 ms | 329 ms | — |
+| bulk `add`, sustained | 36.6 ms each | | ⚠ |
+
+Binary **2 974 KiB** against the 6 MB budget; **33** transitive crates against the
+60-crate budget; ~8.7 KiB stored per 5 KB memory, which is the full-text index's
+second copy of the text plus overhead.
+
+Three of those need a decision that only WP3's harness should make:
+
+- **`list --workspace '*'` at 55.7 ms** is a full scan plus a sort of the corpus. The
+  unscoped ordering `pinned DESC, strength DESC, id DESC` has no matching index, and
+  `idx_mem_order` cannot serve it because an unused leading column (`workspace_id`)
+  means the index is not ordered by the remaining columns. The fix is
+  `(status, pinned DESC, strength DESC, id DESC)`; whether it is worth a fourth index
+  on a table whose write path is already 36 ms is WP3's question, not this one's.
+- **`doctor` at 262 ms** is `PRAGMA integrity_check` and FTS `integrity-check`
+  visiting every page. That is O(corpus) by nature and correct, but it is not
+  documented as such anywhere a user would look.
+- **Sustained `add` at 36.6 ms** against 12.5 ms for a single add is the interesting
+  one: the rate is flat from 1 000 to 5 000 memories, so it is not growing index
+  maintenance — it is a constant per-write cost that a single invocation does not pay.
+  WAL checkpointing is the first suspect and is unmeasured.
+
+### WP1's acceptance criteria
+
+| Criterion | Result |
+|---|---|
+| Migrations idempotent across reopen | ✅ three opens asserted, plus a workspace's review mode surviving one |
+| `add`→`get` round-trips every kind and every metadata field | ✅ unit test per field, plus an integration test over all four kinds |
+| Unknown kind rejected | ✅ exit 3, and the message lists the valid ones |
+| Malformed metadata degrades to `{}` and still writes | ✅ with the warning on stderr and the memory intact |
+| `forget` leaves zero rows in `memories`, `memory_fts`, `memory_links`, `memory_embeddings`, `memory_outcomes` | ✅ by cascade and trigger, asserted after both a single and a bulk purge |
+| `integrity-check` passes after 1k writes and 1k purges | ✅ `crates/kiomon-core/tests/store.rs`, purging in a different order than the writes |
+
+### Where WP1 contradicted this plan
+
+Recorded rather than quietly fixed, because the reasoning is the part a reader needs.
+
+1. **`memory_fts` is not an external-content table, and §3.2 said it would be.** The
+   plan's own WP1 criterion — "`integrity-check` passes after 1k writes and 1k purges" —
+   is what forced the change. FTS5's `integrity-check` verifies the index against the
+   content table and reports an *intentionally incomplete* index as corruption; a
+   pending draft must be absent from the index, so the design broke the very check the
+   criterion named. A plain FTS5 table also makes `DELETE FROM memory_fts WHERE rowid = ?`
+   ordinary SQL, safe when the row is absent — which external-content deletes are not.
+   The price is a second copy of the text, measured above at ~8.7 KiB per 5 KB memory.
+   §3.2's `tags_text` therefore exists only so the index has a column to weight, not to
+   keep the column sets matching.
+2. **`PRAGMA user_version`, not `meta.schema_version`.** The plan said a `meta` row.
+   `user_version` lives in the database header and is written inside the same
+   transaction as the migration it describes, so the version and the schema cannot
+   disagree — which is the one failure a version row cannot rule out. `meta` survives
+   for values with no other home.
+3. **No datetime, hashing or random crate.** `time`/`chrono` are unnecessary because
+   SQLite is the clock (`strftime` on write, `julianday` for the decay arithmetic), and
+   one clock means one answer. `sha2` is unnecessary because `content_hash` is a lookup
+   key that is always followed by an exact comparison, so a 128-bit FNV-1a is safe and
+   is 20 lines. ULIDs are ~60 lines over `getrandom` rather than the `ulid` crate and its
+   `rand` tree. Three dependencies not taken, each with its reason written down.
+4. **Metadata defaults are not injected.** The hosted product's zod schemas fill absent
+   array fields with `[]` because its TypeScript consumers rely on the shape. Nothing
+   here is untyped, so the shape does not need pre-filling and the envelope stores what
+   it was given.
+5. **Unicode NFC normalisation is deferred.** `Café` composed and decomposed hash
+   differently and are two memories. Detecting it needs `unicode-normalization` and its
+   tables, and the failure is an extra row rather than a wrong answer — so it waits for
+   evidence, and §10 is where the trigger is recorded.
+6. **No config file yet.** §3.1 assigns `~/.kiomon/config.toml` three keys; WP1 uses
+   `$KIOMON_DB` and `$KIOMON_WORKSPACE` and no file at all. A config format with one key
+   in it is a parser to maintain and a second place for the answer to be wrong — and the
+   first thing that genuinely needs one is the embedder, which brings a real TOML
+   dependency with it in WP7 rather than a hand-rolled subset now.
+7. **`init --force` was declared in WP0 and removed.** `init` is idempotent by
+   construction: `open` applies migrations and ensures the default workspace, so there is
+   nothing for a `--force` to force. A flag that does nothing is worse than a flag that
+   is absent.
+8. **`stats` moved from WP4 to WP1.** It is twelve lines of counting and it is what makes
+   `init` and `doctor` say anything useful; deferring it would have meant two of WP1's
+   own commands printing less than they knew.
+9. **`list --recent` no longer hoists pinned rows.** "Newest first" with pinned rows on
+   top is not newest first, and the hoist cost a full scan plus a sort because no index
+   covers a leading `pinned` term: 41.5 ms against 14.2 ms, measured. §6.1's promise that
+   "pinned memories sort first under every one of these" now applies to the relevance
+   ordering only, and `docs/CONTRACT.md` says so.
+
+### The ruler earned its place before it existed
+
+WP3 is the bench harness, and WP1 already needed it. Two schema indexes —
+`idx_mem_stats` and `idx_mem_order` — exist because a probe on a 5 000-memory corpus
+measured what nothing in the design predicted:
+
+- `stats` was rewritten from twelve `count(*)` statements into one `GROUP BY`, on the
+  obvious theory that one scan beats twelve. **It got slower: 17.7 ms → 27.5 ms.** The
+  twelve statements had each been answered by a *covering* index, and the `GROUP BY`
+  needed `status` and `pinned`, which no index held — so it fell back to a table lookup
+  per row and read every body in the corpus. Twenty-five milliseconds of that, against
+  0.01 ms for a bare `count(*)`, was page reads.
+- `list`'s default ordering had no matching index either, so SQLite scanned and sorted
+  the corpus: **29.9 ms**. An index matching the `ORDER BY` exactly took it to **13.2 ms**.
+
+The lesson is not "add indexes". It is that **an index is not covering unless it holds
+every column the query reads**, and that the cost of getting it wrong is invisible until
+the bodies are large — a corpus of short notes would have hidden both, and the plan's
+own §7 budget would have been met while the design was wrong. That is the argument for
+WP3 in one paragraph, and it arrived before WP3 did.
+
+### Two things WP0 found before there was anything to measure
 
 - **clap's usage-error exit code is 2, which the contract spends on "not found".**
   The binary catches parse failures and remaps them to 3 (`out::parse_failure`), and

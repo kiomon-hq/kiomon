@@ -17,6 +17,14 @@ keywords.workspace = true
 [dependencies]
 thiserror.workspace = true
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# `bundled` compiles SQLite into the binary: no system library, no version skew, and
+# a `kiomon` binary that runs on a machine with nothing installed. The cost is build
+# time and about 1.5 MB of binary, both of which are budgeted in the plan.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Only for ULID randomness. A hand-written ULID over a real CSPRNG is smaller than a
+# ULID crate plus its `rand` tree, and the format is 40 lines with tests.
+getrandom = "0.4"
 
 [lints]
 workspace = true

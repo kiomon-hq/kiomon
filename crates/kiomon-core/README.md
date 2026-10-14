@@ -9,14 +9,17 @@ This crate is the library. It does not print, does not exit, and does not know t
 a terminal exists — `kiomon-cli` owns stdout, stderr and the exit code, which is
 what lets an MCP server or a daemon reuse the engine without a refactor.
 
-```rust,ignore
-// The intended API. WP1 lands `Database`, `NewMemory` and `search`.
-use kiomon_core::{Database, MemoryKind, NewMemory};
+```rust
+use kiomon_core::{Database, ListQuery, MemoryKind, NewMemory};
 
 let db = Database::open_default()?;
-let saved = db.add(NewMemory::new(MemoryKind::Semantic, "Deploys need migrations")
-    .body("Run migrations before the deploy; the pipeline does not do it."))?;
-let hits = db.search("why did the deploy fail")?;
+db.add(
+    &NewMemory::new(MemoryKind::Semantic, "Deploys need a manual migration")
+        .body("Run migrations before the deploy; the pipeline does not do it."),
+)?;
+for memory in db.list(&ListQuery::default())? {
+    println!("{} {}", memory.id, memory.title);
+}
 # Ok::<(), kiomon_core::Error>(())
 ```
 

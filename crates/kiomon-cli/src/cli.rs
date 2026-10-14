@@ -57,6 +57,10 @@ pub struct Cli {
     #[arg(long, short, global = true)]
     pub quiet: bool,
 
+    /// Print full field values instead of truncating them to fit a line.
+    #[arg(long, global = true)]
+    pub full: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -125,10 +129,6 @@ pub struct InitArgs {
     /// Also create this workspace. Repeating is allowed; `default` always exists.
     #[arg(long, value_name = "NAME")]
     pub workspace: Vec<String>,
-
-    /// Re-initialise an existing database's schema instead of failing.
-    #[arg(long)]
-    pub force: bool,
 }
 
 /// `kiomon doctor`
@@ -216,6 +216,13 @@ pub struct AddArgs {
     /// Topic label.
     #[arg(long, value_name = "TEXT")]
     pub domain: Option<String>,
+
+    /// The whole per-kind envelope, as a JSON object. Mutually exclusive with
+    /// `--entities`, `--claims` and `--domain`: one of the two ways to say the same
+    /// thing, never both, because a merge rule would be a precedence puzzle nobody asked
+    /// for.
+    #[arg(long, value_name = "JSON", conflicts_with_all = ["entities", "claims", "domain"])]
+    pub metadata: Option<String>,
 
     /// Id of a memory this was derived from. Repeatable; becomes a `derived_from` edge.
     #[arg(long = "ref", value_name = "ID")]
@@ -586,14 +593,17 @@ pub enum StatusArg {
     PendingApproval,
     /// Hidden from retrieval, restorable.
     Archived,
+    /// Every status at once. Needed by `export` and by an audit; never the default.
+    Any,
 }
 
-impl From<StatusArg> for Status {
+impl From<StatusArg> for Option<Status> {
     fn from(arg: StatusArg) -> Self {
         match arg {
-            StatusArg::Active => Self::Active,
-            StatusArg::PendingApproval => Self::PendingApproval,
-            StatusArg::Archived => Self::Archived,
+            StatusArg::Active => Some(Status::Active),
+            StatusArg::PendingApproval => Some(Status::PendingApproval),
+            StatusArg::Archived => Some(Status::Archived),
+            StatusArg::Any => None,
         }
     }
 }
@@ -803,9 +813,10 @@ mod tests {
             StatusArg::PendingApproval,
             StatusArg::Archived,
         ] {
-            let domain = Status::from(status);
+            let domain = Option::<Status>::from(status).expect("not Any");
             assert_eq!(domain.as_str().parse::<Status>().unwrap(), domain);
         }
+        assert_eq!(Option::<Status>::from(StatusArg::Any), None);
     }
 
     #[test]
