@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+
+# A local brain is user data and must never be committed.
+*.db
+*.db-wal
+*.db-shm
+.kiomon/
+
+.DS_Store
+Thumbs.db

@@ -1,0 +1,11 @@
+# Normalise line endings: this repository builds on Windows, macOS and Linux, and
+# `cargo fmt --check` is a CI gate. Shell scripts and licence text stay LF.
+* text=auto eol=lf
+
+*.rs text
+*.toml text
+*.md text
+*.sql text
+
+*.db binary
+*.clap binary

@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = ["crates/kiomon-core", "crates/kiomon-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/kiomon-hq/kiomon"
+homepage = "https://kiomon.com"
+authors = ["Kiomon <hello@kiomon.com>"]
+categories = ["command-line-utilities", "database"]
+keywords = ["memory", "agent", "sqlite", "fts5", "cli"]
+
+[workspace.dependencies]
+kiomon-core = { version = "0.1.0", path = "crates/kiomon-core" }
+thiserror = "2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+# A group needs an explicitly lower priority than the individual lints below, or
+# rustc cannot tell which of the two wins and warns that they tie.
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# The workspace writes `as` casts deliberately in a few places (SQLite i64 <-> u32
+# counters, bm25 score narrowing). Each one carries a comment; the lint stays on so
+# the next one is argued for rather than assumed.
+cast_possible_truncation = "warn"
+# Doc comments are prose. Markdown in `//!` is not a lint failure.
+doc_markdown = "allow"
+# `add`, `get`, `list` are the CLI verbs and the contract's vocabulary; renaming a
+# Rust method to satisfy a pedantic lint would put the code and the contract out of
+# alignment on purpose.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+
+# The shipped profile. `strip` and `lto = "fat"` are the two knobs that matter for
+# the binary-size budget in the plan (§7); `panic = "abort"` costs nothing because
+# nothing catches a panic on purpose.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = true
+
+# Benches measure; a panic aborting the harness mid-run produces no numbers at all.
+# Cargo ignores the `panic` setting for the bench and test profiles and inherits the
+# unwind strategy from them regardless, so there is nothing to set here.
+
+[profile.dev.package."*"]
+opt-level = 2

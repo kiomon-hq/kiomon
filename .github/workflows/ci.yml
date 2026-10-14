@@ -1,0 +1,137 @@
+# The same checks CONTRIBUTING.md documents, so a contributor can run them locally
+# and get the same answer.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # `--all-targets` so tests and benches are linted too: they are the code most
+      # likely to carry an `unwrap` nobody reviews.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  msrv:
+    name: minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Must match `rust-version` in Cargo.toml. `resolver = "3"` is MSRV-aware, so a
+      # dependency that quietly raises its own floor fails here rather than in a
+      # user's build.
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --locked
+
+  deps:
+    name: dependency budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Count the default build's transitive crates
+        run: |
+          set -euo pipefail
+          cargo tree --workspace -e normal --prefix none \
+            | grep -E ' v[0-9]' | sed -E 's/ \(\*\)$//' | sort -u > /tmp/crates.txt
+          count=$(wc -l < /tmp/crates.txt)
+          echo "transitive crates in the default build: $count (budget 60)"
+          if [ "$count" -gt 60 ]; then
+            echo "::error::dependency budget exceeded: $count > 60. See plans/001-local-v1-core.md Appendix B."
+            cat /tmp/crates.txt
+            exit 1
+          fi
+      - name: cargo-deny (licences, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+
+  audit:
+    name: security advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    # Four targets, four native runners — no cross-compilation, so a green job is a
+    # binary that actually linked. `ubuntu-24.04-arm` is GitHub's public-repository
+    # ARM runner; if this repository ever goes private, swap that lane for `cross`
+    # rather than deleting it.
+    name: build (${{ matrix.target }})
+    needs: [lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Report the binary size against the 6 MB budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=target/${{ matrix.target }}/release/kiomon
+          [ -f "$bin" ] || bin="$bin.exe"
+          bytes=$(wc -c < "$bin")
+          echo "${{ matrix.target }}: $((bytes / 1024)) KiB (budget 6144 KiB)"
+          if [ "$bytes" -gt 6291456 ]; then
+            echo "::error::binary-size budget exceeded: $((bytes / 1024)) KiB > 6144 KiB"
+            exit 1
+          fi
+      - name: Smoke test that the binary runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=target/${{ matrix.target }}/release/kiomon
+          [ -f "$bin" ] || bin="$bin.exe"
+          "$bin" --version
+          "$bin" --help > /dev/null

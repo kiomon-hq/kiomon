@@ -1,0 +1,42 @@
+[package]
+name = "kiomon-cli"
+description = "The kiomon command-line tool: a fast, local memory for your coding agent"
+documentation = "https://github.com/kiomon-hq/kiomon"
+readme = "../../README.md"
+
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[[bin]]
+name = "kiomon"
+path = "src/main.rs"
+
+[dependencies]
+kiomon-core.workspace = true
+
+# `default-features = false` drops clap's `color` feature, which is the anstream and
+# anstyle stack. A CLI whose stdout is piped into `jq` must not emit escape
+# sequences, and the cheapest way to guarantee that is to not have the code that
+# could. `error-context` and `suggestions` are kept: they are what turns "unknown
+# flag" into "did you mean --title", which is the difference between a usable tool
+# and a guessing game for an agent.
+clap = { version = "4.6", default-features = false, features = [
+  "std",
+  "derive",
+  "help",
+  "usage",
+  "error-context",
+  "suggestions",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lints]
+workspace = true
