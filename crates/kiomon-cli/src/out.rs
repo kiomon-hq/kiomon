@@ -18,7 +18,8 @@
 use serde::Serialize;
 
 use kiomon_core::{
-    Error, ExitCode, Memory, MemorySummaryJson, Result, SearchAttempt, SearchHitJson, SearchOutcome,
+    Assessment, DecayOutcome, Error, ExitCode, Memory, MemorySummaryJson, OutcomeReport,
+    RatingOutcome, Result, SearchAttempt, SearchHitJson, SearchOutcome, Skipped,
 };
 
 /// How wide a field may be on the human path before it is truncated.
@@ -189,6 +190,191 @@ impl<'a> SearchResponse<'a> {
             recorded: outcome.recorded,
         }
     }
+}
+
+/// The `data` block of a `review list` response.
+///
+/// `count` is the whole inbox in scope and `items` is the page, because an agent
+/// answering "is there anything to review" wants the first and a human wants the second.
+/// Reporting only the page would make an inbox of five look the same as one of five
+/// thousand.
+#[derive(Debug, Serialize)]
+pub struct PendingResponse<'a> {
+    /// Everything waiting in scope.
+    pub count: i64,
+    /// The page, newest first.
+    pub items: Vec<MemorySummaryJson<'a>>,
+}
+
+impl<'a> PendingResponse<'a> {
+    /// Shape a page of drafts for the wire.
+    #[must_use]
+    pub fn new(page: &'a [Memory], count: i64) -> Self {
+        Self {
+            count,
+            items: page.iter().map(MemorySummaryJson::from).collect(),
+        }
+    }
+}
+
+/// One draft, for `review list`.
+///
+/// The summary line plus the confidence, which is the one number a reviewer needs and
+/// the only thing that distinguishes two drafts of the same shape. Printed as `0.40` and
+/// not `40%`: the whole system says confidence in tenths of one, and a second unit for
+/// the same quantity is how a reader ends up comparing a percentage to a decimal.
+#[must_use]
+pub fn review_line(memory: &MemorySummaryJson<'_>, width: usize) -> String {
+    let mut line = summary_line(memory, width);
+    let mut marks: Vec<String> = Vec::new();
+    if let Some(confidence) = memory.confidence {
+        marks.push(format!("conf {confidence:.2}"));
+    }
+    marks.push(format!("source {}", memory.source_label));
+    line.push_str("  · ");
+    line.push_str(&marks.join(" · "));
+    line
+}
+
+/// One skipped id, for the warning stream.
+///
+/// Every verb that can leave an id alone reports it in the same shape, so a script
+/// reading warnings does not have to learn a different sentence per verb.
+#[must_use]
+pub fn skip_line(verb: &str, skipped: &Skipped) -> String {
+    match skipped.status {
+        Some(status) => format!(
+            "{verb}: `{}` is {}, so nothing happened to it ({})",
+            skipped.id,
+            status.as_str(),
+            skipped.reason.as_str()
+        ),
+        None => format!("{verb}: `{}` — {}", skipped.id, skipped.reason.as_str()),
+    }
+}
+
+/// What `outcome` did, in one line.
+#[must_use]
+pub fn outcome_line(report: &OutcomeReport) -> String {
+    if report.applied.is_empty() {
+        return format!(
+            "Credited nothing: none of the {} memories could be reached.",
+            report.skipped.len()
+        );
+    }
+    // The breakdown is worth a line because one `outcome` call is usually several
+    // different assessments, and "3 credited" hides which three.
+    let mut counts: Vec<(Assessment, usize)> = Vec::new();
+    for applied in &report.applied {
+        match counts
+            .iter_mut()
+            .find(|(kind, _)| *kind == applied.assessment)
+        {
+            Some((_, count)) => *count += 1,
+            None => counts.push((applied.assessment, 1)),
+        }
+    }
+    let breakdown: Vec<String> = counts
+        .iter()
+        .map(|(assessment, count)| format!("{count} {}", assessment.as_str()))
+        .collect();
+    let skipped = if report.skipped.is_empty() {
+        String::new()
+    } else {
+        format!(" {} skipped.", report.skipped.len())
+    };
+    format!(
+        "Recorded `{}` for {} memor{}: {}.{skipped}",
+        report.outcome.as_str(),
+        report.applied.len(),
+        if report.applied.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        breakdown.join(", ")
+    )
+}
+
+/// What `rate` did, in one line.
+///
+/// The last sentence is not padding: `rate` looking like it moved a memory's ranking is
+/// the single most likely thing to be assumed about it, and it does not.
+#[must_use]
+pub fn rating_line(outcome: &RatingOutcome) -> String {
+    format!(
+        "Rated {} {} · feedback score {:.2} over {} rating{}. Strength is decay's, and this \
+         did not touch it.",
+        outcome.id,
+        outcome.rating.as_str(),
+        outcome.feedback_score,
+        outcome.feedback_count,
+        if outcome.feedback_count == 1 { "" } else { "s" }
+    )
+}
+
+/// The decay table: what a pass did, or would do.
+///
+/// The `--dry-run` header says "would" and includes the word *nothing*, because the one
+/// thing a reader has to come away with is that the numbers are a forecast.
+#[must_use]
+pub fn decay_table(outcome: &DecayOutcome, width: usize) -> String {
+    // `fmt::Write` is what lets a line be appended with `write!` instead of
+    // `push_str(&format!(..))`, which would allocate a throwaway string per line.
+    use std::fmt::Write as _;
+
+    let mut text = String::new();
+    if outcome.dry_run {
+        let _ = writeln!(
+            text,
+            "Would decay {} of {} scanned memories and archive {}; this is a dry run and \
+             nothing was written.",
+            outcome.decayed, outcome.scanned, outcome.archived
+        );
+    } else {
+        let _ = writeln!(
+            text,
+            "Decayed {} of {} scanned memories; archived {}.",
+            outcome.decayed, outcome.scanned, outcome.archived
+        );
+    }
+    if outcome.is_noop() {
+        text.push_str("Nothing was old enough to move.\n");
+        return text;
+    }
+    for row in &outcome.details {
+        let marked = if row.archived {
+            if row.expired {
+                "  archived (past its deadline)"
+            } else {
+                "  archived (below the floor)"
+            }
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            text,
+            "  {}  {:<10}  {:.0}d  {:.3} → {:.3}{marked}",
+            truncate(&row.id, 28),
+            truncate(row.kind, width),
+            row.age_days,
+            row.before,
+            row.after
+        );
+    }
+    if outcome.truncated {
+        // Both counts are row counts, and the report cannot hold more rows than a
+        // process can address, so this conversion is exact in every case that can occur.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let more = usize::try_from(outcome.decayed + outcome.archived)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(outcome.details.len());
+        let _ = writeln!(
+            text,
+            "  … and {more} more, which `--json` counts but does not list."
+        );
+    }
+    text
 }
 
 /// A warning for the user, on stderr. Suppressed by `--quiet`, because it is not a

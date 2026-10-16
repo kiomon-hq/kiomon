@@ -50,7 +50,8 @@ use crate::model::{
 pub(crate) const MEMORY_COLUMNS: &str = "
     id, workspace_id, kind, title, excerpt, body, tags, memory_metadata, source,
     source_url, confidence, importance, strength, corroboration_count, retrieval_count,
-    last_retrieved_at, feedback_score, pinned, status, expires_at, created_at, updated_at
+    last_retrieved_at, feedback_score, feedback_count, pinned, status, expires_at,
+    created_at, updated_at
 ";
 
 /// The timestamp expression every date column is written with: RFC 3339, UTC, second
@@ -62,9 +63,9 @@ pub(crate) const MEMORY_COLUMNS: &str = "
 const INSERT_MEMORY_SQL: &str = "INSERT INTO memories (
         id, workspace_id, kind, title, excerpt, body, tags, tags_text,
         memory_metadata, source, source_url, confidence, importance, status,
-        content_hash, created_at, updated_at
+        content_hash, pending_derived_from, created_at, updated_at
      ) VALUES (
-        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
         strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
         strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
      )";
@@ -420,7 +421,9 @@ impl Database {
         let (scope_clause, bindings) = scope_clause(None, scope);
         let kinds_clause = kind_filter(None, kinds);
         let sql = format!(
-            "SELECT kind, status, pinned, count(*) FROM memories              WHERE 1 = 1{scope_clause}{kinds_clause}              GROUP BY kind, status, pinned"
+            "SELECT kind, status, pinned, count(*) FROM memories
+              WHERE 1 = 1{scope_clause}{kinds_clause}
+              GROUP BY kind, status, pinned"
         );
 
         let mut statement = self.conn().prepare(&sql)?;
@@ -491,7 +494,10 @@ impl Database {
         })
     }
 
-    fn count(&self, sql: &str, bindings: &[Sql]) -> Result<i64> {
+    /// One number out of one statement. Test-facing rather than public API: every
+    /// caller outside the crate has a reason-bearing method instead, and a raw counting
+    /// hole is how a caller ends up writing a query that reads every body in the corpus.
+    pub(crate) fn count(&self, sql: &str, bindings: &[Sql]) -> Result<i64> {
         let mut statement = self.conn().prepare(sql)?;
         let value = statement.query_row(rusqlite::params_from_iter(bindings.iter()), |row| {
             row.get(0)
@@ -607,6 +613,11 @@ fn insert_one(
 
     let status = gate::decide(&new.source, new.confidence, review_mode).status();
     let new_id = id::new_memory_id()?;
+    let pending_provenance = if status == Status::Active || new.derived_from.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&new.derived_from).ok()
+    };
 
     transaction.execute(
         INSERT_MEMORY_SQL,
@@ -626,6 +637,10 @@ fn insert_one(
             new.importance,
             status,
             content_hash,
+            // A draft's provenance has nowhere to go yet: an edge is readable, and
+            // `relate` on the parent would show the draft's title — the inbox leaking
+            // through the graph. So the ids wait on the row and `approve` wires them.
+            pending_provenance,
         ],
     )?;
 
@@ -677,7 +692,7 @@ fn find_duplicate_near(
 /// memory that has since been forgotten should still get its new memory stored, and a
 /// write that fails because of an earlier deletion is a worse outcome than a missing
 /// edge with a note about it.
-fn link_derived_from(
+pub(crate) fn link_derived_from(
     conn: &rusqlite::Connection,
     source_id: &str,
     targets: &[String],
@@ -824,6 +839,7 @@ pub(crate) fn row_to_memory(row: &Row<'_>) -> rusqlite::Result<Memory> {
         retrieval_count: row.get("retrieval_count")?,
         last_retrieved_at: row.get("last_retrieved_at")?,
         feedback_score: row.get("feedback_score")?,
+        feedback_count: row.get("feedback_count")?,
         pinned: row.get("pinned")?,
         status: row.get("status")?,
         expires_at: row.get("expires_at")?,

@@ -25,9 +25,11 @@ That is the whole product: **save once, query forever**, locally.
 ## Status
 
 **Pre-alpha, and it works.** `init`, `doctor`, `stats`, `add`, `update`, `get`, `list`,
-`search` and `forget` all run end to end against a real SQLite file, and the core loop —
-save something, find it again by a sentence — is complete. The lifecycle verbs, the graph
-and the vector leg are not, and each says so along with the work package that owns it.
+`search`, `review`, `rate`, `outcome`, `decay`, `pin`, `archive`, `restore` and `forget`
+all run end to end against a real SQLite file. The core loop — save something, find it
+again by a sentence, tell it whether what you found helped, and let what nobody uses fade
+— is complete. The graph (`link`, `relate`) and the vector leg are not, and each says so
+along with the work package that owns it.
 
 The work packages in [`plans/001-local-v1-core.md`](plans/001-local-v1-core.md) §8 are
 being executed in order, and the plan records where reality contradicted it rather than
@@ -102,10 +104,10 @@ compare. `kiomon bench --repeat 3` prints each pass's median beside the verdict.
 | **Four memory kinds** | `reference` · `semantic` · `procedural` · `episodic` — Files, Facts, Routines, Moments — each with the metadata that makes it retrievable (domain, entities, claims, source refs, timestamps, triggers). |
 | **Retrieval that copes with what you actually type** | *(WP2)* A sentence is tried three ways — the phrase, then all its terms prefix-matched, then any of them — and the first that finds anything wins. Every term is quoted, so punctuation is never an error and a Japanese or accented query is never mangled. `bm25()` weights title over tags over excerpt over body, and results come back with **the match in context**. |
 | **Hybrid retrieval** | *(WP7)* The same ranking fused with an optional vector leg by reciprocal rank (`k = 60`), on the formula the hosted product uses. `--legs vector` exits `4` and names what to pass instead — it is never quietly answered from the lexical leg. |
-| **Lifecycle** | *(WP4)* confidence, importance, strength, pin, archive, rating, and honest decay — unpinned memories weaken on a per-kind half-life, so the brain forgets what it never uses. |
-| **Review inbox** | agent writes below the confidence threshold land pending until approved, and **a pending memory is not in the index at all** — a review inbox that leaks into retrieval is worse than none. Approval itself is WP4; the guarantee is WP1's and is tested. |
+| **Lifecycle** | Confidence, importance, strength, pin, archive, rating, and honest decay — unpinned memories weaken on a per-kind half-life (`episodic 30d`, `procedural 90d`, `semantic 180d`, stretched up to 2× by use), and pass below `0.05` into the archive rather than into oblivion. `reference` memories never decay: a file you saved is not a claim that gets less true. Decay is a command, not a daemon, and `add` nudges it at most once a day; `doctor` tells you when it has not run. |
+| **Review inbox** | Agent writes below the confidence threshold land pending until approved, and **a pending memory is not in the index at all** — a review inbox that leaks into retrieval is worse than none. `review approve` activates and indexes it, `review reject` archives it rather than deleting it, and a draft's `--derived-from` provenance waits on the row until it is allowed to become an edge. |
 | **Knowledge graph** | *(WP5)* typed edges (`derived_from`, `supports`, `contradicts`, `related_to`, `precedes`, `follows`, `part_of`) plus a cheap auto-link pass on every write. `--ref` already writes `derived_from`. |
-| **Feedback** | *(WP4)* `rate` and `outcome` credit move a memory's strength, so the corpus gets sharper instead of just bigger. |
+| **Feedback** | `rate` and `outcome` credit a memory's **confidence** and a running feedback score, so the corpus gets sharper instead of just bigger. `outcome` takes a task's end state and up to fifty assessments (`helpful`, `unused`, `misleading`, `outdated`), records every one of them before applying it, and expires what an agent reports as stale. **Neither verb touches `strength`** — decay owns that number, and a multiplier written by a rating would not survive one pass. |
 | **Workspaces** | isolation is a `WHERE` clause. `--workspace` stays where you point it; `--workspace '*'` is an explicit opt-in to every workspace. |
 | **Agent-grade CLI** | every command takes `--json`, exit codes are stable and documented, and diagnostics never pollute stdout — so `kiomon search … \| jq` always works. A search reports which of its three query forms answered, and which legs ran, so an agent can see *why* it got what it got. |
 | **Measured, not asserted** | `kiomon bench` measures this build on your machine: cold-process timings per command, the corpus's shape, the process-spawn floor, and the plan's budget applied as a pass or a fail. It ships in the binary so the numbers above are falsifiable. |

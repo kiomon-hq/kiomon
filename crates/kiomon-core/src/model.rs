@@ -376,8 +376,10 @@ pub struct Memory {
     pub retrieval_count: i64,
     /// The last retrieval, RFC 3339 UTC.
     pub last_retrieved_at: Option<String>,
-    /// Accumulated `rate`/`outcome` credit.
+    /// Accumulated `rate`/`outcome` credit: a running average of the ratings.
     pub feedback_score: f64,
+    /// How many ratings that average is over. Zero means `feedback_score` means nothing.
+    pub feedback_count: i64,
     /// Immune to decay, and first in every ordering.
     pub pinned: bool,
     /// Where it is in its lifecycle.
@@ -445,6 +447,8 @@ pub struct MemoryJson<'a> {
     pub last_retrieved_at: &'a Option<String>,
     /// See [`Memory::feedback_score`].
     pub feedback_score: f64,
+    /// See [`Memory::feedback_count`].
+    pub feedback_count: i64,
     /// See [`Memory::pinned`].
     pub pinned: bool,
     /// The wire value of the status.
@@ -479,6 +483,7 @@ impl<'a> From<&'a Memory> for MemoryJson<'a> {
             retrieval_count: memory.retrieval_count,
             last_retrieved_at: &memory.last_retrieved_at,
             feedback_score: memory.feedback_score,
+            feedback_count: memory.feedback_count,
             pinned: memory.pinned,
             status: memory.status.as_str(),
             expires_at: &memory.expires_at,

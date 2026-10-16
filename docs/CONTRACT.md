@@ -30,7 +30,7 @@ sequences cannot appear even on a terminal.
 |---|---|---|
 | `0` | Success. | Continue. Includes a search that matched nothing, and an `add` that found an identical memory — neither is a failure. |
 | `1` | Internal failure: I/O, a corrupt database, a bug. | Report it. Retrying the same command is unlikely to help. |
-| `2` | Not found: the memory, workspace, or relation does not exist. | The thing is gone. A `get_memory`-style caller may treat it as "archived or deleted". |
+| `2` | Not found, or nothing to do: the memory, workspace, or relation does not exist — or a lifecycle verb named ids that are not in a state where it means anything (`pin` on a pinned memory, `restore` on an active one). | The thing is gone, or already the way you wanted it. Either way, retrying changes nothing. |
 | `3` | Invalid arguments: unknown flag, conflicting options, a bad value, a missing required one. | Fix the command line. Retrying is pointless. |
 | `4` | The request was valid and the environment cannot serve it: no embedder configured for `--legs vector`, an unwritable database directory, an unparseable config file. | Fix the environment or the configuration. |
 
@@ -115,7 +115,9 @@ display labels and are never accepted as input.
 symmetric and therefore stored once.
 
 **Assessments** (for `outcome`) — `helpful` · `unused` · `misleading` · `outdated`.
-`unused` is a no-op: an omitted memory is untouched, and so is one reported as unused.
+An omitted memory is untouched; one reported as `unused` is credited with a *zero*, which
+pulls its running feedback score toward zero and moves nothing else. See
+[what a rating and an outcome move](#what-a-rating-and-an-outcome-actually-move).
 
 **Sources** — `user_saved` · `agent_reflection` · `import` · `connector_sync`.
 Display labels: saved · reflection · synced.
@@ -228,12 +230,70 @@ still what lets a long one through untruncated.
 
 | Command | Promise |
 |---|---|
-| `review list` | Lists what is waiting. `review approve` activates: it writes the index row, the links and the embedding in one transaction with the status flip. |
-| `outcome` | Records credit before applying it. `helpful` strengthens, `misleading` and `outdated` weaken, `outdated` also expires. Every recorded outcome is auditable. |
-| `decay` | `strength = importance · 0.5^(age_days / effective_half_life)`, half-lives `episodic 30d`, `procedural 90d`, `semantic 180d`, stretched by `min(1 + 0.1·retrievals, 2)`; below `0.05` archives. `reference` never decays; `pinned` is exempt. `--dry-run` writes nothing. |
-| `pin` / `unpin` / `archive` / `restore` | Reversible. Nothing here destroys anything. |
-| `rate` | `+1` strengthens, `-1` weakens. |
+| `review list` | Lists what is waiting — newest first, with the confidence its writer claimed and where it came from. `count` is the whole inbox in scope; `items` is the page. |
+| `review approve` | Activates a draft: status, index row and the provenance that was waiting with it, in one transaction. A draft is unreachable by `search`, `list` and `get` until this runs, and reachable immediately after. |
+| `review reject` | **Archives** the draft. Nothing is deleted: rejecting is a decision made without much information, and `restore` undoes it. |
+| `rate` | `+1` / `-1` per memory, folded into a running average. |
+| `outcome` | The agent-facing credit call: one task outcome, up to 50 memories, each with an assessment. Recorded before it is applied, so every number that moved can be explained afterwards. |
+| `decay` | `strength = importance · 0.5^(age_days / effective_half_life)`, half-lives `episodic 30d`, `procedural 90d`, `semantic 180d`, stretched by `min(1 + 0.1·retrievals, 2)`; below `0.05` archives, and so does a passed `expires_at`. `reference` never decays — it is the user's library, not a claim that gets less true; `pinned` is exempt. `--dry-run` scans everything and writes nothing. |
+| `pin` / `unpin` / `archive` / `restore` | Reversible. Nothing here destroys anything. `archive` removes the index row in the same statement, so "hidden" and "unsearchable" are one fact. |
 | `forget` | The only destructive verb. Deletes the row and everything keyed to it in one transaction. **Refuses without `--yes`, and never prompts** — a prompt is unusable from a script or an agent. |
+
+**Nothing in the lifecycle is a hard failure for a missing id.** `approve`, `reject`,
+`pin`, `unpin`, `archive` and `restore` report every id they left alone, with a reason
+(`not found`, `wrong status`, `already there`, `outside the workspace`, `duplicate`), and
+act on the rest. The exit code is `2` only when **nothing** moved: approving four drafts
+of which one was already approved must not undo the other three, and a script that asked
+for five things and got none of them wants to hear about it.
+
+#### What a rating and an outcome actually move
+
+This is the part of the lifecycle most likely to be assumed wrong, including by the first
+draft of this project's own plan. Ratings and outcomes move **`confidence`**,
+**`feedback_score`** and **`expires_at`**. They never touch `strength`: decay owns it and
+recomputes it from `importance` on every pass, so a multiplier written by a rating would
+survive exactly until the next `decay`.
+
+| Assessment | `confidence` (from `c`, default `0.5` when nothing was claimed) | `expires_at` | feedback average | corroboration |
+|---|---|---|---|---|
+| `helpful` | `c + (1 - c) · 0.1` — diminishing, never certain | — | `+1` | `+1` |
+| `unused` | **untouched** — an absence of information must not invent a claim | — | `0` | — |
+| `misleading` | `max(0.05, c · 0.85)` | — | `-1` | — |
+| `outdated` | `max(0.05, c · 0.9)` | **now** | `-1` | `+1` |
+
+`rate` is the same running average without an assessment: `score = (score · n + rating) /
+(n + 1)`, rounded to two places on every step, with `n = feedback_count`. Rounding each
+step gives the average a fixed point — once a step would move it by less than half a
+hundredth, it does nothing — which is the hosted product's arithmetic and is kept.
+
+Both numbers are in every `get` and `rate` response, and **both are reported as-is**: a
+score of `-0.33` over three ratings is not a percentage and is not normalised.
+
+#### The review inbox
+
+A draft is written by `add` when the write gate holds it back: `--source agent_reflection`
+with `--confidence` below `0.75`, or any write into a workspace whose `review_mode` is
+`review`. A draft has **no index row**, so it is invisible to `search` by construction
+rather than by a filter somebody has to remember — and `kiomon doctor` would report the
+index as *short* if a draft ever leaked into it.
+
+Two things a draft keeps while it waits: its `derived_from` ids, which `add` does not wire
+as edges (an edge from a memory retrieval cannot return would leak the draft's title
+through `relate`), and its place in the inbox. `approve` wires the edges and clears the
+staging column in the same transaction; `reject` discards them.
+
+#### Decay in the background
+
+`decay` is a command, not a daemon. `add` also nudges it — at most once a day, at most a
+hundred rows, resuming from where the last nudge stopped and wrapping at the end of the
+corpus — so that a brain nobody maintains still ages. `search` deliberately does **not**:
+a read whose promise is that it answers a question should not spend fifty milliseconds
+writing index pages, which is what the nudge costs on a ten-thousand-memory corpus.
+
+The nudge is not the mechanism and cannot keep up with a large corpus; `kiomon decay` is,
+and `kiomon doctor` reports how long it has been (and says `never run` when it has never
+run). If the nudge changed anything it is reported on stderr, and `decay --dry-run` is how
+you see what a full pass would do.
 
 ### Portability
 
@@ -425,8 +485,11 @@ See [the envelope](#the-json-envelope). `error.message` is for a human; branch o
 numbers in the README are one laptop's, they are labelled as such, and `kiomon bench` is
 how you get yours.
 
-- `kiomon mcp` (stdio MCP server) — v1.1. It wraps this contract, and the tool names
-  will be the command names.
-- A daemon or HTTP server — v1.2.
+- `kiomon mcp` (stdio MCP server) and `kiomon serve` (loopback HTTP), together in v1.1.
+  `mcp` wraps *this* contract, and the tool names will be the command names. `serve`
+  answers the hosted `/api/*` routes instead, so the published Python and TypeScript SDKs
+  work unchanged against a local brain — see `plans/001-local-v1-core.md` §9-D8 and
+  Appendix C. Routes this engine cannot answer (`revert`, briefings) return a typed
+  `unsupported_locally` error rather than an empty success.
 - URL fetching, PDF parsing, connectors, and every LLM-backed feature. See
   `plans/001-local-v1-core.md` §10 for the trigger that would change each one.

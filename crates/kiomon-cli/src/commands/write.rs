@@ -12,9 +12,9 @@ use std::io::Read as _;
 use std::path::Path;
 
 use kiomon_core::metadata;
-use kiomon_core::{Error, ExitCode, MemoryPatch, NewMemory, Result};
+use kiomon_core::{Error, ExitCode, MemoryPatch, NewMemory, Result, Scope};
 
-use super::{open, pending, write_workspace};
+use super::{decay_if_due, open, pending, write_workspace};
 use crate::cli::{AddArgs, Cli, ImportArgs, LinkArgs, RelateArgs, UnlinkArgs, UpdateArgs};
 use crate::out;
 
@@ -70,7 +70,7 @@ pub fn add(cli: &Cli, args: &AddArgs) -> Result<ExitCode> {
     };
 
     let mut new = NewMemory::new(args.kind.into(), title)
-        .workspace(workspace)
+        .workspace(workspace.clone())
         .body(body)
         .excerpt(args.excerpt.clone().unwrap_or_default())
         .tags(args.tag.clone())
@@ -100,6 +100,9 @@ pub fn add(cli: &Cli, args: &AddArgs) -> Result<ExitCode> {
             );
         }
     })?;
+
+    decay_if_due(&db, &Scope::One(workspace), cli.quiet);
+
     Ok(ExitCode::Success)
 }
 

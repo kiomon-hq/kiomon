@@ -1,0 +1,36 @@
+-- 0002_lifecycle.sql — the one column the lifecycle needs, and why it was not in 0001.
+--
+-- Forward-only, like 0001: once a numbered file has shipped it is never edited. The
+-- applier records this in `PRAGMA user_version` in the same transaction as the
+-- statement below, so the version and the schema cannot disagree.
+--
+-- `feedback_count` is the denominator of the running average that `rate` and
+-- `outcome` maintain.
+--
+-- The first draft of this plan had `feedback_score` move by +1/-1 per rating, which
+-- needs no denominator — and which cannot express what a rating means. In the hosted
+-- product's weight, an `unused` assessment is a *zero*, and a zero is a real datum
+-- practically everywhere except in a running sum: with a count, twenty `unused`
+-- outcomes pull the score toward zero, and without one they are indistinguishable
+-- from never having been asked. The two numbers are what
+-- `POST /api/documents/{id}/rate` returns and what the SDK reads, so a local brain
+-- that could not report both would be a different product with the same vocabulary.
+--
+-- `strength` is deliberately *not* touched by either verb. Decay owns it and
+-- recomputes it from `importance` on every pass, so a multiplier written here would
+-- survive exactly until the next `kiomon decay` — a value that looks like a memory
+-- but is a scratch variable. See §5.3's correction in the plan.
+ALTER TABLE memories ADD COLUMN feedback_count INTEGER NOT NULL DEFAULT 0;
+
+-- `pending_derived_from` is the provenance of a draft that has not been approved yet.
+--
+-- `add` deliberately writes no edge for a draft: an edge is readable, and `relate` on the
+-- parent would show the draft's title — the review inbox leaking through the graph
+-- instead of through search. But dropping the ids on the floor would mean a reviewer's
+-- `--derived-from` vanished on approval, and a silent loss of provenance is the kind of
+-- thing nobody notices until they need it.
+--
+-- So the ids wait on the row, as a JSON array, and `approve` wires the edges and clears
+-- the column in the same transaction that flips the status. `reject` clears it too: a
+-- rejected draft's provenance is not something to resurrect with a later `restore`.
+ALTER TABLE memories ADD COLUMN pending_derived_from TEXT;

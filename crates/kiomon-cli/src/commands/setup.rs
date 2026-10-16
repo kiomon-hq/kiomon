@@ -120,6 +120,11 @@ pub fn doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
     };
 
     let healthy = problems.is_empty() && index_mismatch.is_none();
+    // Read before the report takes ownership of `stats`, which is the only thing that
+    // knows whether a missing decay timestamp means "new brain" or "abandoned brain".
+    let total_memories = stats.total;
+    let last_decay = db.last_decay()?;
+    let decay_age = db.decay_age_days()?;
     let report = DoctorReport {
         path: path.display().to_string(),
         schema_version,
@@ -137,43 +142,59 @@ pub fn doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
             configured: false,
             detail: "not configured (the vector leg arrives in work package 7)".to_owned(),
         },
+        decay: DecayReport {
+            // The opportunistic nudge is a hundred rows a day (see `decay.rs`), which
+            // cannot keep a large corpus current. Saying so here is what makes the nudge
+            // an honest one: the user finds out from `doctor` rather than from a bad
+            // search result six months later.
+            detail: decay_detail(decay_age, last_decay.is_none(), total_memories),
+            last_run: last_decay,
+            overdue_days: decay_age,
+        },
     };
 
-    out::emit(cli.json, report.clone(), |report| {
-        println!("database    {}", report.path);
-        println!(
-            "schema      v{} this build expects v{}",
-            report.schema_version, report.expected_schema_version
-        );
-        if report.problems.is_empty() {
-            println!("integrity   ok");
-        } else {
-            println!("integrity   {} problem(s)", report.problems.len());
-            for problem in &report.problems {
-                println!("  {problem}");
-            }
-        }
-        if let Some(mismatch) = &report.index_mismatch {
-            println!("index       {mismatch}");
-        } else {
-            println!(
-                "index       {} rows, matching the active memories",
-                report.indexed
-            );
-        }
-        println!("workspaces  {}", report.workspaces.join(", "));
-        println!(
-            "memories    {} total, {} indexed as active",
-            report.stats.total, report.indexed
-        );
-        println!("embedder    {}", report.embedder.detail);
-    })?;
+    out::emit(cli.json, report.clone(), render_doctor)?;
 
     Ok(if healthy {
         ExitCode::Success
     } else {
         ExitCode::Internal
     })
+}
+
+/// The human form of a `doctor` report.
+///
+/// Separate from [`doctor`] because gathering and rendering are two jobs, and because the
+/// report is the part a reader compares against the JSON on the line above it.
+fn render_doctor(report: &DoctorReport) {
+    println!("database    {}", report.path);
+    println!(
+        "schema      v{} this build expects v{}",
+        report.schema_version, report.expected_schema_version
+    );
+    if report.problems.is_empty() {
+        println!("integrity   ok");
+    } else {
+        println!("integrity   {} problem(s)", report.problems.len());
+        for problem in &report.problems {
+            println!("  {problem}");
+        }
+    }
+    if let Some(mismatch) = &report.index_mismatch {
+        println!("index       {mismatch}");
+    } else {
+        println!(
+            "index       {} rows, matching the active memories",
+            report.indexed
+        );
+    }
+    println!("workspaces  {}", report.workspaces.join(", "));
+    println!(
+        "memories    {} total, {} indexed as active",
+        report.stats.total, report.indexed
+    );
+    println!("embedder    {}", report.embedder.detail);
+    println!("decay       {}", report.decay.detail);
 }
 
 /// `kiomon stats`
@@ -270,6 +291,42 @@ pub struct DoctorReport {
     pub stats: Stats,
     /// Whether a vector leg is available.
     pub embedder: EmbedderReport,
+    /// When decay last ran, and whether that is long enough ago to matter.
+    pub decay: DecayReport,
+}
+
+/// What `doctor` can say about decay.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecayReport {
+    /// The last run, RFC 3339 UTC.
+    pub last_run: Option<String>,
+    /// How many days ago that was.
+    pub overdue_days: Option<f64>,
+    /// What a user needs to know about it.
+    pub detail: String,
+}
+
+/// The sentence `doctor` prints about decay.
+///
+/// Thresholds rather than an exact age because the point is to answer "do I need to do
+/// anything": under a week nothing has had time to weaken much, and past a month on a
+/// corpus of any size the answer is yes.
+fn decay_detail(age_days: Option<f64>, never: bool, memories: i64) -> String {
+    match age_days {
+        None if never && memories <= 1 => {
+            "never run; nothing to age yet, and the first write starts the clock".to_owned()
+        }
+        None => "never run — `kiomon decay` is what ages a brain".to_owned(),
+        Some(days) if days < 7.0 => format!("last run {days:.1} days ago; nothing to do"),
+        Some(days) if days < 30.0 => format!(
+            "last run {days:.1} days ago — `kiomon decay --dry-run` shows what a pass would \
+             do"
+        ),
+        Some(days) => format!(
+            "last run {days:.0} days ago — memories weaken by age, and a full pass is \
+             overdue"
+        ),
+    }
 }
 
 /// Whether the optional vector leg can run.

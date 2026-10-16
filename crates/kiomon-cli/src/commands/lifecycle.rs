@@ -5,32 +5,115 @@
 //! These are the commands that make the brain *compound* rather than merely accumulate,
 //! and they have the longest memory: a strength written here decides what a search
 //! surfaces a month from now. The formulas are the hosted product's, ported verbatim and
-//! documented in `plans/001-local-v1-core.md` §5.3 and §5.4. Do not tune one without a
-//! measurement and a note in the plan — the hosted repository's own history is a standing
-//! lesson that an unnamed threshold becomes a permanent argument.
+//! documented in `plans/001-local-v1-core.md` §5.3 and §5.4 — with two corrections the
+//! port turned up, both recorded in the plan: ratings and outcomes move `confidence` and
+//! a running `feedback_score` and *never* `strength` (decay recomputes strength from
+//! `importance`, so a multiplier written here would not survive one pass), and an
+//! `unused` assessment leaves an unclaimed confidence alone rather than inventing the
+//! hosted 0.5.
 //!
-//! Only `forget` is implemented in WP1. It is the one verb that has to exist from the
-//! start: a tool that can store a memory and cannot remove it is not one anybody should
-//! put their notes in.
+//! The three verbs that leave a memory alone when there is nothing to do — `pin`,
+//! `archive`, `restore` — report what they skipped and why, and exit `2` when nothing
+//! moved. That mirrors `forget`: a script that asked for five things and got none of them
+//! wants to hear about it, and the alternative, exiting `0` for every no-op, is how a
+//! typo'd id becomes a silent nothing.
 
-use kiomon_core::{Error, ExitCode, Result};
+use kiomon_core::lifecycle::{Assessment, PendingQuery, Rating, TaskOutcome};
+use kiomon_core::{ExitCode, Result, Scope};
 
-use super::{open, pending};
+use super::{open, read_scope};
 use crate::cli::{
-    Cli, DecayArgs, ForgetArgs, IdsArgs, OutcomeArgs, RateArgs, ReviewArgs, ReviewCommand,
+    Cli, DecayArgs, ForgetArgs, IdsArgs, OutcomeArg, OutcomeArgs, RateArgs, RatingArg, ReviewArgs,
+    ReviewCommand,
 };
 use crate::out;
+
+/// What a verb that moves rows returns when nothing moved.
+///
+/// `2` is "the thing you named is not there", and `forget` already uses it for exactly
+/// this. A no-op is not a success: the user named ids, and none of them were in a state
+/// where the verb meant anything.
+fn moved_or(code: ExitCode, moved: usize) -> ExitCode {
+    if moved == 0 { ExitCode::NotFound } else { code }
+}
 
 /// `kiomon review`
 ///
 /// # Errors
 ///
-/// Always [`Error::Unimplemented`], until WP4.
-pub fn review(_cli: &Cli, args: &ReviewArgs) -> Result<ExitCode> {
+/// Returns [`kiomon_core::Error::NotFound`] for an unknown workspace.
+pub fn review(cli: &Cli, args: &ReviewArgs) -> Result<ExitCode> {
+    let db = open(cli)?;
+    let width = if cli.full {
+        usize::MAX
+    } else {
+        out::DEFAULT_WIDTH
+    };
+
     match &args.command {
-        ReviewCommand::List(_) => pending("review list", 4),
-        ReviewCommand::Approve(_) => pending("review approve", 4),
-        ReviewCommand::Reject(_) => pending("review reject", 4),
+        ReviewCommand::List(list) => {
+            let query = PendingQuery {
+                scope: read_scope(&db, list.workspace.as_deref())?,
+                limit: list.limit,
+                min_confidence: list.min_confidence,
+            };
+            let total = db.pending_count(&query.scope)?;
+            let pending = db.list_pending(&query)?;
+            let response = out::PendingResponse::new(&pending, total);
+            out::emit(cli.json, response, |response| {
+                if response.items.is_empty() {
+                    println!("Nothing is waiting for review.");
+                } else {
+                    for (index, memory) in response.items.iter().enumerate() {
+                        println!("{}. {}", index + 1, out::review_line(memory, width));
+                    }
+                    let shown = i64::try_from(response.items.len()).unwrap_or(i64::MAX);
+                    if response.count > shown {
+                        println!(
+                            "{} more waiting; raise --limit to see them.",
+                            response.count - shown
+                        );
+                    }
+                }
+            })?;
+            Ok(ExitCode::Success)
+        }
+        ReviewCommand::Approve(ids) => {
+            let outcome = db.approve(&ids.ids)?;
+            for skip in &outcome.skipped {
+                out::warn(cli.quiet, &out::skip_line("approve", skip));
+            }
+            let code = moved_or(ExitCode::Success, outcome.moved.len());
+            out::emit(cli.json, outcome, |outcome| {
+                println!(
+                    "Approved {} draft{}; they are indexed and retrievable now.",
+                    outcome.moved.len(),
+                    if outcome.moved.len() == 1 { "" } else { "s" }
+                );
+            })?;
+            Ok(code)
+        }
+        ReviewCommand::Reject(ids) => {
+            let outcome = db.reject(&ids.ids)?;
+            for skip in &outcome.skipped {
+                out::warn(cli.quiet, &out::skip_line("reject", skip));
+            }
+            let code = moved_or(ExitCode::Success, outcome.moved.len());
+            out::emit(cli.json, outcome, |outcome| {
+                println!(
+                    "Rejected {} draft{}; archived, not deleted — `kiomon restore` brings \
+                     {} back.",
+                    outcome.moved.len(),
+                    if outcome.moved.len() == 1 { "" } else { "s" },
+                    if outcome.moved.len() == 1 {
+                        "it"
+                    } else {
+                        "them"
+                    }
+                );
+            })?;
+            Ok(code)
+        }
     }
 }
 
@@ -38,63 +121,163 @@ pub fn review(_cli: &Cli, args: &ReviewArgs) -> Result<ExitCode> {
 ///
 /// # Errors
 ///
-/// Always [`Error::Unimplemented`], until WP4.
-pub fn outcome(_cli: &Cli, _args: &OutcomeArgs) -> Result<ExitCode> {
-    pending("outcome", 4)
+/// Returns [`kiomon_core::Error::Invalid`] for more than fifty items, and
+/// [`kiomon_core::Error::NotFound`] for an unknown workspace.
+pub fn outcome(cli: &Cli, args: &OutcomeArgs) -> Result<ExitCode> {
+    let db = open(cli)?;
+    let scope = if args.workspace.is_some() {
+        read_scope(&db, args.workspace.as_deref())?
+    } else {
+        Scope::All
+    };
+
+    let items: Vec<(String, Assessment)> = args
+        .items
+        .iter()
+        .map(|item| (item.memory_id.clone(), Assessment::from(item.assessment)))
+        .collect();
+    let outcome = match args.outcome {
+        OutcomeArg::Success => TaskOutcome::Success,
+        OutcomeArg::Failure => TaskOutcome::Failure,
+    };
+
+    let report = db.record_outcome(outcome, &items, &scope)?;
+    for skip in &report.skipped {
+        out::warn(cli.quiet, &out::skip_line("credit", skip));
+    }
+    let code = moved_or(ExitCode::Success, report.applied.len());
+    out::emit(cli.json, report, |report| {
+        println!("{}", out::outcome_line(report));
+    })?;
+    Ok(code)
 }
 
 /// `kiomon decay`
 ///
 /// # Errors
 ///
-/// Always [`Error::Unimplemented`], until WP4.
-pub fn decay(_cli: &Cli, _args: &DecayArgs) -> Result<ExitCode> {
-    pending("decay", 4)
+/// Returns [`kiomon_core::Error::NotFound`] for an unknown workspace.
+pub fn decay(cli: &Cli, args: &DecayArgs) -> Result<ExitCode> {
+    let db = open(cli)?;
+    let scope = if args.all_workspaces {
+        Scope::All
+    } else {
+        read_scope(&db, None)?
+    };
+
+    let outcome = db.decay(&scope, args.dry_run)?;
+    let width = if cli.full {
+        usize::MAX
+    } else {
+        out::DEFAULT_WIDTH
+    };
+    out::emit(cli.json, outcome, |outcome| {
+        print!("{}", out::decay_table(outcome, width));
+    })?;
+    Ok(ExitCode::Success)
 }
 
 /// `kiomon pin`
 ///
 /// # Errors
 ///
-/// Always [`Error::Unimplemented`], until WP4.
-pub fn pin(_cli: &Cli, _args: &IdsArgs) -> Result<ExitCode> {
-    pending("pin", 4)
+/// Returns [`kiomon_core::Error::Database`] if a statement fails.
+pub fn pin(cli: &Cli, args: &IdsArgs) -> Result<ExitCode> {
+    set_pinned(cli, args, true)
 }
 
 /// `kiomon unpin`
 ///
 /// # Errors
 ///
-/// Always [`Error::Unimplemented`], until WP4.
-pub fn unpin(_cli: &Cli, _args: &IdsArgs) -> Result<ExitCode> {
-    pending("unpin", 4)
+/// As [`pin`].
+pub fn unpin(cli: &Cli, args: &IdsArgs) -> Result<ExitCode> {
+    set_pinned(cli, args, false)
+}
+
+fn set_pinned(cli: &Cli, args: &IdsArgs, pinned: bool) -> Result<ExitCode> {
+    let db = open(cli)?;
+    let outcome = db.set_pinned(&args.ids, pinned)?;
+    let verb = if pinned { "pin" } else { "unpin" };
+    for skip in &outcome.skipped {
+        out::warn(cli.quiet, &out::skip_line(verb, skip));
+    }
+    let code = moved_or(ExitCode::Success, outcome.moved.len());
+    out::emit(cli.json, outcome, |outcome| {
+        println!(
+            "{} {} memor{}.",
+            if pinned { "Pinned" } else { "Unpinned" },
+            outcome.moved.len(),
+            if outcome.moved.len() == 1 { "y" } else { "ies" }
+        );
+        if pinned && !outcome.moved.is_empty() {
+            println!("A pin is immune to decay and first in every ordering.");
+        }
+    })?;
+    Ok(code)
 }
 
 /// `kiomon archive`
 ///
 /// # Errors
 ///
-/// Always [`Error::Unimplemented`], until WP4.
-pub fn archive(_cli: &Cli, _args: &IdsArgs) -> Result<ExitCode> {
-    pending("archive", 4)
+/// Returns [`kiomon_core::Error::Database`] if a statement fails.
+pub fn archive(cli: &Cli, args: &IdsArgs) -> Result<ExitCode> {
+    let db = open(cli)?;
+    let outcome = db.archive(&args.ids)?;
+    for skip in &outcome.skipped {
+        out::warn(cli.quiet, &out::skip_line("archive", skip));
+    }
+    let code = moved_or(ExitCode::Success, outcome.moved.len());
+    out::emit(cli.json, outcome, |outcome| {
+        println!(
+            "Archived {} memor{}. They are hidden from retrieval and can be brought back \
+             with `kiomon restore`.",
+            outcome.moved.len(),
+            if outcome.moved.len() == 1 { "y" } else { "ies" }
+        );
+    })?;
+    Ok(code)
 }
 
 /// `kiomon restore`
 ///
 /// # Errors
 ///
-/// Always [`Error::Unimplemented`], until WP4.
-pub fn restore(_cli: &Cli, _args: &IdsArgs) -> Result<ExitCode> {
-    pending("restore", 4)
+/// Returns [`kiomon_core::Error::Database`] if a statement fails.
+pub fn restore(cli: &Cli, args: &IdsArgs) -> Result<ExitCode> {
+    let db = open(cli)?;
+    let outcome = db.restore(&args.ids)?;
+    for skip in &outcome.skipped {
+        out::warn(cli.quiet, &out::skip_line("restore", skip));
+    }
+    let code = moved_or(ExitCode::Success, outcome.moved.len());
+    out::emit(cli.json, outcome, |outcome| {
+        println!(
+            "Restored {} memor{}. Their decay clock starts again from now.",
+            outcome.moved.len(),
+            if outcome.moved.len() == 1 { "y" } else { "ies" }
+        );
+    })?;
+    Ok(code)
 }
 
 /// `kiomon rate`
 ///
 /// # Errors
 ///
-/// Always [`Error::Unimplemented`], until WP4.
-pub fn rate(_cli: &Cli, _args: &RateArgs) -> Result<ExitCode> {
-    pending("rate", 4)
+/// Returns [`kiomon_core::Error::NotFound`] when no memory has that id.
+pub fn rate(cli: &Cli, args: &RateArgs) -> Result<ExitCode> {
+    let db = open(cli)?;
+    let rating = match args.rating {
+        RatingArg::Up => Rating::Up,
+        RatingArg::Down => Rating::Down,
+    };
+    let outcome = db.rate(&args.id, rating)?;
+    out::emit(cli.json, outcome, |outcome| {
+        println!("{}", out::rating_line(outcome));
+    })?;
+    Ok(ExitCode::Success)
 }
 
 /// `kiomon forget`
@@ -105,12 +288,12 @@ pub fn rate(_cli: &Cli, _args: &RateArgs) -> Result<ExitCode> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Invalid`] without `--yes`. A missing id is *not* an error: it is
-/// reported in the outcome, and the exit code is 2 only when none of the ids existed —
-/// deleting five memories of which one was already gone must not undo the other four.
+/// Returns [`kiomon_core::Error::Invalid`] without `--yes`. A missing id is *not* an error:
+/// it is reported in the outcome, and the exit code is 2 only when none of the ids existed
+/// — deleting five memories of which one was already gone must not undo the other four.
 pub fn forget(cli: &Cli, args: &ForgetArgs) -> Result<ExitCode> {
     if !args.yes {
-        return Err(Error::Invalid(format!(
+        return Err(kiomon_core::Error::Invalid(format!(
             "`forget` deletes {} memor{} permanently and cannot be undone. Pass --yes to \
              confirm, or use `kiomon archive` to hide them reversibly.",
             args.ids.len(),

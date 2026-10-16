@@ -751,6 +751,35 @@ pub enum SortArg {
     Strength,
 }
 
+impl From<AssessmentArg> for kiomon_core::lifecycle::Assessment {
+    fn from(arg: AssessmentArg) -> Self {
+        match arg {
+            AssessmentArg::Helpful => Self::Helpful,
+            AssessmentArg::Unused => Self::Unused,
+            AssessmentArg::Misleading => Self::Misleading,
+            AssessmentArg::Outdated => Self::Outdated,
+        }
+    }
+}
+
+impl From<RatingArg> for kiomon_core::lifecycle::Rating {
+    fn from(arg: RatingArg) -> Self {
+        match arg {
+            RatingArg::Up => Self::Up,
+            RatingArg::Down => Self::Down,
+        }
+    }
+}
+
+impl From<OutcomeArg> for kiomon_core::lifecycle::TaskOutcome {
+    fn from(arg: OutcomeArg) -> Self {
+        match arg {
+            OutcomeArg::Success => Self::Success,
+            OutcomeArg::Failure => Self::Failure,
+        }
+    }
+}
+
 impl From<SortArg> for SearchSort {
     fn from(arg: SortArg) -> Self {
         match arg {

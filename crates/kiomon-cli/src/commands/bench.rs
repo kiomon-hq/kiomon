@@ -352,7 +352,8 @@ fn write_probes(corpus: &CorpusReport) -> Vec<Probe> {
                     "--title".to_owned(),
                     format!("measured write {sample} of {id}"),
                     "--body".to_owned(),
-                    "A body of a realistic length for a note, written by the harness, and                      never written twice because a duplicate is not a write."
+                    "A body of a realistic length for a note, written by the harness, and never \
+                     written twice because a duplicate is not a write."
                         .to_owned(),
                 ])
             }
@@ -489,6 +490,36 @@ fn read_probes(corpus: &CorpusReport) -> Vec<Probe> {
             }
         }),
     });
+    // Last, because it is the most expensive row in the suite and because it is the one
+    // that reads the whole corpus: running it earlier would put its page cache under
+    // every row after it.
+    //
+    // Measured as a **dry run**, and that is a decision rather than a shortcut. A real
+    // pass rewrites the strength of almost every row in the corpus — from 1.0 to
+    // `importance` on the first pass — so `--repeat` would be comparing a corpus with the
+    // one it become after being decayed. The read cost is what scales with the corpus,
+    // and the write cost is `add`-shaped per row that actually moved, which is a property
+    // of the corpus's age rather than of its size. `decay` itself is gated on correctness
+    // (WP4's tests), not on a stopwatch.
+    probes.push(Probe {
+        label: "decay (dry run)",
+        query: None,
+        matches: 0,
+        collect_ids: false,
+        args: Box::new({
+            let db = db.clone();
+            move |_| {
+                Some(vec![
+                    "--db".to_owned(),
+                    db.clone(),
+                    "decay".to_owned(),
+                    "--dry-run".to_owned(),
+                    "--all-workspaces".to_owned(),
+                    "--quiet".to_owned(),
+                ])
+            }
+        }),
+    });
 
     probes
 }
@@ -528,7 +559,8 @@ fn measure_once(
             if probe.collect_ids {
                 written.push(id_from(&out).ok_or_else(|| {
                     Error::Internal(format!(
-                        "`kiomon {}` was measured writing a memory and its id could not be read                          back, so the corpus would keep a row nobody could remove",
+                        "`kiomon {}` was measured writing a memory and its id could not be read back, so \
+                         the corpus would keep a row nobody could remove",
                         arguments.join(" ")
                     ))
                 })?);
@@ -621,11 +653,7 @@ fn one_capturing(exe: &Path, args: &[String], capture: bool) -> Result<(f64, Str
 /// their work package: a budget with a silent hole in it is a budget that looks better
 /// than it is.
 fn rejected_names() -> Vec<&'static str> {
-    vec![
-        DEFERRED_GATE,
-        "relate — no graph until WP5",
-        "decay --full — no decay until WP4",
-    ]
+    vec![DEFERRED_GATE, "relate — no graph until WP5"]
 }
 
 /// This process's peak resident set, where the platform makes it free.

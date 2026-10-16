@@ -63,11 +63,13 @@
 pub mod bench;
 pub mod config;
 pub mod db;
+pub mod decay;
 pub mod error;
 pub mod fuse;
 pub mod gate;
 pub mod hash;
 pub mod id;
+pub mod lifecycle;
 pub mod metadata;
 pub mod model;
 pub mod search;
@@ -78,9 +80,14 @@ pub(crate) mod testing;
 
 pub use bench::{BodyClass, BodyMix, CorpusReport, CorpusSpec, Probe};
 pub use db::{Database, Integrity};
+pub use decay::DecayOutcome;
 pub use error::{Error, ExitCode, Result};
 pub use fuse::{RRF_K, fuse, rrf_score};
 pub use gate::{AUTOPROMOTE_THRESHOLD, Verdict};
+pub use lifecycle::{
+    AppliedOutcome, Assessment, IdsOutcome, OutcomeReport, PendingQuery, Rating, RatingOutcome,
+    ReviewOutcome, Skipped, TaskOutcome,
+};
 pub use model::{
     AddOutcome, DEFAULT_SNIPPET_TOKENS, ForgetOutcome, KindCount, Legs, ListQuery, ListSort,
     MAX_TAGS, Memory, MemoryJson, MemoryKind, MemoryPatch, MemorySummaryJson, NewMemory, Relation,

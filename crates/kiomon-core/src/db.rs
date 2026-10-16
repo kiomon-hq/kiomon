@@ -33,10 +33,16 @@ struct Migration {
 }
 
 /// Every migration, in order. Append only — a shipped file is never edited.
-const MIGRATIONS: &[Migration] = &[Migration {
-    name: "0001_init",
-    sql: include_str!("../migrations/0001_init.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "0001_init",
+        sql: include_str!("../migrations/0001_init.sql"),
+    },
+    Migration {
+        name: "0002_lifecycle",
+        sql: include_str!("../migrations/0002_lifecycle.sql"),
+    },
+];
 
 /// The pragmas every connection gets.
 ///
@@ -505,15 +511,16 @@ mod tests {
         let dir = tempdir();
         let path = dir.join("brain.db");
 
+        let target = Database::target_schema_version();
         {
             let db = Database::open(&path).unwrap();
-            assert_eq!(db.schema_version().unwrap(), 1);
+            assert_eq!(db.schema_version().unwrap(), target);
             db.create_workspace("Work Stuff", ReviewMode::Review)
                 .unwrap();
         }
         {
             let db = Database::open(&path).unwrap();
-            assert_eq!(db.schema_version().unwrap(), 1);
+            assert_eq!(db.schema_version().unwrap(), target);
             assert_eq!(db.workspaces().unwrap().len(), 2);
         }
         {

@@ -73,6 +73,43 @@ pub(crate) fn pending(command: &'static str, wp: u8) -> Result<ExitCode> {
     Err(Error::Unimplemented { command, wp })
 }
 
+/// Run the day's decay, if it is due, and report it on stderr.
+///
+/// Called at the end of `add`, and deliberately **not** at the end of `search`, which is a
+/// correction to §5.4 made after measuring it. The nudge costs about 48 ms of scattered
+/// index writes on a 10 000-memory corpus (see `DECAY_NUDGE_ROWS`), and the cost is not
+/// proportional to the rows: it is the pages a write touches on a cold cache. Forty-eight
+/// milliseconds of hidden write is a thing to bolt onto a command that was already going
+/// to write, and a bad thing to bolt onto a read whose whole promise is that it answers a
+/// question. WP3's second finding asked exactly this question — whether a read nothing
+/// acts on should move a memory's decay clock — and the answer is no.
+///
+/// A failure is a warning and never an error. A write that could not round the
+/// maintenance corner still has to store what it was given, and failing a memory save
+/// because a *separate* background task went wrong would be the tool blaming the user for
+/// its own bookkeeping.
+///
+/// The report goes to stderr rather than into the response: what the command was asked
+/// did not change, and `--json` describes the answer to the question, not the housework
+/// that happened beside it. When `serve` (WP9) exists the nudge belongs on a timer in that
+/// process, where there is no user waiting for anything.
+pub(crate) fn decay_if_due(db: &Database, scope: &Scope, quiet: bool) {
+    match db.decay_opportunistic(scope) {
+        Ok(Some(outcome)) if !outcome.is_noop() => {
+            crate::out::warn(
+                quiet,
+                &format!(
+                    "aged the brain while it was here: {} memories decayed, {} archived \
+                     (`kiomon decay --dry-run` for the detail)",
+                    outcome.decayed, outcome.archived
+                ),
+            );
+        }
+        Ok(_) => {}
+        Err(err) => crate::out::warn(quiet, &format!("decay did not run: {err}")),
+    }
+}
+
 /// Open the database this invocation should use.
 ///
 /// # Errors

@@ -541,34 +541,51 @@ comparison and is where the platform itself still runs a heuristic.
 
 ### 5.3 Feedback
 
-`rate <id> +1|-1` — immediate, human:
+`rate <id> +1|-1` — immediate, human. `outcome <success|failure> --item
+<id>:<assessment>` — the agent-facing credit call, up to 50 items, each recorded in
+`memory_outcomes` **before** its effect is applied so every number that moved can be
+explained.
 
-| | `strength` | `feedback_score` |
-|---|---|---|
-| `+1` | `min(strength * 1.15, 1.0)` | `+1` |
-| `-1` | `strength * 0.75` | `-1` |
+> **Corrected by WP4.** The tables that were here said `rate` and `outcome` multiply
+> `strength`, and that `feedback_score` moves by ±1. Both were wrong, and the first was
+> not merely wrong but *incoherent*: §5.4 recomputes `strength` from `importance` on
+> every pass, so a strength multiplier written by a rating survives exactly until the
+> next `kiomon decay`. The ported behaviour — the hosted product's `credit.ts` and
+> `documents/service.ts` — moves `confidence`, a **running average** `feedback_score`
+> with a `feedback_count` denominator, and `expires_at`. See §8's WP4 record.
 
-`outcome <success|failure> --item <id>:<assessment>` — the agent-facing credit
-attribution, ported from `record_outcome`:
+| assessment | `confidence` (from `c`, the claim or `0.5`) | `expires_at` | average | corroboration |
+|---|---|---|---|---|
+| `helpful` | `c + (1 - c) · 0.1`, diminishing, never certain | — | `+1` | `+1` |
+| `unused` | **untouched** — an absence of information must not invent a claim | — | `0` | — |
+| `misleading` | `max(0.05, c · 0.85)` | — | `-1` | — |
+| `outdated` | `max(0.05, c · 0.9)` | **now** | `-1` | `+1` |
 
-| assessment | effect |
-|---|---|
-| `helpful` | `strength *= 1.15` (cap 1.0), `feedback_score += 1`, `corroboration_count += 1` |
-| `unused` | nothing (omitted memories stay untouched — the tool's own contract) |
-| `misleading` | `strength *= 0.5`, `feedback_score -= 1` |
-| `outdated` | `strength *= 0.5`, `expires_at = now`, `feedback_score -= 1` |
+`rate` is the same average without an assessment: `score = (score · n + rating) / (n +
+1)`, rounded to two places on every step. The rounding gives the average a fixed point,
+which is the hosted product's arithmetic and is kept — see WP4's record for what the
+forty-first `unused` assessment does (nothing, and that is fine).
 
-Every outcome is recorded in `memory_outcomes` before its effect is applied, so
-credit is auditable and reversible. All multipliers are named constants in
-`lifecycle.rs` and documented in `docs/DESIGN.md` — the platform's threshold
-saga (`AUTOPROMOTE_THRESHOLD`, `JACCARD_CONFLICT_THRESHOLD`) is a standing lesson
-that an unnamed magic number becomes a permanent argument.
+`outcome` carries the task's end state and never uses it: a `helpful` memory in a failed
+task is still a helpful memory, and the session's result is a fact about the session.
+
+All numbers are named constants in `lifecycle.rs` — the platform's threshold saga
+(`AUTOPROMOTE_THRESHOLD`, `JACCARD_CONFLICT_THRESHOLD`) is a standing lesson that an
+unnamed magic number becomes a permanent argument. `docs/CONTRACT.md` carries the same
+table for callers; `docs/DESIGN.md` is still a WP8 item.
 
 ### 5.4 Decay
 
 `kiomon decay` — a command, not a daemon. Runs on demand, and opportunistically
-(auto, ≤ once per 24 h, at most one page) on `add`/`search` so a brain that is
-never explicitly maintained still ages correctly. `--dry-run` prints the table.
+(auto, ≤ once per 24 h, one nudge of 100 rows, resuming from a cursor in `meta`) on
+`add` so that a brain nobody maintains still ages. `--dry-run` scans everything and
+writes nothing.
+
+> **Corrected by WP4, twice.** `search` no longer nudges: the nudge measured 48 ms of
+> scattered index writes at 10 000 memories, and a read whose promise is that it answers
+> a question should not spend that. And the nudge is a *walk*: without a cursor it
+> rewrote the same hundred rows every day for as long as they stayed active. Both
+> corrections are in §8's WP4 record, with the numbers that produced them.
 
 ```
 strength        = importance * 0.5 ^ (age_days / effective_half_life)
@@ -760,9 +777,10 @@ the same machine; CI fails if a gate is exceeded; the README's three headline
 numbers are replaced by measured ones or the README is corrected (**never leave a
 claimed number unmeasured** — the platform's own `PRODUCT.md` principle 5).
 
-### WP4 — Lifecycle: gate, review, feedback, decay (2 days)
+### WP4 — Lifecycle: gate, review, feedback, decay (2 days) — **DONE**
 `gate.rs` (authority, 0.75, review mode, dedupe), `review approve|reject` with
-index-on-approve, `pin/archive/restore/rate`, `outcome`, `decay.rs`.
+index-on-approve, `pin/archive/restore/rate`, `outcome`, `decay.rs`, and migration
+`0002_lifecycle.sql` (`feedback_count`, `pending_derived_from`).
 **Accept:** a `pending_approval` row is invisible to `search` (asserted in the
 same test that asserts it becomes visible after `approve`); the decay formula is
 asserted against hand-computed values at age = 0, 1, and 2 half-lives for all
@@ -839,6 +857,7 @@ shape last.
 | **WP0** | ✅ **DONE** 2026-10-14 | Commit `e951d23`. Skeleton, CI, licence, hygiene, and the full CLI surface. `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` green. |
 | **WP1** | ✅ **DONE** 2026-10-14 | Database, pragmas, migration applier, integrity checks, store (`add`/`get`/`update`/`list`/`forget`/`stats`), ids, content hash, metadata envelope, write gate, workspace resolution, and the CLI verbs `init`, `doctor`, `stats`, `add`, `update`, `get`, `list`, `forget`. **158 tests**, clippy clean. `init`/`add`/`get`/`list`/`stats`/`forget`/`doctor` exercised end to end against real database files in `crates/kiomon-cli/tests/cli.rs`. |
 | **WP2** | ✅ **DONE** 2026-10-14 | `search.rs` (the quoted ladder, the ranked window, the snippet query, the retrieval record), `fuse.rs` (RRF, ported from `rrf.ts`), the filter and ordering flags, `docs/CONTRACT.md` §Reading rewritten as v1, and the `--json` shapes for a search. **204 tests** (`cargo test --workspace`), clippy clean, `cargo fmt --check` clean. Exit codes 0/2/3/4 each asserted through the binary, `search | jq`'s property asserted rather than assumed. |
+| **WP4** | ✅ **DONE** 2026-10-16 | `lifecycle.rs` (the review inbox, `pin`/`archive`/`restore`/`rate`/`outcome` with the hosted product's credit rules), `decay.rs` (the formula, the paged command, the resumable daily nudge), migration `0002_lifecycle.sql`, the five lifecycle commands wired end to end, `doctor` reporting when decay last ran, and the CONTRACT's lifecycle section rewritten around what the verbs *actually* move. **274 tests** (192 core + 58 CLI + 24 others), clippy clean, 3 324 KiB binary. |
 | **WP3** | ✅ **DONE** 2026-10-14 | `kiomon bench` (cold-process timings, the plan's gates, `--json`, the corpus generator it ships with), `crates/kiomon-core/benches/store.rs` (in-process, no Criterion — see below), a CI job that fails on a missed gate and publishes the numbers as an artifact, and the README's numbers replaced with measured ones. **146 core + 9 integration tests**, clippy clean. |
 | WP4 | ⬜ NEXT — and it inherits a measured baseline, three corrections, and one open question; see below | |
 | WP4–WP8 | ⬜ TODO | |
@@ -1008,6 +1027,139 @@ And at **one hundred thousand** memories, 1.9 GiB, 14 457 rows matching `deploy`
    query.
 3. **`add` is 3.0 ms and `open` is 2.0 of it** — a lifecycle write that adds a second
    statement or a second index lookup per add is adding it to the smaller half.
+
+### WP4's numbers, and the six things it found
+
+10 000 memories × ~1 KB on the same laptop as every other table here (release build, warm
+cache, `C:`), read against `work` so the 8.38 ms spawn floor is not counted as the
+database's:
+
+| Command | work p50 / p95 (ms) | total p50 |
+|---|---|---|
+| `open` | 2.45 / 4.84 | 10.89 |
+| `add` | 3.36 / 6.02 | 12.00 |
+| `add` (first write to a new file) | 20.57 / 23.04 | 28.46 |
+| `search common` | 28.16 / 83.78 ⚠ | 36.86 |
+| `get` | 2.69 / 7.75 | 10.88 |
+| `stats` | 4.74 / 12.69 | 13.03 |
+| **`decay --dry-run` over the corpus** | **68.05** / 84.51 | **77.31** |
+
+Six findings, in the order they arrived:
+
+1. **A nudge costs pages, not rows.** The first write of the day paid **62 ms** more
+   than an `add` with nothing to do when the opportunistic page was 500 rows, and
+   **48 ms** when it was cut to 100 (medians of twenty and fifteen samples, same binary,
+   same corpus, marker deleted between samples). Cutting the page by 80% saved 23% of the
+   cost, because the price is the pages a write touches on a cold cache — scattered across
+   a 200 MB file by the two indexes that hold `strength` — and not the number of rows. It
+   also means the nudge has an irreducible floor of about 50 ms on a corpus this size,
+   which no page size fixes.
+2. **The nudge was rewriting the same hundred rows forever.** A page from the beginning
+   of the id order is the same page every day, and rows that never fall below the floor
+   never leave the scan — so the nudge reached 100 of 10 000 memories and no more. Fixed
+   with a cursor in `meta` that resumes where the last nudge stopped and wraps when a lap
+   ends; the test asserts the two pages do not overlap.
+3. **A read must not run it.** §5.4 put the nudge on `add` *and* `search`. Forty-eight
+   milliseconds of hidden write on the read path is exactly what §10's "a read nothing
+   acts on should not move a memory's decay clock" was asking about, so `search` no longer
+   does it. This is WP3's second finding, answered.
+4. **§5.3's strength multipliers could not have worked.** Decay recomputes `strength` from
+   `importance` on every pass, so a rating's multiplier would be erased by the next
+   `kiomon decay` — the value would look like a memory and behave like a scratch variable.
+   The hosted product had already solved this the other way: use stretches the half-life
+   (through `retrieval_count`), and *quality* moves `confidence`. That is what is ported.
+5. **A running average needs a denominator, and `0001` had shipped.** `feedback_count` is
+   new in `0002`; without it, `unused` would be a no-op and twenty ignored retrievals would
+   look exactly like never having been asked. **The first schema change after the first
+   release is a migration, not an edit** — the discipline §3.3 asked for, exercised for
+   real.
+6. **The p95 gate fails at fifty samples on a busy machine.** `search common` p95 read
+   83.78 ms against the plan's 60 ms limit while its p50 was 28.16 ms, in a run whose
+   floor was 8.38 ms and whose worst `search` total was 204.70 ms — the same
+   interruption-driven spread WP3's fifth finding describes. The gate is read at 200
+   samples in CI for this reason, and the harness's `--runs` help says so.
+
+Two smaller corrections, both in the code: an opportunistic nudge that changes anything
+now says so on stderr (a silent write is a write nobody can account for), and the decay
+pass skips rows whose strength would move by less than a fiftieth of the floor — without
+that epsilon the recomputed value never equals the stored one and *every* pass rewrites
+the entire corpus (`1e-9` was the first guess; the measured cost is why it is `5e-4`).
+
+`decay` is the most expensive row in the report and the only one that scales with the
+whole corpus: 68 ms at 10 000 memories, one page of 500 at a time, reading every active
+non-reference row. It is not gated — the plan's §7 gates `open`, `add` and `search` — and
+the recorded trigger is a covering index over
+`(status, pinned, kind, id, importance, retrieval_count, strength, created_at,
+expires_at)` if decay ever becomes a gate or runs more often than daily. It is not worth
+one now: a wide index would slow every write in the system to speed up a maintenance
+command that runs once a day and costs 68 ms.
+
+### WP4's acceptance criteria
+
+| # | Criterion | Where it is asserted |
+|---|---|---|
+| 1 | A `pending_approval` row is invisible to `search`, in the same test that asserts it becomes visible after `approve` | `lifecycle::tests::a_draft_is_not_indexed_and_an_approval_indexes_it` (on the index itself, not on a query), `a_draft_is_invisible_to_search_until_it_is_approved` through the binary |
+| 2 | The decay formula, hand-computed at age 0, 1 and 2 half-lives for all three decaying kinds | `decay::tests::the_formula_halves_at_every_half_life`, `decay_weakens_a_row_by_the_formula`, `a_retrieved_memory_outlives_the_same_memory_unretrieved` |
+| 3 | `pinned` and `reference` rows never decay | `a_pinned_memory_is_never_scanned_and_never_archived`, `a_reference_memory_is_never_scanned_and_never_archived`, `a_row_with_no_kind_to_decay_is_left_out_of_the_scan_entirely` |
+| 4 | `--dry-run` mutates nothing | `a_dry_run_reports_the_truth_and_writes_nothing` (row equality, and no `meta` marker), `a_decay_dry_run_reports_the_scan_and_writes_nothing` through the binary |
+| 5 | A `review_mode = 'review'` workspace sends a `confidence = 1.0` write to the inbox | `store::tests::a_review_workspace_holds_back_even_a_certain_write`, plus `lifecycle::tests::the_inbox_can_be_filtered_by_confidence_and_scope` for what the inbox then contains |
+
+Beyond the plan's five: a draft's `--derived-from` survives until approval and is
+discarded on rejection; a restored memory has `expires_at = NULL` so the next pass does
+not re-archive it; `rate` never moves `strength`; `unused` never invents a confidence;
+the state verbs exit `2` when nothing moved and `0` when something did; and the nudge
+walks rather than loops.
+
+### Where WP4 contradicted the plan
+
+1. **§5.3's feedback tables were wrong in four ways** (strength multipliers, `±1` score,
+   `corroboration_count` on `helpful` only, and a `strength` that was never touched at
+   all). §5.3 now carries the corrected table and a pointer to this record.
+2. **`feedback_count` was not in `0001`.** A running average needs its denominator, so
+   WP4 ships the first migration this repository has ever needed. The estimate was one
+   day; a migration plus the credit rules plus the review inbox was two.
+3. **`unused` does not write confidence, and the hosted product does.** Its fallback of
+   `0.5` is invented data on a row whose writer claimed nothing. Deliberate divergence,
+   asserted by test.
+4. **`restore` clears `expires_at`, and the hosted product does not.** Keeping the deadline
+   means the next decay pass re-archives the row, so its restore does not work for exactly
+   the memories most likely to need one. Deliberate divergence, asserted by test.
+5. **`search` does not run the nudge** (§5.4 corrected), and neither does anything else
+   except `add`.
+6. **The nudge is not "at most one page"** — it is 100 rows, a resumable cursor, and an
+   explicit statement in the code that it is not the mechanism.
+7. **`doctor` grew a `decay` line.** The plan's doctor spec was "integrity, schema version,
+   config, embedder probe"; the decay timestamp is the fifth thing a user needs, because
+   the opportunistic nudge cannot keep up and the explicit command can.
+8. **The plan's `decay --full` row is measured as `decay --dry-run`.** A real pass rewrites
+   almost every strength in the corpus, which would make `--repeat` compare a corpus with
+   what it became; the read cost is what scales with the corpus, and the write cost is
+   `add`-shaped per row that moved.
+9. **`docs/DESIGN.md` still does not exist.** §2 lists it and §5.3 referenced it as the
+   place the formulas are documented; `docs/CONTRACT.md` carries the formulas for callers
+   and `lifecycle.rs`/`decay.rs` carry them for maintainers. Still a WP8 item.
+
+### What WP5 inherits
+
+1. **The auto-link pass is untouched and still specified in §5.2.** It belongs on the
+   activation path, which now has two entries — `add` (already wiring `derived_from`) and
+   `approve` (wiring the staging column) — so the hook goes where `link_derived_from` is,
+   not in one of the two callers.
+2. **`relate` is the last deferred row in the bench report.** `get --relations` still exits
+   4 naming WP5, and the harness prints `relate — no graph until WP5`. WP4 removed the
+   `decay --full` line from that list; WP5 removes the last one.
+3. **A draft's edges are never written, by construction.** `link_derived_from` is only
+   reached for an active row or from `approve`, so `relate` cannot leak a draft's title
+   without WP5 adding a new path — and if it does, the test that guards the inbox is in
+   `lifecycle.rs`.
+4. **The cross-workspace ordering gap is still open.** `list --workspace '*'` was 55.7/91.9
+   ms in WP1 and no index in `0001` covers `ORDER BY pinned DESC, strength DESC, id DESC`
+   without a leading `workspace_id`. WP5 is the natural place to decide, since `relate`
+   will add its own cross-workspace query.
+5. **`gate.rs` has never been exercised through the CLI.** The review inbox is tested
+   through `add` with `--source agent_reflection --confidence 0.4` and through a
+   review-mode workspace in `store.rs`; the three authority sources, the threshold
+   boundary, and the unrecognised-source default are unit tests only.
 
 ### WP2's numbers, and the four things WP2 found
 

@@ -459,7 +459,8 @@ fn fill(db: &Database, spec: &CorpusSpec) -> Result<()> {
         // term by accident, and a title with the position in it, so a short write means
         // the corpus is not the corpus the report describes.
         return Err(Error::Invalid(format!(
-            "the corpus asked for {} memories and {} were written; the generator produced              duplicates",
+            "the corpus asked for {} memories and {} were written; the generator produced \
+             duplicates",
             spec.size, written
         )));
     }

@@ -190,13 +190,16 @@ fn a_malformed_outcome_item_exits_three() {
 
 #[test]
 fn a_rating_of_minus_one_is_parsed_rather_than_read_as_a_flag() {
-    // `-1` is the only value in the surface that begins with a hyphen.
+    // `-1` is the only value in the surface that begins with a hyphen, and clap reads a
+    // leading hyphen as the start of another flag unless it is told not to.
     let sandbox = Sandbox::new();
-    let out = run(&["rate", "--db", &sandbox.db_arg(), "k_01JC9W5K2Q", "-1"]);
+    let id = add(&sandbox, &["--kind", "semantic", "--title", "Rate me"]);
+    let db = sandbox.db_arg();
+    let out = run(&["rate", "--db", &db, &id, "-1"]);
     assert_eq!(
         code(&out),
-        1,
-        "expected the unimplemented error, not a parse error: {}",
+        0,
+        "`-1` must be read as a rating, not as a flag: {}",
         stderr(&out)
     );
 }
@@ -240,14 +243,7 @@ fn unimplemented_commands_name_the_work_package_that_owns_them() {
     // be finished before it was.
     let sandbox = Sandbox::new();
     let db = sandbox.db_arg();
-    let cases: [(&str, &[&str], u8); 6] = [
-        ("review list", &["review", "list", "--db", &db], 4),
-        (
-            "outcome",
-            &["outcome", "success", "--item", "k_01:helpful", "--db", &db],
-            4,
-        ),
-        ("pin", &["pin", "k_01", "--db", &db], 4),
+    let cases: [(&str, &[&str], u8); 3] = [
         ("relate", &["relate", "k_01", "--db", &db], 5),
         ("export", &["export", "--db", &db], 6),
         ("import", &["import", "nothing.jsonl", "--db", &db], 6),
@@ -270,10 +266,20 @@ fn unimplemented_commands_name_the_work_package_that_owns_them() {
 
 #[test]
 fn the_json_failure_envelope_is_exactly_one_document_on_stdout() {
+    // A *runtime* failure, not a parse failure: clap's own errors are printed by clap
+    // before this crate ever sees them, and the contract only promises one JSON document
+    // on the paths this crate owns.
     let sandbox = Sandbox::new();
-    let value = json(&["review", "list", "--db", &sandbox.db_arg(), "--json"]);
+    let value = json(&[
+        "rate",
+        "--db",
+        &sandbox.db_arg(),
+        "k_missing",
+        "+1",
+        "--json",
+    ]);
     assert_eq!(value["ok"], serde_json::json!(false));
-    assert_eq!(value["error"]["code"], serde_json::json!("unimplemented"));
+    assert_eq!(value["error"]["code"], serde_json::json!("not_found"));
     assert!(value["error"]["message"].is_string());
     assert_eq!(
         value["meta"]["contract_version"],
@@ -285,8 +291,15 @@ fn the_json_failure_envelope_is_exactly_one_document_on_stdout() {
 #[test]
 fn quiet_does_not_suppress_an_error() {
     let sandbox = Sandbox::new();
-    let out = run(&["--quiet", "review", "list", "--db", &sandbox.db_arg()]);
-    assert_eq!(code(&out), 1);
+    let out = run(&[
+        "--quiet",
+        "rate",
+        "--db",
+        &sandbox.db_arg(),
+        "k_missing",
+        "+1",
+    ]);
+    assert_eq!(code(&out), 2, "a rating of nothing is a not-found");
     assert!(
         stderr(&out).contains("kiomon: "),
         "--quiet means less chatter, not silence on failure: {}",
@@ -300,9 +313,10 @@ fn global_flags_are_accepted_after_the_subcommand_too() {
     // arguments. Asserting it means the property is not lost to a future refactor.
     let sandbox = Sandbox::new();
     let out = run(&["review", "list", "--db", &sandbox.db_arg(), "--json"]);
-    assert_eq!(code(&out), 1);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
     let value: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
-    assert_eq!(value["error"]["code"], serde_json::json!("unimplemented"));
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert_eq!(value["data"]["count"], serde_json::json!(0));
 }
 
 #[test]
@@ -325,7 +339,10 @@ fn init_then_add_then_get_then_update_then_forget() {
     let init = json(&["init", "--db", &sandbox.db_arg(), "--json"]);
     assert_eq!(init["ok"], serde_json::json!(true));
     assert_eq!(init["data"]["created"], serde_json::json!(true));
-    assert_eq!(init["data"]["schema_version"], serde_json::json!(1));
+    assert_eq!(
+        init["data"]["schema_version"],
+        serde_json::json!(kiomon_core::Database::target_schema_version())
+    );
     assert!(sandbox.db().exists(), "init must create the file");
 
     let id = add(
@@ -642,7 +659,10 @@ fn doctor_reports_paths_without_touching_the_database() {
         serde_json::json!(path.display().to_string())
     );
     // `doctor` opens the database, which creates it — that is acceptable, and reported.
-    assert_eq!(value["data"]["schema_version"], serde_json::json!(1));
+    assert_eq!(
+        value["data"]["schema_version"],
+        serde_json::json!(kiomon_core::Database::target_schema_version())
+    );
 }
 
 #[test]
@@ -1472,23 +1492,337 @@ fn bench_gate_is_the_plan_s_limits_and_a_missed_gate_is_an_exit_code() {
     let value: serde_json::Value =
         serde_json::from_str(&stdout(&out)).expect("one JSON document on stdout");
 
-    // A tiny corpus on any machine this runs on meets every gate the plan defines for this
-    // build, so the *passing* exit code is 0. The failing path is `evaluate`'s, and it is
-    // asserted where it lives rather than by trying to make a fast machine slow.
-    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    // The *verdict* is deliberately not asserted here. This test runs beside the rest of
+    // the suite, on a machine that is busy running it, and WP3's fifth finding is exactly
+    // this: a gate read at one sample measures the machine. What is asserted is the
+    // contract, which is what must not drift — the exit code and the report are the same
+    // fact said twice, and a gate that cannot fail is not a gate.
+    let exit = code(&out);
+    let passed = value["data"]["gates_passed"].as_bool().expect("a verdict");
     assert_eq!(
-        value["data"]["gates_passed"],
-        serde_json::json!(true),
-        "{value}"
+        exit == 0,
+        passed,
+        "the exit code and `gates_passed` must agree: exit {exit}, {value}"
     );
-    for gate in value["data"]["reports"][0]["gates"]
+
+    let gates = value["data"]["reports"][0]["gates"]
         .as_array()
-        .expect("the gates")
-    {
-        assert_eq!(gate["passed"], serde_json::json!(true), "{gate}");
-        assert!(
-            gate["limit_ms"].as_f64().expect("a limit") > 0.0,
-            "a gate without a limit is not a gate: {gate}"
+        .expect("the gates");
+    assert!(!gates.is_empty());
+    assert_eq!(
+        passed,
+        gates
+            .iter()
+            .all(|gate| gate["passed"] == serde_json::json!(true)),
+        "the verdict must be the gates' verdict: {value}"
+    );
+    for gate in gates {
+        let limit = gate["limit_ms"].as_f64().expect("a limit");
+        let measured = gate["measured_ms"].as_f64();
+        assert!(limit > 0.0, "a gate without a limit is not a gate: {gate}");
+        assert_eq!(
+            gate["passed"],
+            serde_json::json!(measured.is_some_and(|value| value <= limit)),
+            "a gate must pass exactly when its own numbers say it does, and a gate with no \
+             measurement must not pass by default: {gate}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// lifecycle
+// ---------------------------------------------------------------------------
+
+/// Save a draft the write gate will hold back, and return its id.
+fn draft(sandbox: &Sandbox, title: &str) -> String {
+    let db = sandbox.db_arg();
+    let value = json(&[
+        "add",
+        "--db",
+        &db,
+        "--json",
+        "--kind",
+        "semantic",
+        "--title",
+        title,
+        "--body",
+        "a claim nobody has checked",
+        "--source",
+        "agent_reflection",
+        "--confidence",
+        "0.4",
+    ]);
+    assert_eq!(value["ok"], serde_json::json!(true), "{value}");
+    assert_eq!(
+        value["data"]["status"],
+        serde_json::json!("pending_approval")
+    );
+    value["data"]["id"].as_str().expect("an id").to_owned()
+}
+
+#[test]
+fn a_draft_is_invisible_to_search_until_it_is_approved() {
+    // The review inbox's whole promise, asserted through the binary: a draft that leaks
+    // into retrieval is worse than no review inbox at all, and `search` is the path a leak
+    // would take.
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    let id = draft(&sandbox, "Staging deploys need a manual migration");
+
+    let before = json(&["search", "--db", &db, "--json", "manual migration"]);
+    assert_eq!(before["data"]["results"], serde_json::json!([]));
+    assert_eq!(
+        before["data"]["attempt"]["outcome"], "exhausted",
+        "a draft must not be reachable on any rung of the ladder: {before}"
+    );
+
+    let listed = json(&["review", "list", "--db", &db, "--json"]);
+    assert_eq!(listed["data"]["count"], serde_json::json!(1));
+    assert_eq!(listed["data"]["items"][0]["id"], serde_json::json!(id));
+    assert_eq!(
+        listed["data"]["items"][0]["confidence"],
+        serde_json::json!(0.4)
+    );
+
+    let approved = json(&["review", "approve", "--db", &db, "--json", &id]);
+    assert_eq!(approved["data"]["moved"], serde_json::json!([id]));
+
+    let after = json(&["search", "--db", &db, "--json", "manual migration"]);
+    assert_eq!(
+        after["data"]["results"][0]["id"],
+        serde_json::json!(id),
+        "approving a draft is what makes it retrievable"
+    );
+    assert_eq!(
+        json(&["review", "list", "--db", &db, "--json"])["data"]["count"],
+        serde_json::json!(0)
+    );
+}
+
+#[test]
+fn a_rejected_draft_is_archived_rather_than_deleted() {
+    // Rejecting is a decision made without much information, so it has to be undoable.
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    let id = draft(&sandbox, "A claim I do not trust");
+
+    let rejected = json(&["review", "reject", "--db", &db, "--json", &id]);
+    assert_eq!(rejected["data"]["moved"], serde_json::json!([id]));
+
+    let stored = json(&["get", "--db", &db, "--json", &id]);
+    assert_eq!(stored["data"]["status"], serde_json::json!("archived"));
+    assert_eq!(
+        stored["data"]["body"],
+        serde_json::json!("a claim nobody has checked"),
+        "the text is still there, which is what `restore` needs"
+    );
+
+    // And it never became retrievable along the way.
+    let out = run(&["search", "--db", &db, "claim nobody"]);
+    assert_eq!(code(&out), 0);
+    assert_eq!(stdout(&out).trim(), "");
+
+    let restored = json(&["restore", "--db", &db, "--json", &id]);
+    assert_eq!(restored["data"]["moved"], serde_json::json!([id]));
+    let found = json(&["search", "--db", &db, "--json", "claim nobody"]);
+    assert_eq!(found["data"]["results"][0]["id"], serde_json::json!(id));
+}
+
+#[test]
+fn reviewing_something_that_is_not_waiting_reports_it_and_exits_two() {
+    // The same rule as `forget`: nothing moved is a conclusion, not a success. A script
+    // that approved four drafts of which one was already approved must still have its
+    // other three approved, which is why this is not an error.
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    let active = add(
+        &sandbox,
+        &["--kind", "semantic", "--title", "Already active"],
+    );
+
+    let out = run(&["review", "approve", "--db", &db, &active, "k_missing"]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    let text = stderr(&out);
+    assert!(
+        text.contains("active") && text.contains("wrong status"),
+        "the reason must be reported, not just the id: {text}"
+    );
+    assert!(text.contains("k_missing"), "{text}");
+}
+
+#[test]
+fn a_rating_moves_the_running_average_and_leaves_strength_alone() {
+    // The one thing a reader is most likely to assume about `rate` is that it changed the
+    // memory's ranking. It did not: decay owns strength and recomputes it from
+    // `importance` on every pass, so a rating written into it would last until the next
+    // `kiomon decay`.
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    let id = add(&sandbox, &["--kind", "semantic", "--title", "Rate me"]);
+    let strength_before = json(&["get", "--db", &db, "--json", &id])["data"]["strength"]
+        .as_f64()
+        .expect("a strength");
+
+    json(&["rate", "--db", &db, "--json", &id, "+1"]);
+    let second = json(&["rate", "--db", &db, "--json", &id, "-1"]);
+    assert_eq!(second["data"]["feedback_count"], serde_json::json!(2));
+    assert_eq!(
+        second["data"]["feedback_score"],
+        serde_json::json!(0.0),
+        "one up and one down average to zero: {second}"
+    );
+
+    let stored = json(&["get", "--db", &db, "--json", &id]);
+    assert_eq!(stored["data"]["feedback_count"], serde_json::json!(2));
+    assert_eq!(
+        stored["data"]["strength"],
+        serde_json::json!(strength_before),
+        "a rating must not touch strength"
+    );
+}
+
+#[test]
+fn an_outdated_assessment_expires_a_memory_and_decay_archives_it() {
+    // The credit loop end to end through the binary: `outcome` is what an agent calls,
+    // and `decay` is what acts on it. No clock manipulation is needed, because `outdated`
+    // sets the deadline to now.
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    let id = add(
+        &sandbox,
+        &[
+            "--kind",
+            "semantic",
+            "--title",
+            "The old URL",
+            "--body",
+            "http://old",
+        ],
+    );
+
+    let report = json(&[
+        "outcome",
+        "--db",
+        &db,
+        "--json",
+        "success",
+        "--item",
+        &format!("{id}:outdated"),
+    ]);
+    assert_eq!(report["data"]["applied"][0]["id"], serde_json::json!(id));
+    assert!(
+        report["data"]["applied"][0]["expires_at"].is_string(),
+        "an outdated fact gets a deadline: {report}"
+    );
+
+    let decay = json(&["decay", "--db", &db, "--json", "--all-workspaces"]);
+    assert_eq!(decay["data"]["archived"], serde_json::json!(1));
+    assert_eq!(
+        decay["data"]["details"][0]["expired"],
+        serde_json::json!(true)
+    );
+
+    let stored = json(&["get", "--db", &db, "--json", &id]);
+    assert_eq!(stored["data"]["status"], serde_json::json!("archived"));
+
+    // And the audit trail outlives the effect: the memory can be brought back, and the
+    // reason it was archived is still on the record.
+    let restored = json(&["restore", "--db", &db, "--json", &id]);
+    assert_eq!(restored["data"]["moved"], serde_json::json!([id]));
+    assert_eq!(
+        json(&["get", "--db", &db, "--json", &id])["data"]["expires_at"],
+        serde_json::json!(null),
+        "restoring is a person saying the deadline no longer applies"
+    );
+}
+
+#[test]
+fn a_decay_dry_run_reports_the_scan_and_writes_nothing() {
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    let id = add(&sandbox, &["--kind", "semantic", "--title", "Fresh"]);
+    let before = json(&["get", "--db", &db, "--json", &id]);
+
+    let out = run(&["decay", "--db", &db, "--dry-run"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("dry run"), "{text}");
+    assert!(text.contains("nothing was written"), "{text}");
+
+    let dry = json(&[
+        "decay",
+        "--db",
+        &db,
+        "--json",
+        "--dry-run",
+        "--all-workspaces",
+    ]);
+    assert_eq!(dry["data"]["dry_run"], serde_json::json!(true));
+    assert_eq!(dry["data"]["scanned"], serde_json::json!(1));
+    assert_eq!(dry["data"]["archived"], serde_json::json!(0));
+    assert_eq!(
+        json(&["get", "--db", &db, "--json", &id]),
+        before,
+        "a dry run must not move a single column"
+    );
+
+    // A real pass on a corpus that is minutes old changes nothing either, and says so.
+    let real = json(&["decay", "--db", &db, "--json", "--all-workspaces"]);
+    assert_eq!(real["data"]["dry_run"], serde_json::json!(false));
+    assert_eq!(real["data"]["decayed"], serde_json::json!(0));
+    assert_eq!(real["data"]["archived"], serde_json::json!(0));
+}
+
+#[test]
+fn the_state_verbs_exit_two_when_nothing_moved_and_zero_when_something_did() {
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    let id = add(&sandbox, &["--kind", "semantic", "--title", "Pin me"]);
+
+    for verb in ["pin", "unpin", "archive", "restore"] {
+        let out = run(&[verb, "--db", &db, "k_missing"]);
+        assert_eq!(code(&out), 2, "`{verb}` of a missing id: {}", stderr(&out));
+    }
+
+    assert_eq!(code(&run(&["pin", "--db", &db, &id])), 0);
+    let again = run(&["pin", "--db", &db, &id]);
+    assert_eq!(code(&again), 2, "a second pin moves nothing");
+    assert!(
+        stderr(&again).contains("nothing happened to it"),
+        "{}",
+        stderr(&again)
+    );
+
+    assert_eq!(code(&run(&["archive", "--db", &db, &id])), 0);
+    assert_eq!(code(&run(&["archive", "--db", &db, &id])), 2);
+    assert_eq!(code(&run(&["restore", "--db", &db, &id])), 0);
+    assert_eq!(
+        code(&run(&["restore", "--db", &db, &id])),
+        2,
+        "restoring an active memory moves nothing"
+    );
+}
+
+#[test]
+fn a_pinned_memory_is_archived_by_nothing_and_sorts_first() {
+    // Pin immunity to decay is a unit test in `decay.rs`; this is the part a user sees:
+    // the ordering, and the fact that the pin survives an archive-shaped pass.
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    let first = add(&sandbox, &["--kind", "semantic", "--title", "First saved"]);
+    let second = add(&sandbox, &["--kind", "semantic", "--title", "Second saved"]);
+    assert_eq!(code(&run(&["pin", "--db", &db, &first])), 0);
+
+    let listed = json(&["list", "--db", &db, "--json"]);
+    assert_eq!(
+        listed["data"][0]["id"],
+        serde_json::json!(first),
+        "a pinned memory must be findable in the list"
+    );
+    assert_eq!(listed["data"][1]["id"], serde_json::json!(second));
+
+    json(&["decay", "--db", &db, "--json", "--all-workspaces"]);
+    let after = json(&["list", "--db", &db, "--json"]);
+    assert_eq!(after["data"][0]["pinned"], serde_json::json!(true));
+    assert_eq!(after["data"][0]["id"], serde_json::json!(first));
 }
