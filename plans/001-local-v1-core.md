@@ -709,6 +709,7 @@ flaky-test generator):
 | `add` p95 | ≤ 40 ms |
 | `search` p95 (fts) | ≤ 60 ms |
 | `search` p95 (hybrid, local embedder) | ≤ 250 ms |
+| `retrieve` p95, no retrieval record (WP5.5) | ≤ 45 ms |
 
 > **The budget measures work, not wall time, and WP1 showed why.** Process spawn alone
 > is 8.6 ms on Windows, so a `search` that does nothing costs 8.6 ms and a `search` that
@@ -841,6 +842,129 @@ that costs one query per hit is the thing that would make `search`'s 26.8 ms loo
 and `retrieve` → `outcome` works as one loop, because `retrieved_ids` is exactly what
 `outcome` is fed.
 
+### WP5.5's numbers, and the three things it found
+
+Same laptop, same 10 000-memory corpus, same ruler as every other table here. Read against
+`work`, with the spawn floor at 7.75 ms:
+
+| Command | work p50 / p95 (ms) | total p50 |
+|---|---|---|
+| `search deploy` (the query the packet is built from) | 26.05 / 40.80 | 34.06 |
+| **`retrieve --intent execute deploy`** | **26.20** / 30.75 | 34.36 |
+| **`retrieve --intent answer`** (a five-term sentence) | **32.69** / 38.44 | 40.85 |
+| `retrieve --no-record` | 18.10 / 25.57 | 26.26 |
+| `retrieve` with nothing to match | 4.17 / 8.83 | 12.34 |
+| `retrieve (no record)`, in the harness, n = 5 × 30 | 18.02 / 29.04 | 26.43 |
+
+1. **The packet costs what the search under it costs.** 26.20 ms of work for a packet whose
+   search is 26.05 ms, on the same query — a difference inside the noise of either row. The
+   hosted implementation loads an envelope for its candidate ids because its search returns
+   projections; local search hydrates the whole row, so the re-rank, the bucketing and the
+   warnings are arithmetic over data that already arrived. **The one thing that would have
+   made this expensive is a query per hit, and the claim that it is not is now a gate**
+   (`retrieve p95 ≤ 45 ms`, `--no-record` so the row is comparable with `search`'s).
+2. **The retrieval record is most of what a packet adds to a search**: 26.20 → 18.10 ms of
+   work with `--no-record`, so about 8 ms for bumping the counters and timestamps of the
+   injected rows. That is the same few-milliseconds-per-statement cost WP2 measured for
+   `search`, and it buys the decay stretch: a memory that was put in front of an agent is a
+   memory that was used. `retrieve` records `retrieved_ids` and not the wider window it
+   ranked, so one use is counted once — `search`'s `record` is off for the inner search, and
+   a test asserts the counter equals the packet size rather than the candidate size.
+3. **`0001`'s `memory_links` had no `valid_to`,** and the plan's own schema table did not
+   either, because edges were only ever created and never retired. The ported conflict query
+   is `WHERE valid_to IS NULL AND relation IN ('supersedes', 'contradicts')` — the hosted
+   product marks a resolved argument by setting `valid_to` — so without the column every
+   contradiction a brain ever recorded would be reported as active forever, and there would
+   be no way to say "that was settled in March". `0003_link_valid_to.sql` adds it, nullable,
+   with no index: the packet reads edges by `source_id` and `target_id`, both already
+   indexed, and `memory_links` is empty in every database this build can produce (only
+   `add --ref` writes an edge, §9-D9).
+
+### WP5.5's acceptance criteria
+
+| # | Criterion | Where it is asserted |
+|---|---|---|
+| 1 | One query under two intents: same memories, different packet | `retrieve::tests::a_pool_that_fits_the_packet_injects_the_same_memories_under_any_intent` and `an_intent_decides_which_memories_fit_when_the_pool_is_wider_than_the_packet` — see the record below for why it took two tests |
+| 2 | A `pending_approval` memory never reaches a packet | `retrieve::tests::a_pending_memory_never_reaches_a_packet`, and through the binary in `a_draft_reaches_a_packet_only_after_it_is_approved` (which also asserts it appears after `review approve`) |
+| 3 | The JSON field names match the hosted handler's, against a transcribed fixture | `retrieve::tests::the_json_has_the_wire_shape_and_no_nulls_where_the_wire_has_no_keys`, `the_five_intents_are_the_ones_the_route_validates`, `the_kind_priority_table_is_the_hosted_one`, `the_summary_counts_what_the_buckets_hold_singular_and_plural`, and through the binary in `retrieve_returns_the_packet_shape_the_sdks_parse` |
+| 4 | A bounded number of statements whatever the corpus | one search + one clock read + two edge seeks + one record, and the gate in §7 as the guard: `retrieve (no record)` p95 ≤ 45 ms, read against the same `search common` query |
+
+Beyond the plan's four: an expired memory is warned about and demoted but still injected; a
+`valid_until` counts as a deadline and a non-date does not; an unclaimed confidence is the
+`0.5` default and is *not* warned about; only the first routine takes the procedure slot
+while the runner-up stays in `retrieved_ids`; a condition is only present on a conditional
+item and comes from stored `scope`/`trigger`; `entities` and `risk_level` change nothing;
+a query over 1000 characters and a constraint list over 16 are refused, as the hosted route
+refuses them; `--no-record` leaves the decay clock alone; and `retrieve | jq` is one
+document with every diagnostic on stderr.
+
+### Where WP5.5 contradicted the plan
+
+1. **The intent vocabulary was wrong in the plan.** §8's WP5.5 block said
+   `understand|execute|recall`. The contract has five — `execute`, `plan`, `answer`,
+   `verify`, `debug` — validated by `z.enum` in the route, by the MCP tool's JSON schema,
+   and by `RetrievalIntent` in the Python SDK. Corrected in place before the work started,
+   because an SDK sending `verify` and getting a usage error is the worst possible first
+   impression for the verb both SDKs lead with.
+2. **The acceptance criterion "set equality on ids *and* inequality on section order" is
+   false in the case it was written for, and true in a different one.** With a corpus that
+   fits the packet, every intent injects the same memories *and* the packet is identical
+   except for its summary: each kind has its own bucket, so nothing inside the packet can
+   move. Intent changes the **choice** — which memories fit when the pool is wider than the
+   page — not the presentation. WP5.5's two acceptance tests assert exactly that, and the
+   contract says it plainly, so a caller does not expect the small-corpus case to reorder.
+3. **§8's WP5.5 sketch listed `facts`/`procedure`/`episodes` and left the rest to the
+   reader.** The wire packet also has `summary`, `evidence`, `warnings`, `conflicts` and
+   `retrieved_ids`, and `retrieved_ids` is the interesting one: it is the input to
+   `outcome`, which is how the loop the SDKs document (`retrieve` → `record_outcome`) closes
+   without the caller guessing which memories were injected.
+4. **Applicability is judged on the *matched passage*, not the body.** `candidate_text` is
+   title + snippet + excerpt + tags + envelope, so a constraint that appears only in an
+   unmatched part of a long body does not count. That is the hosted behaviour, discovered by
+   a test that expected otherwise (`the_applicability_surface_is_the_memory_plus_the_passage_that_matched`),
+   and it is the reason a caller should put the task's words in `--constraint` *and* the
+   query: they are read by the same re-rank but from different surfaces.
+5. **The applicability tokenizer is Latin-only, deliberately.** `[a-z0-9]+` with a 31-word
+   stop list, ported verbatim: a constraint written in Japanese matches nothing and leaves
+   every item `unknown`. The hosted product has the same hole. Closing it locally would make
+   the same call rank differently against localhost than against `kiomon.com`, which is the
+   failure this work package exists to prevent — the fix is the trigram tokenizer (D5
+   note), applied in both places at once.
+6. **`memory_links` needed a column the schema never had** (`valid_to`, migration `0003`),
+   and with the graph deferred the column stays `NULL` for every edge. The conflict and
+   supersession reads are still in the packet: they are two indexed seeks that return
+   nothing today, `conflicts: []` is the truth rather than a stub, and the day WP5 starts
+   writing those relations the packet reports them without a code change.
+7. **`risk_level` and `entities` are accepted and never read.** The hosted route validates
+   both and the service drops both, so the port keeps the fields for WP9's wire type and
+   reads neither. They are *not* CLI flags: a flag that provably cannot change the answer
+   teaches a user something false about the engine. A test pins the equivalence.
+8. **The graph's `summary` sentence is missing.** The hosted summary appends ` Graph
+   activation added N linked candidates.` when its graph leg contributes; local has no graph
+   (§9-D9), so the sentence ends after the counts. Claiming otherwise would be a packet
+   describing work it did not do.
+
+### What WP6 inherits
+
+1. **`export`/`import` must carry the packet's inputs, not just the rows.** An exported
+   memory that loses `confidence`, `expires_at` or the envelope's `claims`/`steps`/`trigger`
+   exports something that *searches* the same and *retrieves* differently, and the packet is
+   now part of what a round trip has to preserve. The test to write is export → fresh
+   database → `retrieve`, not export → fresh database → `search`.
+2. **`memory_links` is still unevaluated in a round trip.** Nothing writes edges except
+   `add --ref` and `approve`'s staging path, so an export that drops them drops little today
+   — and the wrong thing to do is to notice that and skip them. §8's WP6 acceptance already
+   says "export → fresh DB → import → `search` returns the same ids and titles"; the packet
+   adds `retrieved_ids` and the buckets.
+3. **The 1000-character query cap and the 16-constraint cap are the route's**, so the
+   importer's hostile-input tests should use the same limits and not invent their own.
+4. **`valid_to` is the one column an importer has to decide about.** Importing an edge whose
+   conflict was resolved elsewhere means importing the resolution with it; a `valid_to` in
+   the file and a NULL in the database is a conflict re-opened.
+5. **The last unimplemented verbs are now `import` and `export`** — `relate`, `link` and
+   `unlink` are deferred, not pending, so the CLI test table in `crates/kiomon-cli/tests/cli.rs`
+   has one family left to empty.
+
 ### WP6 — Import, export, and portability (1 day)
 JSONL in/out, markdown out, directory import, `--workspace` mapping, id
 preservation on import.
@@ -895,7 +1019,7 @@ shape last.
 | **WP3** | ✅ **DONE** 2026-10-14 | `kiomon bench` (cold-process timings, the plan's gates, `--json`, the corpus generator it ships with), `crates/kiomon-core/benches/store.rs` (in-process, no Criterion — see below), a CI job that fails on a missed gate and publishes the numbers as an artifact, and the README's numbers replaced with measured ones. **146 core + 9 integration tests**, clippy clean. |
 | **WP4** | ✅ **DONE** 2026-10-16 | `lifecycle.rs` (the review inbox, `pin`/`archive`/`restore`/`rate`/`outcome` with the hosted product's credit rules), `decay.rs` (the formula, the paged command, the resumable daily nudge), migration `0002_lifecycle.sql`, the five lifecycle commands wired end to end, `doctor` reporting when decay last ran, and the CONTRACT's lifecycle section rewritten around what the verbs *actually* move. **274 tests** (192 core + 58 CLI + 24 others), clippy clean, 3 324 KiB binary. |
 | **WP5** | ⏸ **DEFERRED** to the next sprint (§9-D9, 2026-10-17) — a scope cut, not a design change: the spec below is unchanged and is the next sprint's first work package | |
-| **WP5.5** | ⬜ **NEXT** — the packet the SDKs lead with | |
+| **WP5.5** | ✅ **DONE** 2026-10-17 | `retrieve.rs` (the packet: five intents, the applicability rule, the ranking formula, the warning strings, the summary sentence — ported from the hosted `lib/retrieve.ts` and `routes/retrieve.ts`), the CLI verb with `--intent`/`--constraint`, migration `0003_link_valid_to.sql` (the column the ported conflict query needs and `0001` did not have), a bench row and a gate, and `docs/CONTRACT.md`'s packet shape. **312 tests** (218 core + 70 CLI + 24 others), clippy clean, 3 336 KiB binary. | |
 | **WP6** | ⬜ TODO | |
 | **WP7** | ⬜ TODO | |
 | **WP8** | ⬜ TODO | |

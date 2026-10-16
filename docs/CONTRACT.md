@@ -114,6 +114,11 @@ display labels and are never accepted as input.
 `precedes` · `follows` · `part_of`. All are directed except `related_to`, which is
 symmetric and therefore stored once.
 
+**Intents** (for `retrieve`) — `execute` · `plan` · `answer` · `verify` · `debug`.
+They are the hosted route's vocabulary, the MCP tool's, and the Python SDK's
+`RetrievalIntent`, in that order. Nothing else is accepted: an intent this engine does not
+know is a usage error, not a default.
+
 **Assessments** (for `outcome`) — `helpful` · `unused` · `misleading` · `outdated`.
 An omitted memory is untouched; one reported as `unused` is credited with a *zero*, which
 pulls its running feedback score toward zero and moves nothing else. See
@@ -225,6 +230,34 @@ the excerpt, all of which are already fields of the row. An empty snippet is hon
 body opening that happens to sit under a title match reads as the place it matched.
 `--snippet-len` sets how many full-text tokens of context it carries, and `--full` is
 still what lets a long one through untruncated.
+
+### Retrieving
+
+| Command | Promise |
+|---|---|
+| `retrieve <query>` | The packet: what to use for what you are about to do, rather than what matches. `--intent` decides which kind of memory leads and which memories fit when there are more candidates than the packet holds; `--constraint` (repeatable) says what the task is about, and is the only signal applicability is judged on. Nothing about the task is stored, and `retrieved_ids` is exactly what `outcome` wants fed back. |
+
+**The intent is a re-ranking, not a filter.** Every intent retrieves the same candidates
+for the same query; what changes is the weight of a kind and therefore, when the packet is
+smaller than the pool, which candidates are in it. A packet built from a corpus that fits
+the page is the same packet under any intent, apart from its summary.
+
+**One procedure, and the facts it does not have room for.** A packet holds at most one
+`procedure`: two competing routines side by side is a decision the caller cannot make
+better than the engine can. The runner-up is still in `retrieved_ids`, and so is every
+other memory that was injected and not bucketed.
+
+**Nothing in a packet is inferred.** Claims come from the envelope the writer filled in,
+confidence is the number the writer claimed (or the `0.5` default — which is *not* a low
+confidence and is never warned about), and every warning is a fact already in a column:
+expired, superseded, contradicted, or below the confidence threshold. There is no model on
+this path, and there is nothing to configure.
+
+**An expired memory is demoted, never dropped.** It is evidence about what was believed,
+and the conflict it may be part of is exactly what a caller needs to see. `conflicts` is
+empty until the graph exists — nothing can write a contradiction yet — and if the
+conflict check itself cannot run, that fact is reported in `warnings` rather than left to
+look like an absence.
 
 ### Lifecycle
 
@@ -442,6 +475,59 @@ The body and the metadata envelope are **not** in a list row — a caller browsi
 need them, and an agent paying for tokens certainly does not. `get` is how you ask for the
 whole memory.
 
+### A context packet
+
+`retrieve` returns this as `data`, byte-shaped like the hosted `/api/retrieve` response,
+because the published Python and TypeScript SDKs already parse it:
+
+```json
+{
+  "summary": "1 fact, 1 procedure, 1 episode matched intent \"execute\".",
+  "facts": [
+    {
+      "memory_id": "k_01JC9W5K2Q",
+      "kind": "semantic",
+      "claim": "migrations are manual on staging",
+      "confidence": 0.9,
+      "authority": "user_saved",
+      "applicability": "applicable"
+    }
+  ],
+  "procedure": {
+    "memory_id": "k_01JC9W5K3R",
+    "kind": "procedural",
+    "claim": "run the deploy script → run the migration",
+    "confidence": 0.5,
+    "authority": "user_saved",
+    "applicability": "conditional",
+    "condition": "only when the schema changed"
+  },
+  "episodes": [],
+  "evidence": [
+    {
+      "memory_id": "k_01JC9W5K4S",
+      "source_uri": "https://example.com/runbook",
+      "source_span": "page 12"
+    }
+  ],
+  "warnings": [],
+  "conflicts": [],
+  "retrieved_ids": ["k_01JC9W5K2Q", "k_01JC9W5K3R", "k_01JC9W5K4S"]
+}
+```
+
+`procedure` is present only when a routine is in the packet, `condition` only on a
+conditionally applicable item, and `source_ref` only when the memory points somewhere — the
+key is **absent**, not `null`, which is what the wire does and what a strict decode
+expects.
+
+`claim` is the most specific line the writer stored: a semantic memory's first claim, a
+routine's steps joined with `→`, an episode's outcome, and the title otherwise. `authority`
+is the memory's `source`, verbatim. `applicability` is `applicable` when at least half of
+the constraint tokens appear in the memory or the passage that matched, `conditional` when
+some do, and `unknown` when none do or when no constraints were given — a packet does not
+guess what a task is about.
+
 ### An added memory
 
 ```json
@@ -491,7 +577,9 @@ how you get yours.
   work unchanged against a local brain — see `plans/001-local-v1-core.md` §9-D8 and
   Appendix C. Routes this engine cannot answer (`revert`, briefings) return a typed
   `unsupported_locally` error rather than an empty success.
-- **The knowledge graph** — `link`, `unlink`, `relate` and `get --relations`. Deferred to
+- **The knowledge graph** — `link`, `unlink`, `relate` and `get --relations` — and
+  therefore any edge a packet could report: `retrieve` returns `conflicts: []` today because
+  nothing can write a `contradicts` edge, not because the check is missing. Deferred to
   the next sprint by the plan's §9-D9, after this contract and the lifecycle verbs were
   done. They exit `1` with an `unimplemented` code and a message that says *deferred*, not
   *work package 5*: it is not in this release, and a caller that waits for it waits for

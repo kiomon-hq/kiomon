@@ -42,6 +42,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "0002_lifecycle",
         sql: include_str!("../migrations/0002_lifecycle.sql"),
     },
+    Migration {
+        name: "0003_link_valid_to",
+        sql: include_str!("../migrations/0003_link_valid_to.sql"),
+    },
 ];
 
 /// The pragmas every connection gets.
@@ -367,6 +371,24 @@ impl Database {
     pub(crate) const fn conn(&self) -> &Connection {
         &self.conn
     }
+}
+
+/// The database's own timestamp, as the string every timestamp column holds.
+///
+/// **SQLite is the clock.** That is why this crate has no date library: every deadline,
+/// every `created_at` and every decay pass compares against a value from the same
+/// implementation, in the same format, so a machine with a strange timezone or a clock that
+/// jumped cannot make two rows disagree about when now is.
+///
+/// # Errors
+///
+/// Returns the database error if SQLite cannot be asked.
+pub(crate) fn now(conn: &Connection) -> Result<String> {
+    let now: String =
+        conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')", [], |row| {
+            row.get(0)
+        })?;
+    Ok(now)
 }
 
 /// The outcome of running SQLite's consistency checks.

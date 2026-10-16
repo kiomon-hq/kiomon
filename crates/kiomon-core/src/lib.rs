@@ -72,6 +72,7 @@ pub mod id;
 pub mod lifecycle;
 pub mod metadata;
 pub mod model;
+pub mod retrieve;
 pub mod search;
 pub mod store;
 
@@ -94,6 +95,11 @@ pub use model::{
     ReviewMode, Scope, SearchAttempt, SearchHit, SearchHitJson, SearchOutcome, SearchQuery,
     SearchSort, Stats, Status, StatusCount, UpdateOutcome, WINDOW_OVERFETCH, Workspace,
     source_label,
+};
+pub use retrieve::{
+    Applicability, ConflictNote, ContextPacket, DEFAULT_PACKET_ITEMS, EvidenceRef, Intent,
+    MAX_CONSTRAINTS, MAX_ENTITIES, MAX_PACKET_ITEMS, MAX_QUERY_CHARS, PacketItem, RetrieveQuery,
+    RiskLevel,
 };
 pub use search::{LADDER_RUNGS, Ladder};
 

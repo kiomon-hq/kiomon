@@ -49,6 +49,16 @@ pub const KEY_ENTITIES: &str = "entities";
 pub const KEY_CLAIMS: &str = "claims";
 /// The key that holds the memory ids a memory was derived from.
 pub const KEY_SOURCE_REFS: &str = "source_refs";
+/// The key that holds the date a semantic memory stops being true.
+pub const KEY_VALID_UNTIL: &str = "valid_until";
+/// The key that holds what arms a routine.
+pub const KEY_TRIGGER: &str = "trigger";
+/// The key that holds a routine's ordered steps.
+pub const KEY_STEPS: &str = "steps";
+/// The key that holds the conditions a routine applies under.
+pub const KEY_SCOPE: &str = "scope";
+/// The key that holds how an episode ended.
+pub const KEY_OUTCOME: &str = "outcome";
 
 /// The result of checking an envelope: what to store, and what to tell the user.
 #[derive(Debug, Clone, PartialEq)]
@@ -101,12 +111,12 @@ const COMMON: &[(&str, Shape)] = &[
     (KEY_SOURCE_REFS, Shape::TextList),
 ];
 
-const SEMANTIC: &[(&str, Shape)] = &[("valid_from", Shape::Text), ("valid_until", Shape::Text)];
+const SEMANTIC: &[(&str, Shape)] = &[("valid_from", Shape::Text), (KEY_VALID_UNTIL, Shape::Text)];
 
 const PROCEDURAL: &[(&str, Shape)] = &[
-    ("trigger", Shape::Text),
-    ("steps", Shape::TextList),
-    ("scope", Shape::Text),
+    (KEY_TRIGGER, Shape::Text),
+    (KEY_STEPS, Shape::TextList),
+    (KEY_SCOPE, Shape::Text),
     ("priority", Shape::Choice(PRIORITIES)),
     ("examples", Shape::TextList),
 ];
@@ -114,7 +124,7 @@ const PROCEDURAL: &[(&str, Shape)] = &[
 const EPISODIC: &[(&str, Shape)] = &[
     ("occurred_at", Shape::Text),
     ("participants", Shape::TextList),
-    ("outcome", Shape::Text),
+    (KEY_OUTCOME, Shape::Text),
     ("location", Shape::Text),
     ("context", Shape::Text),
 ];

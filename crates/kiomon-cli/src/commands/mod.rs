@@ -46,6 +46,7 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Relate(args) => write::relate(cli, args),
 
         Command::Search(args) => read::search(cli, args),
+        Command::Retrieve(args) => read::retrieve(cli, args),
         Command::Get(args) => read::get(cli, args),
         Command::List(args) => read::list(cli, args),
 

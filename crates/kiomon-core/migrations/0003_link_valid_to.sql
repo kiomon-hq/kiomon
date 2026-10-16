@@ -1,0 +1,28 @@
+-- 0003_link_valid_to.sql — when an edge stopped being believed.
+--
+-- Forward-only, like 0001 and 0002. `PRAGMA user_version` moves to 3 in the same
+-- transaction as the statement below.
+--
+-- 0001's `memory_links` had no `valid_to`, because the plan's own schema table did not
+-- either: edges were only ever created, never retired. Porting the context packet (WP5.5)
+-- found the hole. The hosted packet decides whether a memory is *currently* contradicted
+-- with
+--
+--     WHERE valid_to IS NULL AND relation IN ('supersedes', 'contradicts')
+--
+-- and a resolved conflict is marked resolved by setting `valid_to`. Without the column,
+-- every contradiction a brain ever recorded would be reported as active forever, and there
+-- would be no way to say "this was argued out in March and settled".
+--
+-- No index comes with it. The packet reads edges by `source_id` and by `target_id`, both of
+-- which `idx_link_source` and `idx_link_target` already seek; `valid_to` is only a filter on
+-- the rows those seeks return. `memory_links` is also nearly empty in every database this
+-- build can produce — only `add --ref` writes an edge today (§9-D9 deferred the rest) — so
+-- an index for it would be speculation. The trigger to add one is the graph landing plus a
+-- `retrieve` measurement that shows the filter costing something; the plan records that.
+--
+-- Nullable on purpose: "currently believed" is the default state of an edge, and a column
+-- that defaulted to a timestamp would mean every edge was born resolved. The unindexed
+-- `NULL` is the common case, which is also why a partial index (`WHERE valid_to IS NULL`)
+-- would be the shape to reach for if one is ever needed.
+ALTER TABLE memory_links ADD COLUMN valid_to TEXT;

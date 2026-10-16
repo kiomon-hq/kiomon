@@ -983,11 +983,7 @@ struct CreditRow {
 /// The database's own timestamp, so `expires_at` comes from the clock that wrote every
 /// other column.
 fn now_expression(conn: &rusqlite::Connection) -> Result<String> {
-    let now: String =
-        conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')", [], |row| {
-            row.get(0)
-        })?;
-    Ok(now)
+    crate::db::now(conn)
 }
 
 #[cfg(test)]

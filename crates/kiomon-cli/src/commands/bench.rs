@@ -408,11 +408,10 @@ fn search_probes(corpus: &CorpusReport) -> Vec<Probe> {
     probes
 }
 
-/// The reads: the same query without its retrieval record, a full page, and the two
-/// list orderings worth watching.
+/// The reads: the same query without its retrieval record, the packet built from it, a
+/// full page, and the two list orderings worth watching.
 fn read_probes(corpus: &CorpusReport) -> Vec<Probe> {
     let db = corpus.path.display().to_string();
-    let id = corpus.sample_ids.first().cloned().unwrap_or_default();
     // How many rows the `deploy` rows have to rank, which is the number that decides what
     // the rest of this table means.
     let common = corpus
@@ -421,27 +420,40 @@ fn read_probes(corpus: &CorpusReport) -> Vec<Probe> {
         .find(|probe| probe.name == "common")
         .map_or(0, |probe| probe.matches);
     let mut probes = Vec::new();
-    for (label, extra, query) in [
+    // `retrieve` rides on the same `deploy` query as the search rows on purpose: a packet
+    // is a search plus a re-rank, a clock read and an edge lookup, so the number to compare
+    // it with is the search that fed it and not a number of its own. Its row is the guard
+    // against the packet growing a per-hit query, which would show up here as a multiple
+    // rather than as a few milliseconds.
+    for (label, verb, extra, query) in [
         (
             "search (no record)",
+            "search",
             vec!["--no-record", "deploy"],
-            Some("deploy"),
+            true,
         ),
         (
             "search (limit 50)",
+            "search",
             vec!["--no-record", "--limit", "50", "deploy"],
-            Some("deploy"),
+            true,
         ),
-        ("list", vec![], None),
-        ("list --recent", vec!["--recent"], None),
-        ("list --full", vec!["--full"], None),
+        (
+            "retrieve (no record)",
+            "retrieve",
+            vec!["--no-record", "--intent", "execute", "deploy"],
+            true,
+        ),
+        ("list", "list", vec![], false),
+        ("list --recent", "list", vec!["--recent"], false),
+        ("list --full", "list", vec!["--full"], false),
     ] {
-        let mut rest = vec![if query.is_some() { "search" } else { "list" }, "--quiet"];
+        let mut rest = vec![verb, "--quiet"];
         rest.extend(extra);
         probes.push(Probe {
             label,
-            query: query.map(str::to_owned),
-            matches: if query.is_some() { common } else { 0 },
+            query: query.then(|| "deploy".to_owned()),
+            matches: if query { common } else { 0 },
             collect_ids: false,
             args: Box::new({
                 let db = db.clone();
@@ -454,6 +466,20 @@ fn read_probes(corpus: &CorpusReport) -> Vec<Probe> {
         });
     }
 
+    probes.extend(single_probes(corpus));
+
+    probes
+}
+
+/// The rows that are one command with no query: `stats`, `get`, and the decay pass.
+///
+/// Split out of [`read_probes`] because they answer a different question — "what does
+/// this command cost" rather than "what does this query cost over a corpus" — and
+/// because a function that does two things is a function whose parts cannot be read.
+fn single_probes(corpus: &CorpusReport) -> Vec<Probe> {
+    let db = corpus.path.display().to_string();
+    let id = corpus.sample_ids.first().cloned().unwrap_or_default();
+    let mut probes = Vec::new();
     probes.push(Probe {
         label: "stats",
         query: None,
@@ -588,7 +614,9 @@ fn id_from(stdout: &str) -> Option<String> {
 /// comparing their times.
 fn display_label(label: &str) -> String {
     match label {
-        "open" | "add" | "add (cold file)" | "stats" | "get" => label.to_owned(),
+        "open" | "add" | "add (cold file)" | "stats" | "get" | "retrieve (no record)" => {
+            label.to_owned()
+        }
         name if name.starts_with("list") || name.starts_with("search (") => name.to_owned(),
         name => format!("search {name}"),
     }

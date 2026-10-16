@@ -263,6 +263,443 @@ fn unimplemented_commands_name_the_work_package_that_owns_them() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// retrieve
+// ---------------------------------------------------------------------------
+
+/// A sandbox with one memory of each kind, all matching "deploy staging".
+fn four_kinds(sandbox: &Sandbox) -> [String; 4] {
+    [
+        add(
+            sandbox,
+            &[
+                "--kind",
+                "semantic",
+                "--title",
+                "Staging deploys need a manual migration",
+                "--body",
+                "The migrate step does not run by itself when we deploy to staging.",
+                "--confidence",
+                "0.9",
+                "--claims",
+                "migrations are manual on staging",
+            ],
+        ),
+        add(
+            sandbox,
+            &[
+                "--kind",
+                "procedural",
+                "--title",
+                "How to deploy to staging",
+                "--body",
+                "Run the deploy script, then the migration by hand.",
+                "--metadata",
+                r#"{"trigger":"a deploy is scheduled","steps":["run the deploy script","run the migration"]}"#,
+            ],
+        ),
+        add(
+            sandbox,
+            &[
+                "--kind",
+                "episodic",
+                "--title",
+                "The deploy that broke staging",
+                "--body",
+                "We deployed on a Friday and staging lost its schema.",
+                "--metadata",
+                r#"{"outcome":"staging was down for an hour"}"#,
+            ],
+        ),
+        add(
+            sandbox,
+            &[
+                "--kind",
+                "reference",
+                "--title",
+                "Staging deploy runbook",
+                "--body",
+                "The runbook for staging deploys.",
+                "--excerpt",
+                "page 12",
+                "--url",
+                "https://example.com/runbook",
+            ],
+        ),
+    ]
+}
+
+#[test]
+fn retrieve_returns_the_packet_shape_the_sdks_parse() {
+    // The field names are the wire's, and this is the assertion that they stay the wire's:
+    // the packet is the payload two published SDKs already decode, so a rename here is not
+    // a refactor, it is a different product with the same verb.
+    let sandbox = Sandbox::new();
+    let ids = four_kinds(&sandbox);
+    let db = sandbox.db_arg();
+    let value = json(&[
+        "retrieve",
+        "--db",
+        &db,
+        "deploy staging",
+        "--intent",
+        "execute",
+        "--json",
+    ]);
+
+    let packet = &value["data"];
+    let mut keys: Vec<&str> = packet
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "conflicts",
+            "episodes",
+            "evidence",
+            "facts",
+            "procedure",
+            "retrieved_ids",
+            "summary",
+            "warnings",
+        ],
+        "{value}"
+    );
+
+    assert_eq!(
+        packet["procedure"]["claim"],
+        serde_json::json!("run the deploy script → run the migration"),
+        "the routine's steps are its claim, joined with an arrow"
+    );
+    assert_eq!(
+        packet["facts"][0]["claim"],
+        "migrations are manual on staging"
+    );
+    assert_eq!(packet["facts"][0]["authority"], "user_saved");
+    assert_eq!(packet["facts"][0]["kind"], "semantic");
+    assert_eq!(
+        packet["episodes"][0]["claim"],
+        "staging was down for an hour"
+    );
+    assert_eq!(packet["evidence"][0]["source_span"], "page 12");
+    assert_eq!(
+        packet["evidence"][0]["source_uri"],
+        "https://example.com/runbook"
+    );
+    assert!(
+        packet["facts"][0].get("condition").is_none(),
+        "no constraint was stated, so no item is conditional"
+    );
+
+    let mut retrieved: Vec<&str> = packet["retrieved_ids"]
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|id| id.as_str().expect("a string"))
+        .collect();
+    retrieved.sort_unstable();
+    let mut expected: Vec<&str> = ids.iter().map(String::as_str).collect();
+    expected.sort_unstable();
+    assert_eq!(retrieved, expected, "every memory was injected: {value}");
+}
+
+#[test]
+fn retrieve_records_the_items_it_injected_and_no_record_does_not() {
+    // The retrieval record is the decay stretch, and the packet's ids are the right thing
+    // to hang it on: these memories were put in front of an agent, so they were used.
+    let sandbox = Sandbox::new();
+    let ids = four_kinds(&sandbox);
+    let db = sandbox.db_arg();
+
+    run(&["retrieve", "--db", &db, "deploy staging"]);
+    let after = json(&["get", "--db", &db, &ids[0], "--json"]);
+    assert_eq!(
+        after["data"]["retrieval_count"],
+        serde_json::json!(1),
+        "one packet, one retrieval: {after}"
+    );
+
+    run(&["retrieve", "--db", &db, "deploy staging", "--no-record"]);
+    let unchanged = json(&["get", "--db", &db, &ids[0], "--json"]);
+    assert_eq!(
+        unchanged["data"]["retrieval_count"],
+        serde_json::json!(1),
+        "--no-record must leave the clock exactly as it found it"
+    );
+}
+
+#[test]
+fn a_draft_reaches_a_packet_only_after_it_is_approved() {
+    // The review inbox's guarantee, through the verb an agent actually calls. A packet is a
+    // retrieval, and a draft is not retrievable — the same rule that keeps it out of
+    // `search`, asserted where a user would notice it being broken.
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    let live = add(
+        &sandbox,
+        &[
+            "--kind",
+            "semantic",
+            "--title",
+            "Staging deploys need a manual migration",
+            "--body",
+            "The migrate step does not run by itself.",
+        ],
+    );
+    let draft = add(
+        &sandbox,
+        &[
+            "--kind",
+            "semantic",
+            "--title",
+            "Deploys to staging are fine",
+            "--body",
+            "Staging deploys need no migration at all, as far as I could tell.",
+            "--source",
+            "agent_reflection",
+            "--confidence",
+            "0.3",
+        ],
+    );
+
+    let before = json(&["retrieve", "--db", &db, "staging deploys", "--json"]);
+    let ids: Vec<&str> = before["data"]["retrieved_ids"]
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|id| id.as_str().expect("a string"))
+        .collect();
+    assert!(ids.contains(&live.as_str()), "{before}");
+    assert!(!ids.contains(&draft.as_str()), "a draft is not retrievable");
+
+    let approved = run(&["review", "approve", "--db", &db, &draft]);
+    assert_eq!(code(&approved), 0, "{}", stderr(&approved));
+    let after = json(&["retrieve", "--db", &db, "staging deploys", "--json"]);
+    let ids: Vec<&str> = after["data"]["retrieved_ids"]
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|id| id.as_str().expect("a string"))
+        .collect();
+    assert!(ids.contains(&draft.as_str()), "{after}");
+}
+
+#[test]
+fn a_constraint_that_only_partly_matches_says_so_in_the_item() {
+    // `condition` is the field that makes an applicability judgement actionable: without
+    // it, "conditional" is a flag with no reason attached, and the caller has to re-read
+    // the memory to find out what the condition might be.
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    add(
+        &sandbox,
+        &[
+            "--kind",
+            "procedural",
+            "--title",
+            "How to deploy to staging",
+            "--body",
+            "Run the deploy script for staging.",
+            "--metadata",
+            r#"{"scope":"only when the schema changed"}"#,
+        ],
+    );
+    let value = json(&[
+        "retrieve",
+        "--db",
+        &db,
+        "deploy staging",
+        "--constraint",
+        "staging kubernetes tuesday",
+        "--json",
+    ]);
+    let item = &value["data"]["procedure"];
+    assert_eq!(item["applicability"], "conditional");
+    assert_eq!(item["condition"], "only when the schema changed");
+}
+
+#[test]
+fn retrieve_refuses_an_intent_that_is_not_one_of_the_five() {
+    // `understand` and `recall` were in an early draft of the plan and nothing accepts
+    // them; a CLI that accepted them would be a fourth opinion about a vocabulary three
+    // implementations already agree on.
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    for intent in ["understand", "recall", "EXECUTE", ""] {
+        let out = run(&["retrieve", "--db", &db, "anything", "--intent", intent]);
+        assert_eq!(code(&out), 3, "`{intent}`: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("debug"),
+            "the error must list the five: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn retrieve_bounds_the_packet_to_the_routes_ceiling() {
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    for limit in ["0", "21", "200"] {
+        let out = run(&["retrieve", "--db", &db, "anything", "--limit", limit]);
+        assert_eq!(code(&out), 3, "--limit {limit}: {}", stderr(&out));
+    }
+    let ok = run(&["retrieve", "--db", &db, "anything", "--limit", "20"]);
+    assert_eq!(code(&ok), 0, "{}", stderr(&ok));
+}
+
+#[test]
+fn retrieve_refuses_a_query_wider_than_the_route_accepts() {
+    // The same call pointed at kiomon.com would be a 400. A local `200` for a request the
+    // hosted API rejects is the kind of difference that only shows up in production.
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    let long = "x".repeat(1001);
+    let out = run(&["retrieve", "--db", &db, &long]);
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(stderr(&out).contains("1000"), "{}", stderr(&out));
+}
+
+#[test]
+fn an_unknown_workspace_is_not_found_rather_than_an_empty_packet() {
+    // The core treats an unknown workspace in the scope as a filter that matches nothing,
+    // because that is what `search` does. The CLI resolves the name first, so a person who
+    // typos a workspace is told the workspace does not exist rather than shown a packet
+    // that says there is nothing to know about their task.
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    add(
+        &sandbox,
+        &[
+            "--kind",
+            "semantic",
+            "--title",
+            "Staging deploys need a manual migration",
+            "--body",
+            "The migrate step does not run by itself.",
+        ],
+    );
+    let out = run(&[
+        "retrieve",
+        "--db",
+        &db,
+        "deploy staging",
+        "--workspace",
+        "no-such-workspace",
+    ]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+}
+
+#[test]
+fn retrieve_json_is_one_document_with_every_diagnostic_on_stderr() {
+    // The `| jq` property, on the verb an agent is most likely to pipe: a packet is one
+    // JSON document, and anything else the command has to say goes to stderr.
+    let sandbox = Sandbox::new();
+    four_kinds(&sandbox);
+    let db = sandbox.db_arg();
+    let out = run(&["retrieve", "--db", &db, "deploy staging", "--json"]);
+    assert_eq!(code(&out), 0);
+    let text = stdout(&out);
+    assert_eq!(text.lines().count(), 1, "{text:?}");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("one document");
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert!(
+        text.contains("retrieved_ids"),
+        "the data block is the packet, not a wrapper around it"
+    );
+}
+
+#[test]
+fn an_empty_corpus_is_a_packet_that_says_so_and_exits_zero() {
+    // "Nothing matched" is an answer, not a failure: exit 0 with a packet that names the
+    // intent, so a caller can tell an empty brain from a broken one.
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    let value = json(&[
+        "retrieve",
+        "--db",
+        &db,
+        "nothing here",
+        "--intent",
+        "plan",
+        "--json",
+    ]);
+    assert_eq!(
+        value["data"]["summary"],
+        serde_json::json!("No memories matched intent \"plan\".")
+    );
+    assert_eq!(value["data"]["retrieved_ids"], serde_json::json!([]));
+    assert!(
+        value["data"].get("procedure").is_none(),
+        "an absent procedure is absent, not null: {value}"
+    );
+}
+
+#[test]
+fn retrieve_covers_every_workspace_only_when_asked() {
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    run(&["init", "--db", &db, "--workspace", "other", "--quiet"]);
+    let quiet = add(
+        &sandbox,
+        &[
+            "--kind",
+            "semantic",
+            "--title",
+            "Staging deploys need a manual migration",
+            "--body",
+            "The migrate step does not run by itself.",
+        ],
+    );
+    let elsewhere = add(
+        &sandbox,
+        &[
+            "--kind",
+            "semantic",
+            "--title",
+            "Deploys elsewhere are automatic",
+            "--body",
+            "Nothing to do by hand in the other workspace.",
+            "--workspace",
+            "other",
+        ],
+    );
+
+    let scoped = json(&["retrieve", "--db", &db, "deploys", "--json"]);
+    let ids: Vec<&str> = scoped["data"]["retrieved_ids"]
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|id| id.as_str().expect("a string"))
+        .collect();
+    assert!(ids.contains(&quiet.as_str()), "{scoped}");
+    assert!(
+        !ids.contains(&elsewhere.as_str()),
+        "absence never widens scope"
+    );
+
+    let all = json(&[
+        "retrieve",
+        "--db",
+        &db,
+        "deploys",
+        "--workspace",
+        "*",
+        "--json",
+    ]);
+    let ids: Vec<&str> = all["data"]["retrieved_ids"]
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|id| id.as_str().expect("a string"))
+        .collect();
+    assert!(ids.contains(&elsewhere.as_str()), "{all}");
+}
+
 #[test]
 fn the_graph_says_deferred_rather_than_on_its_way() {
     // §9-D9 cut the graph from v1, so "work package 5 is coming" is the wrong thing to

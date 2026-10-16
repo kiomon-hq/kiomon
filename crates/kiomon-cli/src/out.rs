@@ -18,8 +18,9 @@
 use serde::Serialize;
 
 use kiomon_core::{
-    Assessment, DecayOutcome, Error, ExitCode, Memory, MemorySummaryJson, OutcomeReport,
-    RatingOutcome, Result, SearchAttempt, SearchHitJson, SearchOutcome, Skipped,
+    Assessment, ContextPacket, DecayOutcome, Error, ExitCode, Memory, MemorySummaryJson,
+    OutcomeReport, PacketItem, RatingOutcome, Result, SearchAttempt, SearchHitJson, SearchOutcome,
+    Skipped,
 };
 
 /// How wide a field may be on the human path before it is truncated.
@@ -446,6 +447,122 @@ pub fn search_line(number: usize, hit: &SearchHitJson<'_>, width: usize) -> Stri
     out
 }
 
+/// The packet, for a person.
+///
+/// The summary leads because it is the packet's own account of itself, and an account a
+/// caller cannot see is one they cannot check. Sections follow in the order a reader needs
+/// them, and a section with nothing in it is **omitted** rather than printed empty: "no
+/// warnings" and "the warning check did not run" look the same in a list of nothing, which
+/// is exactly why the packet puts the second one *in* the warnings when it happens.
+#[must_use]
+pub fn render_packet(packet: &ContextPacket, width: usize) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", truncate(&packet.summary, width));
+
+    let mut section = |heading: &str, lines: &[String]| {
+        if lines.is_empty() {
+            return;
+        }
+        let _ = writeln!(out, "\n{heading}");
+        for line in lines {
+            let _ = writeln!(out, "{line}");
+        }
+    };
+
+    section(
+        "FACTS",
+        &packet
+            .facts
+            .iter()
+            .map(|item| packet_item(item, width))
+            .collect::<Vec<_>>(),
+    );
+    section(
+        "PROCEDURE",
+        &packet
+            .procedure
+            .iter()
+            .map(|item| packet_item(item, width))
+            .collect::<Vec<_>>(),
+    );
+    section(
+        "EPISODES",
+        &packet
+            .episodes
+            .iter()
+            .map(|item| packet_item(item, width))
+            .collect::<Vec<_>>(),
+    );
+    section(
+        "EVIDENCE",
+        &packet
+            .evidence
+            .iter()
+            .map(|reference| {
+                let mut line = format!("- {}", reference.memory_id);
+                if let Some(uri) = &reference.source_uri {
+                    let _ = write!(line, "  {}", truncate(uri, width));
+                }
+                if let Some(span) = &reference.source_span {
+                    let _ = write!(line, "  · {}", truncate(span, width));
+                }
+                line
+            })
+            .collect::<Vec<_>>(),
+    );
+    section(
+        "WARNINGS",
+        &packet
+            .warnings
+            .iter()
+            .map(|warning| format!("! {}", truncate(warning, width)))
+            .collect::<Vec<_>>(),
+    );
+    section(
+        "CONFLICTS",
+        &packet
+            .conflicts
+            .iter()
+            .map(|conflict| {
+                format!(
+                    "! {} vs {} — {}",
+                    conflict.memory_id_a, conflict.memory_id_b, conflict.note
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    out
+}
+
+/// One packet item: the claim, then the facts about it that a caller has to weigh.
+///
+/// The claim is first and is the only part that is worth truncating, because it is what the
+/// caller asked for. `unknown` applicability is the default and is **not** printed: a line
+/// that says "unknown" on every item teaches a reader to skip the line that sometimes
+/// carries the reason an item is only conditionally true.
+fn packet_item(item: &PacketItem, width: usize) -> String {
+    use std::fmt::Write as _;
+
+    let mut line = format!("{}  {}", item.memory_id, truncate(&item.claim, width));
+    let _ = write!(
+        line,
+        "\n     {}  ·  {}  ·  confidence {:.2}",
+        item.kind, item.authority, item.confidence
+    );
+    if item.applicability != "unknown" {
+        let _ = write!(line, "  ·  {}", item.applicability);
+    }
+    if let Some(condition) = &item.condition {
+        let _ = write!(line, " ({})", truncate(condition, width));
+    }
+    if let Some(reference) = &item.source_ref {
+        let _ = write!(line, "  ·  from {}", truncate(reference, width));
+    }
+    line
+}
+
 /// The full record, for `get`.
 #[must_use]
 pub fn render_memory(memory: &Memory, width: usize) -> String {
@@ -799,6 +916,16 @@ pub(crate) const GATES: &[Gate] = &[
         label: "search common",
         percentile: Percentile::P95,
         limit_ms: 60.0,
+    },
+    // The packet, on the same query as `search common` and with its retrieval record off,
+    // so this row is comparable with that one. The limit is the search budget rather than a
+    // budget of its own: what WP5.5 claims is that a packet costs what its search costs
+    // plus a clock read, two indexed seeks and one record, and a gate that allowed more
+    // would not be testing that claim.
+    Gate {
+        label: "retrieve (no record)",
+        percentile: Percentile::P95,
+        limit_ms: 45.0,
     },
 ];
 

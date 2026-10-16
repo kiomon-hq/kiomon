@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Reading: `search`, `get`, `list`.
+//! Reading: `search`, `retrieve`, `get`, `list`.
 //!
 //! `list` is deliberately not a search: it is unranked, it does not touch the retrieval
 //! counters, and its ordering is a fact about the rows rather than an opinion about the
 //! query. `search` is the ranked path, and the one the whole performance budget exists
-//! for.
+//! for. `retrieve` is `search` plus a decision: it asks the same index, then re-ranks and
+//! buckets the answer by what the caller said it was about to do.
 
 use kiomon_core::{
-    ExitCode, ListQuery, ListSort, MemoryKind, MemorySummaryJson, Result, SearchAttempt,
-    SearchHitJson, SearchQuery, Status,
+    ExitCode, ListQuery, ListSort, MemoryKind, MemorySummaryJson, Result, RetrieveQuery,
+    SearchAttempt, SearchHitJson, SearchQuery, Status,
 };
 
 use super::{deferred, open, read_scope};
-use crate::cli::{Cli, GetArgs, ListArgs, SearchArgs};
+use crate::cli::{Cli, GetArgs, ListArgs, RetrieveArgs, SearchArgs};
 use crate::out;
 
 /// `kiomon search`
@@ -76,6 +77,39 @@ pub fn search(cli: &Cli, args: &SearchArgs) -> Result<ExitCode> {
         }
     }
 
+    Ok(ExitCode::Success)
+}
+
+/// `kiomon retrieve`
+///
+/// # Errors
+///
+/// [`kiomon_core::Error::Invalid`] for a query or constraint list the hosted route would
+/// reject, [`kiomon_core::Error::NotFound`] for an unknown workspace when one is named, and
+/// whatever the candidate search raises.
+pub fn retrieve(cli: &Cli, args: &RetrieveArgs) -> Result<ExitCode> {
+    let db = open(cli)?;
+    let scope = read_scope(&db, args.workspace.as_deref())?;
+
+    let packet = db.retrieve(&RetrieveQuery {
+        intent: args.intent.into(),
+        text: args.query.clone(),
+        scope,
+        kinds: args.kind.iter().copied().map(MemoryKind::from).collect(),
+        constraints: args.constraint.clone(),
+        limit: usize::from(args.limit),
+        record: !args.no_record,
+        ..RetrieveQuery::default()
+    })?;
+
+    let width = if cli.full {
+        usize::MAX
+    } else {
+        out::DEFAULT_WIDTH
+    };
+    out::emit(cli.json, packet, |packet| {
+        println!("{}", out::render_packet(packet, width));
+    })?;
     Ok(ExitCode::Success)
 }
 

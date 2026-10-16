@@ -93,6 +93,9 @@ pub enum Command {
 
     /// Search the brain: full text, fused with meaning when an embedder is configured.
     Search(SearchArgs),
+    /// Retrieve a decision-ready packet for a task: facts, the best procedure, episodes,
+    /// evidence and warnings, chosen by what you are trying to do.
+    Retrieve(RetrieveArgs),
     /// Fetch one memory by id, with its body and metadata.
     Get(GetArgs),
     /// List memories without ranking them.
@@ -417,6 +420,39 @@ pub struct RelateArgs {
 // Read
 // ---------------------------------------------------------------------------
 
+/// `kiomon retrieve`
+#[derive(Debug, Args)]
+pub struct RetrieveArgs {
+    /// The query: what you are about to do, in your own words.
+    pub query: String,
+
+    /// What you are about to do. Decides which kind of memory leads, and which memories fit
+    /// when there are more candidates than the packet holds.
+    #[arg(long, value_enum, default_value_t = IntentArg::Answer)]
+    pub intent: IntentArg,
+
+    /// Hints about the task, used only to judge how applicable a memory is. Repeatable, up
+    /// to 16. Nothing here is stored, and nothing is sent anywhere.
+    #[arg(long, value_name = "HINT")]
+    pub constraint: Vec<String>,
+
+    /// Restrict the candidate pool to these kinds. Repeatable or comma-separated.
+    #[arg(long, value_enum, value_delimiter = ',', value_name = "KIND")]
+    pub kind: Vec<KindArg>,
+
+    /// Workspace to retrieve from. `*` covers every workspace.
+    #[arg(long, value_name = "WORKSPACE")]
+    pub workspace: Option<String>,
+
+    /// Maximum items in the packet, 1–20.
+    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(1..=20))]
+    pub limit: u8,
+
+    /// Do not count the items in the packet against their decay clock.
+    #[arg(long)]
+    pub no_record: bool,
+}
+
 /// `kiomon search`
 #[derive(Debug, Args)]
 pub struct SearchArgs {
@@ -736,6 +772,38 @@ impl LegsArg {
             Self::Auto => "auto",
             Self::Fts => "fts",
             Self::Vector => "vector",
+        }
+    }
+}
+
+/// What the caller is about to do, for `retrieve --intent`.
+///
+/// The five values are the wire vocabulary, spelled once in `kiomon_core::Intent`; this
+/// enum exists so clap can validate the flag and print the choices. There is no `understand`
+/// and no `recall`: those were in an early draft of the plan and nothing accepts them (see
+/// §8's WP5.5 record).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum IntentArg {
+    /// Carry out an action or a routine.
+    Execute,
+    /// Decompose a task.
+    Plan,
+    /// Answer a question about the user.
+    Answer,
+    /// Check a factual claim.
+    Verify,
+    /// Recover from a failure.
+    Debug,
+}
+
+impl From<IntentArg> for kiomon_core::Intent {
+    fn from(arg: IntentArg) -> Self {
+        match arg {
+            IntentArg::Execute => Self::Execute,
+            IntentArg::Plan => Self::Plan,
+            IntentArg::Answer => Self::Answer,
+            IntentArg::Verify => Self::Verify,
+            IntentArg::Debug => Self::Debug,
         }
     }
 }
