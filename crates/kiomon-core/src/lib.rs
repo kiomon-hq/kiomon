@@ -36,7 +36,7 @@
 //! | [`fuse`] | reciprocal rank fusion |
 //! | [`bench`] | the measurement corpus, so a number has a shape to mean |
 //! | `lifecycle` / `decay` | the review inbox, feedback, and forgetting *(WP4)* |
-//! | `links` | typed edges and the auto-link pass *(WP5)* |
+//! | `links` | typed edges and the auto-link pass *(WP5 — deferred, §9-D9)* |
 //! | `import` | JSONL and markdown in and out *(WP6)* |
 //! | `embed` / `vector` | the optional vector leg *(WP7)* |
 //!

@@ -73,6 +73,17 @@ pub(crate) fn pending(command: &'static str, wp: u8) -> Result<ExitCode> {
     Err(Error::Unimplemented { command, wp })
 }
 
+/// Refuse a command this release deliberately left out (§9-D9).
+///
+/// The message is different from [`pending`]'s on purpose. "Work package 5" describes a
+/// package in a plan that is being executed, which a caller reasonably reads as "coming in
+/// this release"; `link` and `relate` are not, and an agent that waits for them waits for
+/// nothing. Whoever needs the graph is told that it is the next sprint's work, not that it
+/// is on its way.
+pub(crate) fn deferred(command: &'static str) -> Result<ExitCode> {
+    Err(Error::Deferred { command })
+}
+
 /// Run the day's decay, if it is due, and report it on stderr.
 ///
 /// Called at the end of `add`, and deliberately **not** at the end of `search`, which is a

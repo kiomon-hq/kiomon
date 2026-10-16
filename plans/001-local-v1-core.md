@@ -788,24 +788,58 @@ three decaying kinds; `pinned` and `reference` rows never decay; `--dry-run`
 mutates nothing; a `--workspace` with `review_mode='review'` sends a
 `confidence=1.0` write to the inbox.
 
-### WP5 — The graph: links, auto-link, relate (2 days)
+### WP5 — The graph: links, auto-link, relate (2 days) — **DEFERRED (§9-D9)**
 `links.rs`, `link`/`unlink`/`relate`, the synchronous auto-link pass on activate,
 `origin` tagging, `derived_from` from `source_refs`.
 **Accept:** auto-link writes ≤5 edges and never a self-edge; `derived_from` edges
 are directed and `related_to` are not; `relate` returns 1-hop neighbours with
 relation + title + excerpt; purge cascades.
 
+**Deferred to the next sprint by the owner on 2026-10-17.** Nothing below this line
+changes; what changes is that v1 does not wait for it. What already exists, and is tested:
+the `memory_links` table (directed and symmetric, with the `related_to` canonicalisation
+rule), `add --ref` writing a `derived_from` edge, `forget` cascading to every edge that
+touches the row, and a draft's `pending_derived_from` staging that `approve` wires up.
+What v1 does not do: write `related_to`, write `contradicts`/`supersedes`, read any of it
+back through a verb, or auto-link a memory against its neighbours. The three verbs and
+`get --relations` therefore stay stubs — but they now say **deferred**, because a message
+naming work package 5 of an in-flight plan reads as "coming in this release".
+
 ### WP5.5 — `retrieveMemory`: the intent-aware packet (1 day) — **in v1, per §9-D8**
-The `retrieve` verb and the packet: `facts` / `procedure` / `episodes`, every item with
-its provenance, plus `conflicts` and `warnings`; `--intent understand|execute|recall`
-decides which section leads and how deep the others go. Pure composition over `search`,
-kinds, status and links — no model, no network, no provider.
+The `retrieve` verb and the packet: `summary`, `facts` / `procedure` (**one**, not a list)
+/ `episodes`, `evidence`, `warnings`, `conflicts`, `retrieved_ids`; every item carrying
+`memory_id`, `kind`, `claim`, `confidence`, `authority`, `applicability` and optionally
+`condition` / `source_ref`. `--intent execute|plan|answer|verify|debug` decides which kind
+leads, how the candidates are re-ranked, and how deep each bucket goes. Pure composition
+over `search`, the kinds, the envelope and the typed edges — no model, no network, no
+provider.
+
+> **Corrected before it was written.** This block said the intents were
+> `understand|execute|recall`. The contract has five — `execute`, `plan`, `answer`,
+> `verify`, `debug` — and they are the keys of `INTENT_KIND_PRIORITY` in the platform's
+> `worker/src/lib/retrieve.ts`, which is what `/api/retrieve` *and* the MCP tool validate
+> against (`platform/mcp/src/handlers/retrieveMemory.ts`, the tool's own JSON schema). A
+> packet fetched by an SDK saying `verify` and answered with a 400 would be a poor first
+> impression for a self-hosting backend, so the five are the contract and the three were a
+> misremembering. The rest of what only reading the implementation could have told us is in
+> WP5.5's record in §8.
+
+**Where the graph was assumed.** The platform's packet reads `supersedes` and `contradicts`
+edges to fill `conflicts` and to warn about superseded memories, so the one place WP5.5
+depends on WP5 is three statements over `memory_links`. With the graph deferred (§9-D9)
+nothing writes those two relations, so the local packet reports `conflicts: []` and no
+superseded warnings — **the truth, not a stub.** The reads stay, because they are indexed
+seeks over the candidate ids, they cost less than the `warnings` list they feed, and
+deleting them to re-add them with WP5 is how a capability gets forgotten.
+
 **Accept:** one query under two intents returns the same underlying ids in a different
 shape (set equality on ids *and* inequality on section order, in one test); a
 `pending_approval` memory never reaches a packet; the JSON field names match the hosted
 handler's, asserted against a fixture transcribed from the platform and checked in; the
 packet is assembled in a bounded number of statements whatever the corpus size — a packet
-that costs one query per hit is the thing that would make `search`'s 26.8 ms look cheap.
+that costs one query per hit is the thing that would make `search`'s 26.8 ms look cheap;
+and `retrieve` → `outcome` works as one loop, because `retrieved_ids` is exactly what
+`outcome` is fed.
 
 ### WP6 — Import, export, and portability (1 day)
 JSONL in/out, markdown out, directory import, `--workspace` mapping, id
@@ -837,14 +871,15 @@ Loopback HTTP/1.1 — `std::net` and threads, no async runtime — answering the
 the same layer, plus a token file in the data directory and `--port 0` printing the port
 it chose. Broad enough that the two published SDKs work unchanged; honest enough that the
 routes this engine cannot answer say so.
-**Accept:** `../SDK/kiomon-py`'s and `../SDK/kiomon-ts`'s own test suites pass against
+**Accept:** `../../SDK/kiomon-py`'s and `../../SDK/kiomon-ts`'s own test suites pass against
 `127.0.0.1:<port>` in CI; every route in Appendix C either answers or returns
 `unsupported_locally`, asserted route by route, so a route cannot be forgotten into a
 404 that reads like an empty success; a request without the token and a request with a
 foreign `Origin` are both refused; an MCP session lists the same operations the CLI has;
 `serve` adds no dependency with an async runtime and the binary stays inside §7's budget.
 
-**v1 = WP0–WP5.5 + WP6–WP8 complete. Estimated 2–3 focused weeks.** WP3 precedes WP4 by
+**v1 = WP0–WP4 + WP5.5 + WP6–WP8 complete (WP5 deferred, §9-D9). Estimated 2–3 focused
+weeks.** WP3 precedes WP4 by
 design: the ruler has to exist before there is anything worth measuring. WP5.5 is in v1
 because `retrieveMemory` is the verb both SDKs lead with and because it is the payload
 WP9 exists to deliver (§9-D8) — building it after the socket would design the flagship
@@ -859,8 +894,8 @@ shape last.
 | **WP2** | ✅ **DONE** 2026-10-14 | `search.rs` (the quoted ladder, the ranked window, the snippet query, the retrieval record), `fuse.rs` (RRF, ported from `rrf.ts`), the filter and ordering flags, `docs/CONTRACT.md` §Reading rewritten as v1, and the `--json` shapes for a search. **204 tests** (`cargo test --workspace`), clippy clean, `cargo fmt --check` clean. Exit codes 0/2/3/4 each asserted through the binary, `search | jq`'s property asserted rather than assumed. |
 | **WP3** | ✅ **DONE** 2026-10-14 | `kiomon bench` (cold-process timings, the plan's gates, `--json`, the corpus generator it ships with), `crates/kiomon-core/benches/store.rs` (in-process, no Criterion — see below), a CI job that fails on a missed gate and publishes the numbers as an artifact, and the README's numbers replaced with measured ones. **146 core + 9 integration tests**, clippy clean. |
 | **WP4** | ✅ **DONE** 2026-10-16 | `lifecycle.rs` (the review inbox, `pin`/`archive`/`restore`/`rate`/`outcome` with the hosted product's credit rules), `decay.rs` (the formula, the paged command, the resumable daily nudge), migration `0002_lifecycle.sql`, the five lifecycle commands wired end to end, `doctor` reporting when decay last ran, and the CONTRACT's lifecycle section rewritten around what the verbs *actually* move. **274 tests** (192 core + 58 CLI + 24 others), clippy clean, 3 324 KiB binary. |
-| **WP5** | ⬜ **NEXT** — the graph, and the last thing §8 can build without a new dependency | |
-| **WP5.5** | ⬜ TODO | |
+| **WP5** | ⏸ **DEFERRED** to the next sprint (§9-D9, 2026-10-17) — a scope cut, not a design change: the spec below is unchanged and is the next sprint's first work package | |
+| **WP5.5** | ⬜ **NEXT** — the packet the SDKs lead with | |
 | **WP6** | ⬜ TODO | |
 | **WP7** | ⬜ TODO | |
 | **WP8** | ⬜ TODO | |
@@ -1384,7 +1419,7 @@ WP3 in one paragraph, and it arrived before WP3 did.
 
 ### The v1.1 decision: the local engine as an SDK backend (2026-10-15)
 
-Four SDK repositories already exist beside this one (`../SDK/`): `kiomon-py` and
+Four SDK repositories already exist beside this one (`../../SDK/`): `kiomon-py` and
 `kiomon-ts` are real, published HTTP clients; `kiomon-go` and `kiomon-rs` are empty
 directories. `DEFAULT_BASE_URL` is `https://api.kiomon.com` and `baseUrl` overrides it, so
 those two clients already pin the wire contract a local engine would have to speak. That
@@ -1422,8 +1457,8 @@ What it changes, and only this:
 **The risk is the payload, not the socket.** A listener over a wrong payload is worse than
 no listener: a client authenticates, gets a `200`, and hands the user a shape the hosted
 API never returns. So WP5.5 lands first, its packet is deliberately the hosted item shape,
-and WP9's acceptance test belongs to somebody else — `../SDK/kiomon-py` and
-`../SDK/kiomon-ts`'s own suites, pointed at `127.0.0.1`.
+and WP9's acceptance test belongs to somebody else — `../../SDK/kiomon-py` and
+`../../SDK/kiomon-ts`'s own suites, pointed at `127.0.0.1`.
 
 ---
 
@@ -1443,6 +1478,7 @@ kept verbatim below so a later reader can see what was traded away.
 | D6 | Workspaces | **In v1**, and `--workspace '*'` is part of the contract from WP2 |
 | D7 | MCP | **v1.1** — as one transport of the WP9 milestone, not a milestone of its own (amended by D8) |
 | D8 | The local engine as an SDK backend | **A** — loopback HTTP speaking the hosted `/api/*` contract, plus stdio MCP, one verb layer; `retrieveMemory` in v1 |
+| D9 | The knowledge graph | **Deferred to the next sprint** (owner's call, 2026-10-17): `link`, `unlink`, `relate`, the auto-link pass and `get --relations` leave v1 |
 
 Consequences that follow from these answers, and are now binding on the work
 packages:
@@ -1466,6 +1502,16 @@ packages:
   new operation lands as a function over `&Database` returning owned data plus a
   documented JSON shape, because two more callers are coming (WP9) and they are the
   consumers that cannot be refactored quietly. Review-enforced.
+- **D9:** the three graph verbs and `get --relations` stay unimplemented, and now say
+  *deferred* rather than *work package 5* — a message naming a package in a plan that is
+  still being executed reads as "coming in this release", and the contract's own rule is
+  that a caller must be able to tell "absent" from "not implemented". v1 keeps everything
+  WP1 and WP4 already shipped: the `memory_links` schema (directed, with `related_to`
+  stored once), `add --ref` writing `derived_from`, edge cascades on `forget`, and a
+  draft's `pending_derived_from` staging. v1 does not *write* `related_to` or
+  `contradicts`/`supersedes`, read them back through a verb, or auto-link a new memory
+  against its neighbours — so `retrieve` (WP5.5) reports no conflicts and no superseded
+  warnings, and Appendix C's `/api/graph` answers `unsupported_locally` until WP5 lands.
 
 ### D1 — Is the vector leg in v1's default build? ⚠️ biggest fork
 
@@ -1568,9 +1614,9 @@ Binding consequences:
 - **No tokio, no axum.** Loopback HTTP/1.1 over `std::net` and threads; `serde_json` is
   already in the tree. §7 holds 27 crates and 2.8 MiB of slack and an async runtime spends
   both on a socket that serves one local client.
-- **`kiomon-core` *is* the Rust SDK.** `../SDK/kiomon-rs` stays empty on purpose — a Rust
+- **`kiomon-core` *is* the Rust SDK.** `../../SDK/kiomon-rs` stays empty on purpose — a Rust
   user with the engine on the same machine calls `kiomon-core` in-process rather than
-  paying for a socket to their own SQLite file. `../SDK/kiomon-go` is the HTTP client it
+  paying for a socket to their own SQLite file. `../../SDK/kiomon-go` is the HTTP client it
   has to be.
 - **What cannot be answered locally is never faked.** `POST /api/memories/{id}/revert` and
   `GET /api/workspaces/{id}/briefings/latest` return a typed `unsupported_locally` error
@@ -1588,6 +1634,13 @@ Binding consequences:
 **DECIDED: A. `retrieveMemory` (WP5.5) is in v1; v1.1 is `serve` + `mcp` in one milestone
 over one verb layer; the acceptance criterion is the two published SDKs' test suites
 against `127.0.0.1`.**
+
+**DECIDED: the graph is not v1.** Put to the owner on 2026-10-17, after WP4 landed and the
+remaining scope could be read as a list rather than a plan: the graph is the next sprint's
+first work package, and v1 ships the packet, portability, the vector leg and packaging
+without it. The product cost is bounded and known — `retrieve` is honest about an empty
+`conflicts` because nothing can create a contradiction yet — and the alternative cost is
+paid per day by every user who cannot install the thing.
 
 ---
 
@@ -1616,7 +1669,9 @@ it the right next thing — not a schedule.
    the two that could double. Mitigation: WP0–WP3 ship a genuinely useful product
    (`add`/`search`/`get`/`list`/`stats`, fast). Lifecycle and graph are additive and
    can be cut from v1 without breaking the contract — **decide at WP3's exit whether
-   v1 is WP0–WP3+WP6 (a fast local search tool) or WP0–WP8 (a local brain).**
+   v1 is WP0–WP3+WP6 (a fast local search tool) or WP0–WP8 (a local brain).** **Resolved
+   2026-10-17: the cut was the graph (D9) and not the lifecycle**, so v1 is
+   WP0–WP4 + WP5.5 + WP6–WP8: a local brain that cannot draw its own graph yet.
 2. **The FTS-only default undersells the product.** A user comparing `kiomon search`
    to the hosted hybrid search will notice the difference. Mitigation: D1-B so
    hybrid is one config block away, and honest README wording — `PRODUCT.md`'s
@@ -1650,7 +1705,7 @@ it the right next thing — not a schedule.
 | `worker/src/lib/memory/lifecycle.ts` `promote()` | `review approve` | Same rule: index at activation, never before |
 | `worker/migrations/0042_memory_kinds.sql` | `0001_init.sql` | Same kinds, same envelope columns, same relation names |
 | `mcp/src/handlers/retrieveMemory.ts`, `searchMemory.ts`, `getMemory.ts`, `draftMemory.ts`, `recordOutcome.ts` | `CONTRACT.md` + CLI verbs | Same vocabulary, same framing, same output shape |
-| `../SDK/kiomon-{py,ts}` wire specs (`_specs.py`, `sdk/dist/client.js`) | `serve` (WP9, Appendix C) | Same paths, methods and bodies; the SDKs point at `127.0.0.1` with no release of their own |
+| `../../SDK/kiomon-{py,ts}` wire specs (`_specs.py`, `sdk/dist/client.js`) | `serve` (WP9, Appendix C) | Same paths, methods and bodies; the SDKs point at `127.0.0.1` with no release of their own |
 | `agent/src/` (Rust, Rig) | — | Not ported: that is a model-driven turn loop, not memory |
 | `migrations/0001_init.sql` FTS setup | `0001_init.sql` | **Bug fixed**: `content_rowid` points at an INTEGER rowid |
 
@@ -1669,7 +1724,7 @@ it the right next thing — not a schedule.
 
 ## Appendix C — The routes `serve` must answer (WP9)
 
-Transcribed from `../SDK/kiomon-py/src/kiomon/_specs.py` and `_client.py`, which is where
+Transcribed from `../../SDK/kiomon-py/src/kiomon/_specs.py` and `_client.py`, which is where
 the wire contract actually lives: those two SDKs already agree with each other, and a third
 opinion invented here would be a fourth implementation of a format nobody owns.
 
@@ -1680,7 +1735,7 @@ opinion invented here would be a fourth implementation of a format nobody owns.
 | `GET /api/documents/{id}` | `getMemory` | `get` (WP1) |
 | `POST /api/memories/batch-draft` | `draftMemory` | `add`, batched (`insert_many`, WP3) |
 | `POST /api/memories/record-outcome` | `recordOutcome` | `outcome` (WP4) |
-| `GET /api/graph?id&relation&depth` | `exploreMemoryGraph` | `relate` (WP5) |
+| `GET /api/graph?id&relation&depth` | `exploreMemoryGraph` | ❌ `unsupported_locally` — deferred with WP5 (§9-D9), and never an empty `200` |
 | `PATCH /api/documents/{id}` `{"pinned": 0\|1}` | `manageMemory` pin/unpin | `pin`/`unpin` (WP1) |
 | `POST /api/documents/{id}/rate` `{"rating": n}` | `manageMemory` rate | `rate` (WP4) |
 | `POST /api/documents/{id}/{action}` | `manageMemory` archive/restore/forget/approve/reject | WP4 + WP5 verbs |

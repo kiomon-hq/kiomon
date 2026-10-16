@@ -12,7 +12,7 @@ use kiomon_core::{
     SearchHitJson, SearchQuery, Status,
 };
 
-use super::{open, pending, read_scope};
+use super::{deferred, open, read_scope};
 use crate::cli::{Cli, GetArgs, ListArgs, SearchArgs};
 use crate::out;
 
@@ -87,14 +87,18 @@ pub fn search(cli: &Cli, args: &SearchArgs) -> Result<ExitCode> {
 /// cannot tell "absent" from "empty" will conclude a memory is gone when it is not.
 pub fn get(cli: &Cli, args: &GetArgs) -> Result<ExitCode> {
     let db = open(cli)?;
-    let memory = db.get(&args.id)?;
 
+    // Refused before the row is looked up, so that a flag this build cannot honour behaves
+    // the same way whatever the id is. Checking the id first would answer "no such memory"
+    // for a typo and "not implemented" for a real one, and a caller that learns different
+    // things about the same flag depending on its data cannot write correct error handling.
+    // It is also the cheaper order, and the answer is a lie either way: an empty relation
+    // list would claim a memory has no neighbours when nobody can ask (plan §9-D9).
     if args.relations {
-        // Reading the graph is WP5. Answering with an empty list instead would be a lie
-        // an agent cannot detect: "no relations" and "relations are not implemented" are
-        // different facts, and only one of them is true.
-        return pending("get --relations", 5);
+        return deferred("get --relations");
     }
+
+    let memory = db.get(&args.id)?;
 
     let width = if cli.full {
         usize::MAX

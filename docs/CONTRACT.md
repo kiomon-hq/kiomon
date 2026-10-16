@@ -143,7 +143,7 @@ Every command is listed in `kiomon --help`. This section records what each one
 | `update` | Re-indexes when a field retrieval can see — title, excerpt, body, tags — changed. A no-op update is not an error. |
 | `import` | Streams. A malformed line is reported on stderr with its number and skipped; valid lines are still imported. Exit is `1` if any line failed, `0` if none did. |
 | `link` / `unlink` | Idempotent. Linking twice is not an error. |
-| `relate` | Returns 1-hop neighbours by default. Depth is bounded. |
+| `relate` | **Not in this release** — the graph is deferred to the next sprint (plan §9-D9). Exits `1` and says so; it never returns an empty list, because "no relations" and "relations are not implemented" are different facts and an agent cannot tell them apart from a success. |
 
 **The write gate.** An `add` is activated immediately when the source is
 high-authority (`user_saved`, `import`) or when `--confidence` is at least `0.75`.
@@ -491,5 +491,11 @@ how you get yours.
   work unchanged against a local brain — see `plans/001-local-v1-core.md` §9-D8 and
   Appendix C. Routes this engine cannot answer (`revert`, briefings) return a typed
   `unsupported_locally` error rather than an empty success.
+- **The knowledge graph** — `link`, `unlink`, `relate` and `get --relations`. Deferred to
+  the next sprint by the plan's §9-D9, after this contract and the lifecycle verbs were
+  done. They exit `1` with an `unimplemented` code and a message that says *deferred*, not
+  *work package 5*: it is not in this release, and a caller that waits for it waits for
+  nothing. The schema is in place, `add --ref` writes its `derived_from` edge today, and
+  the next sprint's first work package is unchanged (`plans/001-local-v1-core.md` §8).
 - URL fetching, PDF parsing, connectors, and every LLM-backed feature. See
   `plans/001-local-v1-core.md` §10 for the trigger that would change each one.

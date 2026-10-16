@@ -653,7 +653,10 @@ fn one_capturing(exe: &Path, args: &[String], capture: bool) -> Result<(f64, Str
 /// their work package: a budget with a silent hole in it is a budget that looks better
 /// than it is.
 fn rejected_names() -> Vec<&'static str> {
-    vec![DEFERRED_GATE, "relate — no graph until WP5"]
+    vec![
+        DEFERRED_GATE,
+        "relate — no graph, deferred to the next sprint (§9-D9)",
+    ]
 }
 
 /// This process's peak resident set, where the platform makes it free.

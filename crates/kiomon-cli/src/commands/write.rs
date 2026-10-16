@@ -14,7 +14,7 @@ use std::path::Path;
 use kiomon_core::metadata;
 use kiomon_core::{Error, ExitCode, MemoryPatch, NewMemory, Result, Scope};
 
-use super::{decay_if_due, open, pending, write_workspace};
+use super::{decay_if_due, deferred, open, pending, write_workspace};
 use crate::cli::{AddArgs, Cli, ImportArgs, LinkArgs, RelateArgs, UnlinkArgs, UpdateArgs};
 use crate::out;
 
@@ -170,27 +170,29 @@ pub fn import(_cli: &Cli, _args: &ImportArgs) -> Result<ExitCode> {
 ///
 /// # Errors
 ///
-/// Always [`Error::Unimplemented`], until WP5.
+/// Always [`Error::Deferred`]: the graph left v1 (§9-D9) and is the next sprint's first
+/// work package. Writing the edge anyway — the table and its constraints exist — would
+/// create rows that no verb can read back, which is a worse answer than a refusal.
 pub fn link(_cli: &Cli, _args: &LinkArgs) -> Result<ExitCode> {
-    pending("link", 5)
+    deferred("link")
 }
 
 /// `kiomon unlink`
 ///
 /// # Errors
 ///
-/// Always [`Error::Unimplemented`], until WP5.
+/// Always [`Error::Deferred`] — see [`link`].
 pub fn unlink(_cli: &Cli, _args: &UnlinkArgs) -> Result<ExitCode> {
-    pending("unlink", 5)
+    deferred("unlink")
 }
 
 /// `kiomon relate`
 ///
 /// # Errors
 ///
-/// Always [`Error::Unimplemented`], until WP5.
+/// Always [`Error::Deferred`] — see [`link`].
 pub fn relate(_cli: &Cli, _args: &RelateArgs) -> Result<ExitCode> {
-    pending("relate", 5)
+    deferred("relate")
 }
 
 /// The content for a write, from whichever source was given.

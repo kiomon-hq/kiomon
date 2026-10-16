@@ -243,8 +243,7 @@ fn unimplemented_commands_name_the_work_package_that_owns_them() {
     // be finished before it was.
     let sandbox = Sandbox::new();
     let db = sandbox.db_arg();
-    let cases: [(&str, &[&str], u8); 3] = [
-        ("relate", &["relate", "k_01", "--db", &db], 5),
+    let cases: [(&str, &[&str], u8); 2] = [
         ("export", &["export", "--db", &db], 6),
         ("import", &["import", "nothing.jsonl", "--db", &db], 6),
     ];
@@ -260,6 +259,51 @@ fn unimplemented_commands_name_the_work_package_that_owns_them() {
         assert!(
             text.contains(&format!("work package {wp}")),
             "`{name}` should name work package {wp}: {text}"
+        );
+    }
+}
+
+#[test]
+fn the_graph_says_deferred_rather_than_on_its_way() {
+    // §9-D9 cut the graph from v1, so "work package 5 is coming" is the wrong thing to
+    // tell a caller: it describes a package in an in-flight plan, and WP5 is not in this
+    // release. `get --relations` is in this table because it is the same refusal reached
+    // through a flag rather than a verb — the one an agent is most likely to hit by
+    // accident, and the one where an empty success would be a lie.
+    let sandbox = Sandbox::new();
+    let db = sandbox.db_arg();
+    let cases: [(&str, &[&str]); 4] = [
+        (
+            "link",
+            &[
+                "link",
+                "--db",
+                &db,
+                "k_01",
+                "k_02",
+                "--relation",
+                "supports",
+            ],
+        ),
+        ("unlink", &["unlink", "--db", &db, "k_01", "k_02"]),
+        ("relate", &["relate", "k_01", "--db", &db]),
+        (
+            "get --relations",
+            &["get", "--db", &db, "k_01", "--relations"],
+        ),
+    ];
+    for (name, args) in cases {
+        let out = run(args);
+        assert_eq!(code(&out), 1, "`{name}` should refuse: {}", stderr(&out));
+        let text = stderr(&out);
+        assert!(text.contains("not in this release"), "`{name}`: {text}");
+        assert!(
+            text.contains("deferred to the next sprint"),
+            "`{name}` should say where the graph went: {text}"
+        );
+        assert!(
+            !text.contains("work package"),
+            "`{name}` must not promise a work package in this release: {text}"
         );
     }
 }
