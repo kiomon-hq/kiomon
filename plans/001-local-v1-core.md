@@ -79,8 +79,8 @@ protect them.
 | **Connectors** (Notion, Drive, Confluence, RSS, Scholar) | Network, OAuth, and sync state machines. `import` covers the migration case. |
 | **Browser extension, dashboard, landing page** | Not a CLI product's problem. |
 | **Auth, API keys, plans, quotas, billing, orgs, multi-tenancy** | The whole point of local. `workspace_id` is a filter; there is no `user_id`. |
-| **MCP server** | v1.1. `kiomon mcp` (stdio) is the natural agent surface and reuses `kiomon-core` verbatim. v1 is CLI so the contract can be proven and stabilized first. |
-| **Daemon / HTTP server** | v1.2. Design `kiomon-core` to be daemon-ready; do not build it. |
+| **MCP server** | v1.1, and it ships *with* `serve` rather than before it: one verb layer, two transports, one milestone (§9-D8). v1 is CLI so the native contract can be proven first. |
+| **HTTP server / SDK backend** | v1.1 — `kiomon serve`, loopback only, speaking the hosted `/api/*` contract so the existing Python and TypeScript SDKs work unchanged. **Self-hosting the engine is a first-class product**, not a power-user path (§9-D8). |
 | **PDF parsing, OCR, reader mode** | Local files + stdin + URL fetch only. |
 | **Contradiction engine / quarantine** | Needs claim comparison. v1.1, after `claims` are being stored. |
 | **Cloud sync, hosted parity, telemetry** | Off the table by definition. |
@@ -169,10 +169,18 @@ kiomon/
 ```
 
 **Two crates, not one.** A single crate would be "more minimal" for about a week,
-then `kiomon mcp` (v1.1) and `kiomon serve` (v1.2) would either duplicate the
+then `kiomon mcp` and `kiomon serve` (both v1.1, §9-D8) would either duplicate the
 library or force a split under load. `kiomon-core` has no `clap`, no `print!`, and
 no `process::exit` — that rule is what makes those later binaries one `main.rs`
 each.
+
+**One verb layer, thin surfaces.** Every operation is a function over `&Database`
+that returns owned data, plus a JSON shape `docs/CONTRACT.md` documents. The CLI is
+the first adapter for that layer, not the only planned one: WP9 adds HTTP and stdio
+over the same functions. This is the only architectural rule the v1.1 decision adds
+to v1, and it earns its place immediately — anything that prints inside
+`kiomon-core`, reads `std::env`, or decides an exit code cannot be served, so a
+command that breaks the rule is a bug *today* and not a refactor later.
 
 ---
 
@@ -769,6 +777,18 @@ mutates nothing; a `--workspace` with `review_mode='review'` sends a
 are directed and `related_to` are not; `relate` returns 1-hop neighbours with
 relation + title + excerpt; purge cascades.
 
+### WP5.5 — `retrieveMemory`: the intent-aware packet (1 day) — **in v1, per §9-D8**
+The `retrieve` verb and the packet: `facts` / `procedure` / `episodes`, every item with
+its provenance, plus `conflicts` and `warnings`; `--intent understand|execute|recall`
+decides which section leads and how deep the others go. Pure composition over `search`,
+kinds, status and links — no model, no network, no provider.
+**Accept:** one query under two intents returns the same underlying ids in a different
+shape (set equality on ids *and* inequality on section order, in one test); a
+`pending_approval` memory never reaches a packet; the JSON field names match the hosted
+handler's, asserted against a fixture transcribed from the platform and checked in; the
+packet is assembled in a bounded number of statements whatever the corpus size — a packet
+that costs one query per hit is the thing that would make `search`'s 26.8 ms look cheap.
+
 ### WP6 — Import, export, and portability (1 day)
 JSONL in/out, markdown out, directory import, `--workspace` mapping, id
 preservation on import.
@@ -793,8 +813,24 @@ installers, `kiomon init` onboarding text, crates.io publish for `kiomon-core`.
 && kiomon search` works; `kiomon --version` reports a git sha; the release workflow
 builds all four targets from a tag with no manual steps.
 
-**v1 = WP0–WP8 complete. Estimated 2–3 focused weeks.** WP3 precedes WP4 by
-design: the ruler has to exist before there is anything worth measuring.
+### WP9 — `serve` + `mcp`: two transports, one verb layer (2½ days) — **v1.1, per §9-D8**
+Loopback HTTP/1.1 — `std::net` and threads, no async runtime — answering the hosted
+`/api/*` routes in Appendix C from the same functions the CLI calls, plus stdio MCP over
+the same layer, plus a token file in the data directory and `--port 0` printing the port
+it chose. Broad enough that the two published SDKs work unchanged; honest enough that the
+routes this engine cannot answer say so.
+**Accept:** `../SDK/kiomon-py`'s and `../SDK/kiomon-ts`'s own test suites pass against
+`127.0.0.1:<port>` in CI; every route in Appendix C either answers or returns
+`unsupported_locally`, asserted route by route, so a route cannot be forgotten into a
+404 that reads like an empty success; a request without the token and a request with a
+foreign `Origin` are both refused; an MCP session lists the same operations the CLI has;
+`serve` adds no dependency with an async runtime and the binary stays inside §7's budget.
+
+**v1 = WP0–WP5.5 + WP6–WP8 complete. Estimated 2–3 focused weeks.** WP3 precedes WP4 by
+design: the ruler has to exist before there is anything worth measuring. WP5.5 is in v1
+because `retrieveMemory` is the verb both SDKs lead with and because it is the payload
+WP9 exists to deliver (§9-D8) — building it after the socket would design the flagship
+shape last.
 
 ### Progress
 
@@ -1190,10 +1226,56 @@ WP3 in one paragraph, and it arrived before WP3 did.
 
 ---
 
+### The v1.1 decision: the local engine as an SDK backend (2026-10-15)
+
+Four SDK repositories already exist beside this one (`../SDK/`): `kiomon-py` and
+`kiomon-ts` are real, published HTTP clients; `kiomon-go` and `kiomon-rs` are empty
+directories. `DEFAULT_BASE_URL` is `https://api.kiomon.com` and `baseUrl` overrides it, so
+those two clients already pin the wire contract a local engine would have to speak. That
+contract — transcribed from `_specs.py`, and reproduced route by route in Appendix C — is
+13 endpoints, and the happy coincidence is that 6 of them are already implemented in WP1
+and WP2 and the rest are scheduled in WP4, WP5 and WP5.5.
+
+The owner's answer: **self-hosting the engine is a first-class product.** That turns "a
+local brain" from a better CLI into a *backend*, and it makes the transport decision a
+product decision rather than an engineering preference. §9-D8 records the shape.
+
+What the decision does **not** change: v1 is still the CLI. WP0–WP8 still ship without a
+listener, and the contract the CLI proves is still the native one (`docs/CONTRACT.md`, the
+`--json` envelope, the exit codes).
+
+What it changes, and only this:
+
+1. **WP5.5, in v1 — `retrieveMemory`.** It is the verb both SDKs lead their READMEs with,
+   and it is the one local capability with no counterpart at all: `search` returns hits,
+   the packet returns `facts` / `procedure` / `episodes` with provenance, conflicts and
+   warnings. It is pure composition over WP2 + WP4 + WP5 — **no model, no provider, no
+   network** — so it is about a day, it is worth having on the command line by itself, and
+   it is exactly the shape `/api/retrieve` must return. Building it after the socket would
+   mean designing the product's flagship payload as an afterthought.
+2. **WP9, v1.1 — `serve` + `mcp` as one milestone.** The old ordering put MCP first "so
+   the contract can be proven first" (D7); that has happened, and proving a *second*
+   contract is now the whole risk. Two transports over one verb layer cost ~15% more than
+   either alone and they serve two different consumers: stdio for agent harnesses that
+   spawn it per session, HTTP for applications that hold a client for the life of a
+   process.
+3. **The daemon trigger is met, read per command** (§10) — and the CLI's answer stays "no
+   daemon", because both zero-process outcomes are covered: stdio for agents, a user-run
+   `serve` for applications.
+
+**The risk is the payload, not the socket.** A listener over a wrong payload is worse than
+no listener: a client authenticates, gets a `200`, and hands the user a shape the hosted
+API never returns. So WP5.5 lands first, its packet is deliberately the hosted item shape,
+and WP9's acceptance test belongs to somebody else — `../SDK/kiomon-py` and
+`../SDK/kiomon-ts`'s own suites, pointed at `127.0.0.1`.
+
+---
+
 ## 9. Decisions
 
-All seven were put to the owner on 2026-10-14 and answered. The recommendation text
-is kept verbatim below so a later reader can see what was traded away.
+The first seven were put to the owner on 2026-10-14 and answered; **D8** was put on
+2026-10-15, after WP3's numbers made the question concrete. The recommendation text is
+kept verbatim below so a later reader can see what was traded away.
 
 | # | Decision | Answer |
 |---|---|---|
@@ -1203,7 +1285,8 @@ is kept verbatim below so a later reader can see what was traded away.
 | D4 | URL fetch ingest | **Out of v1** (recorded in §10 for the future) |
 | D5 | FTS tokenizer | `porter unicode61` |
 | D6 | Workspaces | **In v1**, and `--workspace '*'` is part of the contract from WP2 |
-| D7 | MCP | **v1.1**, first item |
+| D7 | MCP | **v1.1** — as one transport of the WP9 milestone, not a milestone of its own (amended by D8) |
+| D8 | The local engine as an SDK backend | **A** — loopback HTTP speaking the hosted `/api/*` contract, plus stdio MCP, one verb layer; `retrieveMemory` in v1 |
 
 Consequences that follow from these answers, and are now binding on the work
 packages:
@@ -1223,6 +1306,10 @@ packages:
 - **D7:** `kiomon-core` must not assume a one-shot process. Every public function
   takes `&Database` and returns owned data, so the v1.1 MCP server holds one
   connection for the life of the session.
+- **D8:** the verb layer is the product and the CLI is merely its first surface. Every
+  new operation lands as a function over `&Database` returning owned data plus a
+  documented JSON shape, because two more callers are coming (WP9) and they are the
+  consumers that cannot be refactored quietly. Review-enforced.
 
 ### D1 — Is the vector leg in v1's default build? ⚠️ biggest fork
 
@@ -1297,7 +1384,54 @@ Recommendation: **hold the line at CLI for v1** (it is what proves the contract)
 **and schedule MCP as the first v1.1 item** — it is a thin adapter over
 `kiomon-core` because §4.4's row shape is already the MCP handler's.
 
-**DECIDED: CLI in v1, `kiomon mcp` first in v1.1.**
+**DECIDED: CLI in v1, `kiomon mcp` first in v1.1.** *(Amended 2026-10-15 by D8: MCP
+is the stdio transport of the WP9 milestone, and it ships alongside `serve`.)*
+
+### D8 — Does the local engine speak the hosted API?
+
+Asked after WP3, once the owner's requirement was explicit: *users run the engine on their
+own machine and connect to it with the SDKs*. Four shapes were on the table.
+
+| Shape | Cost | Verdict |
+|---|---|---|
+| **A. Loopback HTTP answering the hosted `/api/*` contract, plus stdio MCP, over one verb layer** | ~2½ days, ~2 crates, +~250 KiB | **Chosen.** The Python and TypeScript SDKs work with **no release of their own** — `new Kiomon({ baseUrl: "http://127.0.0.1:8765", apiKey: "local" })` is already supported, because the client checks that a credential is *present*, never what it *is*. Their own test suites then become this milestone's conformance suite, written by someone who did not write the server. |
+| B. Local HTTP with our own JSON contract | same, plus a fourth SDK to keep in step | Rejected: it makes compatibility a permanent obligation in four languages, when the four clients already exist. |
+| C. MCP only, as originally planned | ~1 day | Rejected as the *only* surface: agent harnesses get memory, applications do not, and the SDK program stays pointed at the cloud. Kept as the second transport — it is the one with no port and no lifecycle. |
+| D. No server; the SDKs shell out to `kiomon --json` | ~0 | Rejected: a process per operation, no batching, no long-lived session, and a subprocess parser in four languages instead of one listener in Rust. |
+
+Binding consequences:
+
+- **Loopback only, and authenticated.** `127.0.0.1`, never `0.0.0.0`; no TLS; a random
+  token written to the data directory and required on every request; `Origin` and `Host`
+  checked — a browser tab can reach `localhost`, so a local brain with no CSRF story is a
+  local brain any web page can read.
+- **No daemon lifecycle.** `serve` is started by the user, or by a script with `--port 0`,
+  and never auto-spawned by an SDK: an auto-spawned server is a stale binary after every
+  upgrade and a zombie per crashed client, and §10 already refused that once. stdio MCP is
+  the no-daemon path, and it is what an agent harness should use.
+- **No tokio, no axum.** Loopback HTTP/1.1 over `std::net` and threads; `serde_json` is
+  already in the tree. §7 holds 27 crates and 2.8 MiB of slack and an async runtime spends
+  both on a socket that serves one local client.
+- **`kiomon-core` *is* the Rust SDK.** `../SDK/kiomon-rs` stays empty on purpose — a Rust
+  user with the engine on the same machine calls `kiomon-core` in-process rather than
+  paying for a socket to their own SQLite file. `../SDK/kiomon-go` is the HTTP client it
+  has to be.
+- **What cannot be answered locally is never faked.** `POST /api/memories/{id}/revert` and
+  `GET /api/workspaces/{id}/briefings/latest` return a typed `unsupported_locally` error
+  naming the reason, never an empty `200`. An SDK that reports "no briefings" because the
+  feature does not exist is an SDK lying to its user, and that is the failure mode
+  self-hosting cannot afford.
+- **The native contract stays native.** `/api/*` is a translation layer with its own tests;
+  the CLI's envelope and exit codes do not move to accommodate it. One contract per
+  surface, one owner each.
+- **`--db` remains the only scope.** No users, no accounts, no tenancy: `serve` is
+  single-brain by construction, and `GET /api/workspaces` lists that brain's workspaces.
+  The engine has nothing to check an API key against, and inventing an account model
+  locally would be the first piece of tenancy §9-D6 refused from the start.
+
+**DECIDED: A. `retrieveMemory` (WP5.5) is in v1; v1.1 is `serve` + `mcp` in one milestone
+over one verb layer; the acceptance criterion is the two published SDKs' test suites
+against `127.0.0.1`.**
 
 ---
 
@@ -1310,7 +1444,7 @@ it the right next thing — not a schedule.
 |---|---|
 | Chunk-level retrieval | A single memory's body exceeds ~50 KB and search snippets stop being useful, or the corpus passes ~250k rows. |
 | Contradiction / quarantine | `claims` are populated by real agents and users report conflicting facts. (Needs claim normalisation — the platform's own `JACCARD_CONFLICT_THRESHOLD = 0.4` is a heuristic we should not port blindly.) |
-| Daemon / `serve` (unix socket + JSON-RPC) | Measured `open` overhead exceeds ~30% of `search` wall time. Not before — a daemon is a lifecycle problem (stale version after upgrade) that a local tool should not buy early. |
+| Server / `serve` | **Trigger met 2026-10-15 — and it was the wrong shape.** Measured per command (§7): `open` is 2.0 ms of a 26.8 ms `search` (7.5%, *under* the 30% as originally worded, because search's own work dominates) but ~**80% of an `add`** and most of a `get`; and an application holding an SDK client also deletes the 8.9 ms process-spawn floor entirely. The old trigger asked the question of the CLI, where one process per command is right. The answer arrives from the other direction: for a long-lived client, one process per operation is the cost. Scheduled as WP9 (v1.1), with the lifecycle objection answered rather than ignored — §9-D8. |
 | Consolidation (`consolidate-memories`) | Duplicate/near-duplicate rate in `list` is visibly annoying. |
 | `reflect_session`, briefings, RAG | Never locally, unless the user opts into a provider — this is where the local product would stop being fast and start being a cloud client. |
 | Connectors | Never. `import` + a script is the honest local answer. |
@@ -1340,6 +1474,11 @@ it the right next thing — not a schedule.
    response.
 5. **Windows.** `mmap_size`, path resolution, and the `isatty` check all differ.
    Mitigation: Windows is in the CI matrix from WP0, not added at WP8.
+6. **The hosted contract drifts away from the local one.** Two implementations of one
+   wire format, one of them in another repository, is how an SDK starts lying to its
+   users. Mitigation: Appendix C is the route-by-route checklist, every route is asserted
+   either to answer or to refuse explicitly, and the SDKs' own suites run against
+   `127.0.0.1` in CI (§9-D8) — the conformance test is theirs, not ours.
 
 ---
 
@@ -1355,6 +1494,7 @@ it the right next thing — not a schedule.
 | `worker/src/lib/memory/lifecycle.ts` `promote()` | `review approve` | Same rule: index at activation, never before |
 | `worker/migrations/0042_memory_kinds.sql` | `0001_init.sql` | Same kinds, same envelope columns, same relation names |
 | `mcp/src/handlers/retrieveMemory.ts`, `searchMemory.ts`, `getMemory.ts`, `draftMemory.ts`, `recordOutcome.ts` | `CONTRACT.md` + CLI verbs | Same vocabulary, same framing, same output shape |
+| `../SDK/kiomon-{py,ts}` wire specs (`_specs.py`, `sdk/dist/client.js`) | `serve` (WP9, Appendix C) | Same paths, methods and bodies; the SDKs point at `127.0.0.1` with no release of their own |
 | `agent/src/` (Rust, Rig) | — | Not ported: that is a model-driven turn loop, not memory |
 | `migrations/0001_init.sql` FTS setup | `0001_init.sql` | **Bug fixed**: `content_rowid` points at an INTEGER rowid |
 
@@ -1370,3 +1510,30 @@ it the right next thing — not a schedule.
 - `deny.toml` + `cargo-deny` in CI: a dependency is a promise, and a local binary
   with 300 transitive crates is not "minimal". Target: **< 60 direct+transitive
   crates in the default build**.
+
+## Appendix C — The routes `serve` must answer (WP9)
+
+Transcribed from `../SDK/kiomon-py/src/kiomon/_specs.py` and `_client.py`, which is where
+the wire contract actually lives: those two SDKs already agree with each other, and a third
+opinion invented here would be a fourth implementation of a format nobody owns.
+
+| Method + path | SDK verb | Local |
+|---|---|---|
+| `GET /api/search?q&limit&workspace_id&kind` | `searchMemory` | `search` (WP2) |
+| `POST /api/retrieve` | `retrieveMemory` | `retrieve` (WP5.5) |
+| `GET /api/documents/{id}` | `getMemory` | `get` (WP1) |
+| `POST /api/memories/batch-draft` | `draftMemory` | `add`, batched (`insert_many`, WP3) |
+| `POST /api/memories/record-outcome` | `recordOutcome` | `outcome` (WP4) |
+| `GET /api/graph?id&relation&depth` | `exploreMemoryGraph` | `relate` (WP5) |
+| `PATCH /api/documents/{id}` `{"pinned": 0\|1}` | `manageMemory` pin/unpin | `pin`/`unpin` (WP1) |
+| `POST /api/documents/{id}/rate` `{"rating": n}` | `manageMemory` rate | `rate` (WP4) |
+| `POST /api/documents/{id}/{action}` | `manageMemory` archive/restore/forget/approve/reject | WP4 + WP5 verbs |
+| `GET /api/workspaces` | `listWorkspaces` | the `workspaces` table (WP1) |
+| `GET /api/workspaces/{id}/context?topic` | `getWorkspaceContext` | partial — pinned + recent + kinds, composable from WP1/WP2 |
+| `POST /api/memories/{id}/revert` | `manageMemory` revert | ❌ `unsupported_locally` — this engine keeps no revision history |
+| `GET /api/workspaces/{id}/briefings/latest` | `getLatestBriefing` | ❌ `unsupported_locally` — briefings are a hosted composition, and §10 says never locally |
+
+Auth: `X-API-Key` or `Authorization: Bearer`. The client refuses to construct without one,
+so `serve` accepts any non-empty key on a loopback bind and separately requires its own
+token file; there is nothing local to validate a key against, and inventing an account
+model to have something to check would be the tenancy §9-D6 refused from the start.
