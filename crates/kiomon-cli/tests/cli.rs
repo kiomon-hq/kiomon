@@ -1422,7 +1422,18 @@ fn the_search_json_carries_every_field_the_contract_documents() {
     }
     assert_eq!(value["data"]["query"], serde_json::json!("migration"));
     assert_eq!(value["data"]["requested_legs"], serde_json::json!("auto"));
-    assert_eq!(value["data"]["legs"], serde_json::json!("fts"));
+    assert_eq!(
+        value["data"]["legs"],
+        serde_json::json!({"fts": true, "vector": false}),
+        "the legs are an object, the door's shape, because a string cannot tell \"lexical \
+         only\" and \"both\" apart without inventing a spelling"
+    );
+    assert_eq!(
+        value["data"]["reason"],
+        serde_json::json!("no_embedder"),
+        "no embedder configured is not a degradation, but it is still the answer to \"why is \
+         this not semantic\""
+    );
     assert_eq!(value["data"]["degraded"], serde_json::json!(false));
     assert_eq!(
         value["data"]["attempt"]["outcome"],
@@ -1894,15 +1905,23 @@ fn bench_measures_a_corpus_and_reports_what_it_built() {
         .collect();
     assert!(labels.contains(&"open"));
     assert!(labels.contains(&"add"));
-    assert!(labels.contains(&"search common"));
+    assert!(
+        labels.contains(&"common (fts)"),
+        "the lexical budget has its own row"
+    );
+    assert!(
+        labels.contains(&"common (hybrid)"),
+        "and so does the hybrid budget — the one this build can measure, because the harness \
+         configures a stub embedder"
+    );
     assert!(
         report["rejected"]
             .as_array()
             .expect("the deferred gates")
             .iter()
-            .any(|line| line.as_str().is_some_and(|line| line.contains("embedder"))),
-        "the hybrid gate is deferred, and a budget with a silent hole in it is worse than one \
-         that names the hole"
+            .any(|line| line.as_str().is_some_and(|line| line.contains("hybrid"))),
+        "what a stub cannot measure is a real model's latency, and the report has to say so \
+         rather than implying the number is end to end"
     );
 }
 

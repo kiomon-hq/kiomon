@@ -58,6 +58,7 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Archive(args) => lifecycle::archive(cli, args),
         Command::Restore(args) => lifecycle::restore(cli, args),
         Command::Rate(args) => lifecycle::rate(cli, args),
+        Command::Reindex(args) => lifecycle::reindex(cli, args),
         Command::Forget(args) => lifecycle::forget(cli, args),
 
         Command::Export(args) => portability::export(cli, args),
@@ -122,14 +123,36 @@ pub(crate) fn decay_if_due(db: &Database, scope: &Scope, quiet: bool) {
     }
 }
 
-/// Open the database this invocation should use.
+/// Open the database this invocation should use, with the embedder the config names.
+///
+/// The config file is read here and nowhere else. It is one small file, and a cached copy
+/// would be a second object whose lifetime has to be argued about — for a process that
+/// lives for one command, reading it again costs less than the argument.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Config`] when no path can be resolved, and whatever
-/// [`Database::open`] raises.
+/// Returns [`Error::Config`] when no path can be resolved, when the config file does not
+/// parse, when its `[embedder]` block is incomplete, and whatever [`Database::open`]
+/// raises.
 pub(crate) fn open(cli: &Cli) -> Result<Database> {
-    Database::open(config::resolve_db_path(cli.db.as_deref())?)
+    let config = config::Config::load(cli.config.as_deref())?;
+    let embedder = config.embedder()?.map(std::sync::Arc::new);
+    Ok(Database::open(config.resolve_db_path(cli.db.as_deref())?)?.with_embedder(embedder))
+}
+
+/// The workspace a command should use when it was not told one.
+///
+/// `$KIOMON_WORKSPACE`, then the config file's `default_workspace`, then `default` — see
+/// [`config::default_workspace`] for why that order.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] when the config file does not parse. A command that cannot
+/// read the config cannot know which workspace it was meant to use, and guessing is how a
+/// memory lands somewhere its owner will never look.
+pub(crate) fn default_workspace(cli: &Cli) -> Result<String> {
+    let config = config::Config::load(cli.config.as_deref())?;
+    Ok(config::default_workspace(&config))
 }
 
 /// The scope a read should cover: `'*'` for everything, otherwise exactly one workspace.
@@ -144,10 +167,10 @@ pub(crate) fn open(cli: &Cli) -> Result<Database> {
 /// # Errors
 ///
 /// Returns [`Error::NotFound`] when the named workspace does not exist.
-pub(crate) fn read_scope(db: &Database, workspace: Option<&str>) -> Result<Scope> {
+pub(crate) fn read_scope(db: &Database, cli: &Cli, workspace: Option<&str>) -> Result<Scope> {
     match workspace.map(str::trim) {
         Some("*") => Ok(Scope::All),
-        other => Ok(Scope::One(write_workspace(db, other)?)),
+        other => Ok(Scope::One(write_workspace(db, cli, other)?)),
     }
 }
 
@@ -160,7 +183,7 @@ pub(crate) fn read_scope(db: &Database, workspace: Option<&str>) -> Result<Scope
 /// # Errors
 ///
 /// Returns [`Error::Invalid`] for `'*'`, and [`Error::NotFound`] for an unknown name.
-pub(crate) fn write_workspace(db: &Database, workspace: Option<&str>) -> Result<String> {
+pub(crate) fn write_workspace(db: &Database, cli: &Cli, workspace: Option<&str>) -> Result<String> {
     let requested = match workspace.map(str::trim) {
         Some("*") => {
             return Err(Error::Invalid(
@@ -170,7 +193,7 @@ pub(crate) fn write_workspace(db: &Database, workspace: Option<&str>) -> Result<
             ));
         }
         Some(name) if !name.is_empty() => name.to_owned(),
-        _ => config::default_workspace(),
+        _ => default_workspace(cli)?,
     };
     Ok(db.resolve_workspace(&requested)?.id)
 }

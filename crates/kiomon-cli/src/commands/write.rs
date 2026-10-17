@@ -26,7 +26,7 @@ use crate::out;
 /// a file or stdin cannot be read, and whatever the store raises.
 pub fn add(cli: &Cli, args: &AddArgs) -> Result<ExitCode> {
     let db = open(cli)?;
-    let workspace = write_workspace(&db, args.workspace.as_deref())?;
+    let workspace = write_workspace(&db, cli, args.workspace.as_deref())?;
 
     let (title, body) = if let Some(path) = &args.from_file {
         let text = read_file(path)?;

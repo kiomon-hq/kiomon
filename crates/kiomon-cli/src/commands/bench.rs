@@ -51,7 +51,14 @@ use crate::out::{self, Sample};
 const DEFAULT_SIZES: &[usize] = &[1_000, 10_000];
 
 /// The gate the plan defines and this build cannot express.
-const DEFERRED_GATE: &str = "search p95 (hybrid, local embedder) ≤ 250 ms — no embedder until WP7";
+///
+/// The hybrid gate left this list in WP7: the harness configures a stub embedder, so the
+/// `common (hybrid)` row measures the real code path and the gate reads it. What a stub
+/// cannot measure is a *model's* latency — which is not this program's number and not
+/// something CI could bound anyway.
+const DEFERRED_GATE: &str =
+    "search p95 (hybrid) against a real model — the harness uses a stub, so 
+                              what is measured is this program's work and not the model's";
 
 /// `kiomon bench`
 ///
@@ -74,6 +81,15 @@ pub fn bench(cli: &Cli, args: &BenchArgs) -> Result<ExitCode> {
     let dir = corpus_dir(args)?;
     let sizes = sizes(args)?;
 
+    // The harness gives every command it runs one stub embedder, and the corpora are
+    // built with it, for two reasons. The gate the plan sets for this work package is a
+    // *hybrid* search budget, and CI has no model to embed with; and a row measured with an
+    // embedder configured is the row that shows what the vector leg costs, which is the
+    // number a user with Ollama actually pays. The stub is a hashed bag of words — no
+    // network, microseconds per thousand texts, deterministic — so what these rows measure
+    // is this program's work and not a model's, which is what the budget is about.
+    let config = stub_config(&dir)?;
+
     let mut reports = Vec::with_capacity(sizes.len());
     for size in sizes {
         let path = dir.join(format!("brain-{size}.db"));
@@ -84,9 +100,15 @@ pub fn bench(cli: &Cli, args: &BenchArgs) -> Result<ExitCode> {
             );
         }
         let db = Database::open(&path)?;
-        let corpus = kiomon_core::bench::generate(&db, &CorpusSpec::new(size), args.rebuild)?;
+        let mut corpus = kiomon_core::bench::generate(&db, &CorpusSpec::new(size), args.rebuild)?;
         drop(db);
-        reports.push(measure(&exe, &corpus, args)?);
+        // A corpus that was built before this work package exists has no vectors, and one
+        // built by an earlier run of this harness in the same directory is reused rather
+        // than rebuilt. Either way the vector leg only sees what is there, so the gap is
+        // filled once — through the same `reindex --embed` a user would run, which is also
+        // how the harness keeps that command exercised.
+        corpus.vectors = embed_corpus(&exe, &config, &corpus, cli.quiet)?;
+        reports.push(measure(&exe, &config, &corpus, args)?);
     }
 
     let passed = reports
@@ -127,6 +149,74 @@ fn open_probe(cli: &Cli) -> Result<ExitCode> {
         out::emit(true, probe, |_| {})?;
     }
     Ok(ExitCode::Success)
+}
+
+/// The stub embedder this harness gives every command it runs.
+///
+/// Written beside the corpora rather than in the user's data directory: the harness must
+/// not change how the user's own `kiomon search` behaves, and a config file it owns is a
+/// file it can rewrite when the shape of the block changes.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the file cannot be written.
+fn stub_config(dir: &Path) -> Result<PathBuf> {
+    let path = dir.join("bench-config.toml");
+    // `default_workspace` is deliberately absent: a probe passes `--db` and lets the
+    // workspace default to `default`, which is what the corpus was generated into.
+    let text = r#"# Written by `kiomon bench`. The stub embedder has no model and no network:
+# its vectors are a hashed bag of words, so what the hybrid rows measure is
+# this program's work and not a model's.
+[embedder]
+provider = "stub"
+"#;
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+/// Give the corpus vectors for the stub model, and report how many it wrote.
+///
+/// Through `reindex --embed`, which is the command a user runs: a harness that embedded
+/// rows itself would be measuring a code path that does not exist in production, and a
+/// harness that skipped the step would report a hybrid row with nothing in the vector leg.
+///
+/// # Errors
+///
+/// Returns [`Error::Internal`] when the command exits without a JSON report, which means
+/// the harness cannot know what it measured.
+fn embed_corpus(
+    exe: &Path,
+    config: &Path,
+    corpus: &kiomon_core::CorpusReport,
+    quiet: bool,
+) -> Result<usize> {
+    // `--config` is prepended by the runner, so it is not repeated here.
+    let args = vec![
+        "--db".to_owned(),
+        corpus.path.display().to_string(),
+        "reindex".to_owned(),
+        "--embed".to_owned(),
+        "--workspace".to_owned(),
+        "*".to_owned(),
+        "--json".to_owned(),
+    ];
+    let config = config.display().to_string();
+    let (elapsed, out) = one_capturing(exe, &config, &args, true)?;
+    let value: serde_json::Value = serde_json::from_str(out.trim()).map_err(|error| {
+        Error::Internal(format!(
+            "`kiomon reindex --embed` printed no JSON report, so the harness cannot tell \
+             how many vectors the corpus has: {error}"
+        ))
+    })?;
+    let written = value["data"]["embedded"].as_u64().unwrap_or(0);
+    if !quiet && written > 0 {
+        eprintln!(
+            "kiomon bench: embedded {written} memories for the vector leg in {elapsed:.1} ms"
+        );
+    }
+    Ok(corpus
+        .vectors
+        .saturating_add(usize::try_from(written).unwrap_or(0)))
 }
 
 /// Where the corpora live.
@@ -175,7 +265,12 @@ fn sizes(args: &BenchArgs) -> Result<Vec<usize>> {
 }
 
 /// Measure one corpus, `--repeat` times.
-fn measure(exe: &Path, corpus: &CorpusReport, args: &BenchArgs) -> Result<out::BenchReport> {
+fn measure(
+    exe: &Path,
+    config: &Path,
+    corpus: &CorpusReport,
+    args: &BenchArgs,
+) -> Result<out::BenchReport> {
     // One pass is run and thrown away before the measured ones. Building the corpus
     // writes two hundred megabytes and then checkpoints the write-ahead log back into the
     // file, and the kernel does not finish flushing it for another minute — a command
@@ -187,11 +282,11 @@ fn measure(exe: &Path, corpus: &CorpusReport, args: &BenchArgs) -> Result<out::B
     // a number that is known to be wrong belongs in the bin and not in an average. Every
     // figure this harness publishes is therefore a warm-cache figure, which is what the
     // plan's numbers claim to be.
-    let (_, _, mut written) = measure_once(exe, corpus, args)?;
+    let (_, _, mut written) = measure_once(exe, config, corpus, args)?;
     let mut passes = Vec::with_capacity(args.repeat as usize);
     let mut floor_samples = Vec::new();
     for _ in 0..args.repeat {
-        let (rows, floor, added) = measure_once(exe, corpus, args)?;
+        let (rows, floor, added) = measure_once(exe, config, corpus, args)?;
         passes.push(rows);
         floor_samples.extend(floor.samples);
         written.extend(added);
@@ -377,9 +472,13 @@ fn search_probes(corpus: &CorpusReport) -> Vec<Probe> {
             .iter()
             .find(|probe| probe.name == planted.name)
             .map_or(0, |probe| probe.matches);
+        // `auto`, which with the harness's stub embedder is both legs — the mix a user
+        // who configured a model actually gets. The lexical-only and vector-only twins are
+        // added below, and the set is the point: a hybrid row that drifts is either one leg
+        // getting slower or the fusion getting slower, and only the separate rows say which.
         probes.push(Probe {
             label: match planted.name {
-                "common" => "common",
+                "common" => "common (hybrid)",
                 "uncommon" => "uncommon",
                 "rare" => "rare",
                 "phrase" => "phrase",
@@ -399,6 +498,36 @@ fn search_probes(corpus: &CorpusReport) -> Vec<Probe> {
                         "search".to_owned(),
                         "--quiet".to_owned(),
                         query.clone(),
+                    ])
+                }
+            }),
+        });
+    }
+
+    // The same query on one leg at a time, so "the vector leg costs X" and "the lexical leg
+    // costs Y" are measurements rather than arithmetic on a sum.
+    let common = corpus
+        .probes
+        .iter()
+        .find(|probe| probe.name == "common")
+        .map_or(0, |probe| probe.matches);
+    for (label, leg) in [("common (fts)", "fts"), ("common (vector)", "vector")] {
+        probes.push(Probe {
+            label,
+            query: Some("deploy".to_owned()),
+            matches: common,
+            collect_ids: false,
+            args: Box::new({
+                let db = db.clone();
+                move |_| {
+                    Some(vec![
+                        "--db".to_owned(),
+                        db.clone(),
+                        "search".to_owned(),
+                        "--quiet".to_owned(),
+                        "--legs".to_owned(),
+                        leg.to_owned(),
+                        "deploy".to_owned(),
                     ])
                 }
             }),
@@ -438,8 +567,24 @@ fn read_probes(corpus: &CorpusReport) -> Vec<Probe> {
             vec!["--no-record", "--limit", "50", "deploy"],
             true,
         ),
+        // Lexical on purpose: this row is WP5.5's gate ("a packet costs what the search
+        // under it costs"), and a comparison is only a comparison if both halves run the
+        // same legs. `retrieve (hybrid)` is the row a configured user actually gets.
         (
             "retrieve (no record)",
+            "retrieve",
+            vec![
+                "--no-record",
+                "--legs",
+                "fts",
+                "--intent",
+                "execute",
+                "deploy",
+            ],
+            true,
+        ),
+        (
+            "retrieve (hybrid)",
             "retrieve",
             vec!["--no-record", "--intent", "execute", "deploy"],
             true,
@@ -553,10 +698,12 @@ fn single_probes(corpus: &CorpusReport) -> Vec<Probe> {
 /// Run every probe once per sample index, with the floor for that index measured first.
 fn measure_once(
     exe: &Path,
+    config: &Path,
     corpus: &CorpusReport,
     args: &BenchArgs,
 ) -> Result<(Vec<out::Row>, Sample, Vec<String>)> {
     let probes = probes_for(corpus);
+    let config = config.display().to_string();
     let runs = args.runs as usize;
     let mut rows = probes
         .iter()
@@ -573,13 +720,13 @@ fn measure_once(
     for sample in 0..runs {
         // The floor for this sample index, taken moments before it. Every row's sample of
         // this index is measured against it.
-        let floor = one(exe, &["--version".to_owned()])?;
+        let floor = one(exe, &config, &["--version".to_owned()])?;
         floor_samples.push(floor);
         for (index, probe) in probes.iter().enumerate() {
             let Some(arguments) = (probe.args)(sample) else {
                 continue;
             };
-            let (elapsed, out) = one_capturing(exe, &arguments, probe.collect_ids)?;
+            let (elapsed, out) = one_capturing(exe, &config, &arguments, probe.collect_ids)?;
             rows[index].total_ms.push(elapsed);
             rows[index].floor_ms.push(floor);
             if probe.collect_ids {
@@ -614,17 +761,28 @@ fn id_from(stdout: &str) -> Option<String> {
 /// comparing their times.
 fn display_label(label: &str) -> String {
     match label {
-        "open" | "add" | "add (cold file)" | "stats" | "get" | "retrieve (no record)" => {
-            label.to_owned()
+        "open"
+        | "add"
+        | "add (cold file)"
+        | "stats"
+        | "get"
+        | "retrieve (no record)"
+        | "retrieve (hybrid)" => label.to_owned(),
+        name if name.starts_with("list")
+            || name.starts_with("search (")
+            || name.ends_with("(fts)")
+            || name.ends_with("(vector)")
+            || name.ends_with("(hybrid)") =>
+        {
+            name.to_owned()
         }
-        name if name.starts_with("list") || name.starts_with("search (") => name.to_owned(),
         name => format!("search {name}"),
     }
 }
 
 /// One cold process, in milliseconds.
-fn one(exe: &Path, args: &[String]) -> Result<f64> {
-    Ok(one_capturing(exe, args, false)?.0)
+fn one(exe: &Path, config: &str, args: &[String]) -> Result<f64> {
+    Ok(one_capturing(exe, config, args, false)?.0)
 }
 
 /// One cold process, in milliseconds, optionally keeping its stdout.
@@ -632,9 +790,19 @@ fn one(exe: &Path, args: &[String]) -> Result<f64> {
 /// Nothing is captured unless a row asks for it, and that is not an optimisation: a
 /// benchmark whose output goes nowhere is one fewer thing to go wrong, and the pipe read is
 /// a cost the rows that ask for it really do pay.
-fn one_capturing(exe: &Path, args: &[String], capture: bool) -> Result<(f64, String)> {
+fn one_capturing(
+    exe: &Path,
+    config: &str,
+    args: &[String],
+    capture: bool,
+) -> Result<(f64, String)> {
     let started = Instant::now();
     let output = Command::new(exe)
+        // The global flags first, so every row runs against the same database the same way:
+        // with the harness's stub embedder configured. A row that ran without it would be a
+        // row from a different program.
+        .arg("--config")
+        .arg(config)
         .args(args)
         // Nowhere on purpose. Piping the output would make the child block on a full
         // pipe, and reading it would make this a measurement of the harness; a benchmark

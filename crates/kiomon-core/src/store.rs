@@ -38,8 +38,9 @@ use crate::hash;
 use crate::id;
 use crate::metadata;
 use crate::model::{
-    AddOutcome, ForgetOutcome, KindCount, ListQuery, ListSort, Memory, MemoryKind, MemoryPatch,
-    NewMemory, Relation, ReviewMode, Scope, Stats, Status, StatusCount, UpdateOutcome,
+    AddOutcome, EmbedReport, EmbedState, ForgetOutcome, KindCount, ListQuery, ListSort, Memory,
+    MemoryKind, MemoryPatch, NewMemory, Relation, ReviewMode, Scope, Stats, Status, StatusCount,
+    UpdateOutcome,
 };
 
 /// Every column a [`Memory`] needs, in one place so a query cannot half-populate a row.
@@ -109,8 +110,18 @@ impl Database {
     pub fn add(&self, new: &NewMemory) -> Result<AddOutcome> {
         let workspace = self.resolve_workspace(&new.workspace_id)?;
         let transaction = self.conn().unchecked_transaction()?;
-        let outcome = insert_one(&transaction, &workspace.id, workspace.review_mode, new)?;
+        let mut outcome = insert_one(&transaction, &workspace.id, workspace.review_mode, new)?;
         transaction.commit()?;
+        // After the commit, never inside the transaction: the embedder is a network call,
+        // and a write lock held across one is a write lock held for as long as someone
+        // else's model takes to load. A failure here is a warning on a write that already
+        // succeeded — the memory is stored and findable lexically, and `reindex --embed`
+        // exists to come back for it.
+        if let Err(error) = self.embed_ids(std::slice::from_ref(&outcome.id)) {
+            outcome.warnings.push(format!(
+                "stored, but not embedded: {error}. `kiomon reindex --embed` retries it."
+            ));
+        }
         Ok(outcome)
     }
 
@@ -289,6 +300,17 @@ impl Database {
                 content_hash,
             ],
         )?;
+
+        // A vector is a function of the text it was made from. An update that touched
+        // title, body or excerpt without re-embedding leaves a row that semantic search
+        // can only find by the words it used to have — worse than a row with no vector,
+        // because nothing reports it and the stale one still wins.
+        let text_moved = patch.title.is_some() || patch.body.is_some() || patch.excerpt.is_some();
+        if text_moved && changed > 0 {
+            if let Err(error) = self.reembed_ids(std::slice::from_ref(&existing.id)) {
+                warnings.push(format!("updated, but not re-embedded: {error}"));
+            }
+        }
 
         Ok(UpdateOutcome {
             id: existing.id,
@@ -535,6 +557,268 @@ impl Database {
         }
         transaction.commit()?;
         Ok(ForgetOutcome { deleted, missing })
+    }
+
+    /// Embed these ids, skipping the ones that already have a vector for this model.
+    ///
+    /// The one write path for vectors, shared by `add`, `update`, `review approve` and
+    /// `reindex --embed`, so that four callers cannot disagree about the text rule, the
+    /// model key, or the batching.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when the embedder is configured and fails, and
+    /// [`Error::Database`] when a row named here cannot be read.
+    pub fn embed_ids(&self, ids: &[String]) -> Result<Vec<EmbedState>> {
+        self.embed_ids_inner(ids, false)
+    }
+
+    /// Embed these ids, replacing any vector they already have.
+    ///
+    /// For the one caller whose text *moved*: an `update` that rewrote a title or a body
+    /// leaves a vector that describes text the memory no longer has, and a stale vector is
+    /// worse than a missing one — nothing reports it, and a query for the old words keeps
+    /// finding the row.
+    ///
+    /// # Errors
+    ///
+    /// As [`Database::embed_ids`].
+    pub fn reembed_ids(&self, ids: &[String]) -> Result<Vec<EmbedState>> {
+        self.embed_ids_inner(ids, true)
+    }
+
+    /// The shared body of [`Database::embed_ids`] and [`Database::reembed_ids`].
+    fn embed_ids_inner(&self, ids: &[String], force: bool) -> Result<Vec<EmbedState>> {
+        let Some(embedder) = self.embedder() else {
+            return Ok(ids.iter().map(|_| EmbedState::NoEmbedder).collect());
+        };
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // One statement for the whole list, not one per id: a reindex page is five hundred
+        // ids, and five hundred round trips through SQLite is a scan of the corpus's index
+        // five hundred times over. The `IN` list is bounded by the batch size the caller
+        // chose.
+        let mut states = vec![EmbedState::Present; ids.len()];
+        let present: Vec<String> = if force {
+            Vec::new()
+        } else {
+            self.embedded_subset(ids, embedder.model())?
+        };
+        let mut missing: Vec<(usize, String)> = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            if !present.iter().any(|already| already == id) {
+                missing.push((index, id.clone()));
+            }
+        }
+        if missing.is_empty() {
+            return Ok(states);
+        }
+
+        let mut texts = Vec::with_capacity(missing.len());
+        for (_, id) in &missing {
+            let memory = self.get(id)?;
+            texts.push(crate::embed::memory_text(
+                &memory.title,
+                &memory.body,
+                &memory.excerpt,
+            ));
+        }
+
+        let vectors = embedder.embed_documents(&texts)?;
+        debug_assert_eq!(vectors.len(), missing.len());
+
+        let now = crate::db::now(self.conn())?;
+        let transaction = self.conn().unchecked_transaction()?;
+        {
+            // `INSERT OR REPLACE` rather than `INSERT`: re-embedding a row that already
+            // has a vector under this model (a model switch back, a forced reindex) is
+            // the normal case, and the primary key is `(mem_id, model)`.
+            let mut statement = transaction.prepare(
+                "INSERT OR REPLACE INTO memory_embeddings (mem_id, model, dim, vec, created_at) \
+                 VALUES ((SELECT mem_id FROM memories WHERE id = ?1), ?2, ?3, ?4, ?5)",
+            )?;
+            for ((index, _), vector) in missing.iter().zip(vectors) {
+                statement.execute(params![
+                    ids[*index],
+                    embedder.model(),
+                    i64::try_from(vector.len()).unwrap_or(i64::MAX),
+                    crate::vector::encode(&vector),
+                    now,
+                ])?;
+                states[*index] = EmbedState::Written;
+            }
+        }
+        transaction.commit()?;
+        Ok(states)
+    }
+
+    /// Embed every memory in scope that has no vector for this model.
+    ///
+    /// Paged by primary key, one page at a time, each page committed before the next is
+    /// read: an interrupted run keeps the pages it finished, and running it again resumes
+    /// at the first row that still has no vector — because "which rows are missing" is
+    /// the query, and it is the only cursor this needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when there is no embedder (a reindex with nothing to
+    /// embed with is a usage error rather than a no-op), and [`Error::Database`] when a
+    /// page cannot be read.
+    pub fn reindex_embeddings(
+        &self,
+        scope: &Scope,
+        limit: Option<u32>,
+        dry_run: bool,
+    ) -> Result<EmbedReport> {
+        let embedder = self.embedder().ok_or_else(|| {
+            Error::Config(
+                "`reindex --embed` needs an embedder, and none is configured: add an \
+                 [embedder] block to the config file. Without one there is nothing to \
+                 write vectors with, and a reindex that reported success without writing \
+                 any would be worse than this message."
+                    .to_owned(),
+            )
+        })?;
+        let mut report = EmbedReport::empty(embedder.model());
+        report.dry_run = dry_run;
+
+        let page = limit.unwrap_or(500).max(1);
+        let mut cursor: i64 = 0;
+        loop {
+            let ids = self.unembedded_ids(embedder.model(), scope, cursor, page)?;
+            let Some(last) = ids.last().map(|(mem_id, _)| *mem_id) else {
+                break;
+            };
+            report.requested += ids.len();
+            cursor = last;
+            if dry_run {
+                // Counted, not embedded: the point of a dry run is to answer "how much
+                // work is this" without spending a model's time or a user's tokens.
+                report.embedded += ids.len();
+                if ids.len() < page as usize {
+                    break;
+                }
+                continue;
+            }
+            let names: Vec<String> = ids.iter().map(|(_, id)| id.clone()).collect();
+            for (_, id) in &ids {
+                let memory = self.get(id)?;
+                let text = crate::embed::memory_text(&memory.title, &memory.body, &memory.excerpt);
+                if crate::embed::Embedder::truncates(&text) {
+                    report.truncated += 1;
+                }
+            }
+            match self.embed_ids(&names) {
+                Ok(states) => {
+                    report.embedded += states
+                        .iter()
+                        .filter(|state| **state == EmbedState::Written)
+                        .count();
+                    report.present += states
+                        .iter()
+                        .filter(|state| **state == EmbedState::Present)
+                        .count();
+                }
+                Err(error) => {
+                    // Reported and skipped: one page a model refused is not a reason to
+                    // abandon the pages after it, and the count at the end says what
+                    // actually landed rather than what was attempted.
+                    report.errors.push(error.to_string());
+                }
+            }
+            if ids.len() < page as usize {
+                break;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Which of `ids` already have a vector for `model`, in one statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] if the query fails.
+    fn embedded_subset(&self, ids: &[String], model: &str) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        let sql = format!(
+            "SELECT memories.id \
+               FROM memories \
+               JOIN memory_embeddings ON memory_embeddings.mem_id = memories.mem_id \
+              WHERE memory_embeddings.model = ?1 AND memories.id IN ({placeholders})"
+        );
+        let mut values: Vec<Sql> = vec![Sql::Text(model.to_owned())];
+        values.extend(ids.iter().map(|id| Sql::Text(id.clone())));
+        let mut statement = self.conn().prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Whether this memory already has a vector for `model`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] if the query fails.
+    pub fn has_embedding(&self, id: &str, model: &str) -> Result<bool> {
+        let count: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM memory_embeddings \
+               JOIN memories ON memories.mem_id = memory_embeddings.mem_id \
+              WHERE memories.id = ?1 AND memory_embeddings.model = ?2",
+            params![id, model],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Active memories after `cursor` that have no vector for `model`.
+    ///
+    /// A page of `(mem_id, id)`: `mem_id` because that is what the cursor walks, `id`
+    /// because that is what a caller names. `NOT EXISTS` rather than a `LEFT JOIN ... IS
+    /// NULL`, which is the same answer for a fraction of the planning and reads as what it
+    /// means.
+    fn unembedded_ids(
+        &self,
+        model: &str,
+        scope: &Scope,
+        cursor: i64,
+        limit: u32,
+    ) -> Result<Vec<(i64, String)>> {
+        let mut sql = String::from(
+            "SELECT memories.mem_id, memories.id \
+               FROM memories \
+              WHERE memories.status = 'active' \
+                AND memories.mem_id > ? \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM memory_embeddings \
+                     WHERE memory_embeddings.mem_id = memories.mem_id \
+                       AND memory_embeddings.model = ?)",
+        );
+        let mut values: Vec<Sql> = vec![Sql::Integer(cursor), Sql::Text(model.to_owned())];
+        let (scope_clause, scope_values) = scope_clause(Some("memories."), scope);
+        sql.push_str(&scope_clause);
+        values.extend(scope_values);
+        sql.push_str(" ORDER BY memories.mem_id LIMIT ?");
+        values.push(Sql::Integer(i64::from(limit)));
+
+        let mut statement = self.conn().prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// How many rows the full-text index holds.

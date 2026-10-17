@@ -49,6 +49,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub db: Option<PathBuf>,
 
+    /// Path to the config file: the embedder, and the default workspace.
+    ///
+    /// Overrides $KIOMON_CONFIG. Without either, `<data dir>/config.toml` is read when it
+    /// exists, and a brain with no config file is a full-text brain rather than an error.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
     /// Emit one JSON document on stdout instead of human-readable text.
     #[arg(long, global = true)]
     pub json: bool,
@@ -118,6 +125,9 @@ pub enum Command {
     Restore(IdsArgs),
     /// Say whether a memory was useful. Feeds its strength and its decay clock.
     Rate(RateArgs),
+
+    /// Rebuild an index: embed the memories that have no vector yet.
+    Reindex(ReindexArgs),
 
     /// Permanently delete memories. The only destructive command.
     Forget(ForgetArgs),
@@ -451,6 +461,11 @@ pub struct RetrieveArgs {
     /// Do not count the items in the packet against their decay clock.
     #[arg(long)]
     pub no_record: bool,
+
+    /// Which legs the search under the packet may use. `fts` builds the packet without
+    /// going near the embedder, which is what to reach for when it is down.
+    #[arg(long, value_enum, default_value_t = LegsArg::Auto)]
+    pub legs: LegsArg,
 }
 
 /// `kiomon search`
@@ -608,6 +623,31 @@ pub struct RateArgs {
     pub rating: RatingArg,
 }
 
+/// `kiomon reindex`
+///
+/// What it reindexes is decided by flags rather than by a sub-subcommand: there is one
+/// index that can fall behind (`--embed`), and a `reindex embed` spelling would be a verb
+/// whose only value is a word.
+#[derive(Debug, Args)]
+pub struct ReindexArgs {
+    /// Re-embed every active memory that has no vector for the configured model.
+    #[arg(long)]
+    pub embed: bool,
+
+    /// Workspace to cover. `*` covers every workspace.
+    #[arg(long, value_name = "WORKSPACE")]
+    pub workspace: Option<String>,
+
+    /// Report what would be embedded, and embed nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Memories per batch. Each batch is one embed call per `batch` the embedder
+    /// configures, and one transaction.
+    #[arg(long, default_value_t = 500, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=10_000))]
+    pub limit: u32,
+}
+
 /// `kiomon forget`
 #[derive(Debug, Args)]
 pub struct ForgetArgs {
@@ -740,14 +780,26 @@ impl From<RelationArg> for Relation {
 }
 
 /// Which retrieval legs to run.
+///
+/// The hosted spellings are accepted as aliases — `hybrid` and `both` for `auto`,
+/// `lexical` for `fts`, `semantic` for `vector` — because a caller that read `legs` off a
+/// hosted response asks for it back by the name it saw, and a usage error for a word the
+/// other half of this product uses would be a gratuitous difference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum LegsArg {
-    /// Full text, plus the vector leg when an embedder is configured.
+    /// Every leg this build has: full text, plus the vector leg when an embedder is
+    /// configured. `--legs hybrid` and `--legs both` are the same thing.
+    #[value(alias = "hybrid", alias = "both")]
     Auto,
     /// Full text only. Never touches an embedder, so it is the fast mode.
+    #[value(alias = "lexical", alias = "fulltext")]
     Fts,
-    /// Vector only. Fails with exit code 4 when no embedder is configured.
+    /// Vector only. Fails with exit code 4 when no embedder is configured, and never
+    /// answers from the lexical leg.
+    #[value(alias = "semantic")]
     Vector,
+    /// The graph leg, which this release does not have (§9-D9).
+    Graph,
 }
 
 impl From<LegsArg> for Legs {
@@ -756,6 +808,7 @@ impl From<LegsArg> for Legs {
             LegsArg::Auto => Self::Auto,
             LegsArg::Fts => Self::Fts,
             LegsArg::Vector => Self::Vector,
+            LegsArg::Graph => Self::Graph,
         }
     }
 }
@@ -772,6 +825,7 @@ impl LegsArg {
             Self::Auto => "auto",
             Self::Fts => "fts",
             Self::Vector => "vector",
+            Self::Graph => "graph",
         }
     }
 }

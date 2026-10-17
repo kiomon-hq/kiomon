@@ -521,6 +521,16 @@ impl Database {
         }
 
         transaction.commit()?;
+        // Approving is the moment a draft becomes findable, so it is the moment it needs a
+        // vector: `add` skipped one for a draft (semantic search cannot return a
+        // `pending_approval` row), and the search that runs right after this would
+        // otherwise never find it. Failures are silent here because the review outcome has
+        // no warning channel and a memory that is approved and lexically findable is a
+        // success; `doctor`'s coverage count and `reindex --embed` are where a missing
+        // vector surfaces.
+        if !moved.is_empty() {
+            let _ = self.embed_ids(&moved);
+        }
         Ok(ReviewOutcome { moved, skipped })
     }
 

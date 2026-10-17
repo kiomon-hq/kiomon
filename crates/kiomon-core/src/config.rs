@@ -2,12 +2,30 @@
 
 //! Where the database lives, and what it is called.
 //!
-//! Resolution is a fixed order — flag, then environment, then platform convention —
-//! and there is no config file yet. That is deliberate: a config file with one key in
-//! it is a parser to maintain and a second place for the answer to be wrong, and
-//! nothing in WP1–WP6 needs one. The embedder (WP7) is the first thing that genuinely
-//! does, and it brings a real TOML dependency with it rather than a hand-rolled
-//! subset that would become a bug.
+//!
+//! Resolution is a fixed order — flag, then environment, then the config file, then the
+//! platform convention — and the order is the contract, not an accident. Each step is a
+//! narrower statement than the one before it: a flag says "this file, now", an
+//! environment variable says "this file, in this shell", and the config file says "this
+//! file, on this machine".
+//!
+//! # The config file
+//!
+//! `$KIOMON_CONFIG`, or `--config`, or `<data dir>/config.toml` (`%APPDATA%\kiomon` on
+//! Windows, `~/.kiomon` as the fallback everywhere): TOML, and it holds `default_workspace`
+//! and the optional `[embedder]` block. §3.1 of the plan also assigns it `review_mode`,
+//! which it does not hold — the review mode is a column on the workspace row, set by
+//! `init --review`, and a second place to say it is a second place to be wrong. §8's WP7
+//! record carries the contradiction.
+//!
+//! A missing file is not an error: a brain with no config is a full-text brain, and the
+//! commands that need nothing from the file must not fail because it is absent. A file
+//! that exists and does not parse *is* an error, and it names the file and the span —
+//! silently ignoring a typo in `[embedder]` would look exactly like a broken embedder.
+//!
+//! # The one deliberate omission
+//!
+//! `review_mode` is not here. See above.
 
 use std::path::{Path, PathBuf};
 
@@ -56,18 +74,159 @@ pub fn resolve_db_path(explicit: Option<&Path>) -> Result<PathBuf> {
     Ok(home.join(LEGACY_DIR).join(DB_FILE))
 }
 
-/// The default workspace, unless the environment overrides it.
+/// The default workspace: `$KIOMON_WORKSPACE`, then the config file, then `default`.
 ///
-/// `$KIOMON_WORKSPACE` exists because a user with several workspaces wants a shell or
-/// an agent session to stay in one of them without repeating `--workspace` on every
-/// command. Absence of `--workspace` still means exactly one workspace — this one.
+/// `$KIOMON_WORKSPACE` exists because a user with several workspaces wants a shell or an
+/// agent session to stay in one of them without repeating `--workspace` on every command,
+/// and it outranks the file because an environment variable is the more specific
+/// statement. Absence of `--workspace` still means exactly one workspace — this one.
 #[must_use]
-pub fn default_workspace() -> String {
+pub fn default_workspace(config: &Config) -> String {
     std::env::var(ENV_WORKSPACE)
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            config
+                .default_workspace
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
         .unwrap_or_else(|| crate::model::DEFAULT_WORKSPACE.to_owned())
+}
+
+/// The environment variable that names the config file.
+pub const ENV_CONFIG: &str = "KIOMON_CONFIG";
+
+/// The config file's name, in whichever directory it lives.
+const CONFIG_FILE: &str = "config.toml";
+
+/// What the config file said.
+///
+/// Every field is optional because the file is: a config that sets only
+/// `default_workspace` is a complete config, and a config that sets only an embedder is a
+/// complete config too.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// The workspace a command uses when it is not told.
+    pub default_workspace: Option<String>,
+    /// The optional embedder (WP7). Absent means lexical search only.
+    pub embedder: Option<crate::embed::EmbedderConfig>,
+    /// The file this was read from, for messages. `None` when there was no file.
+    #[serde(skip)]
+    pub source: Option<PathBuf>,
+}
+
+impl Config {
+    /// Read the config file: `--config`, then `$KIOMON_CONFIG`, then the data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] naming the file and the parse error when a file that
+    /// exists does not parse, and [`Error::Io`] when it exists and cannot be read.
+    pub fn load(explicit: Option<&Path>) -> Result<Self> {
+        let path = match explicit {
+            Some(path) => Some(path.to_path_buf()),
+            None => match std::env::var_os(ENV_CONFIG) {
+                Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
+                _ => Self::default_path(),
+            },
+        };
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            // Absent is a normal state: most brains have no embedder and no config file.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // ... unless the path was named explicitly, in which case the user is
+                // asking for *that* file and a typo in it has to be a failure.
+                if explicit.is_some() || std::env::var_os(ENV_CONFIG).is_some() {
+                    return Err(Error::Config(format!(
+                        "could not read the config file {}: {err}",
+                        path.display()
+                    )));
+                }
+                return Ok(Self::default());
+            }
+            Err(err) => {
+                return Err(Error::Config(format!(
+                    "could not read the config file {}: {err}",
+                    path.display()
+                )));
+            }
+        };
+        Self::parse(&text, &path)
+    }
+
+    /// Parse config text, with the file it came from for the error message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] with the file, the line, and the offending text.
+    pub fn parse(text: &str, path: &Path) -> Result<Self> {
+        let mut parsed: Self = toml::from_str(text).map_err(|err| {
+            // `toml`'s own message includes the span and a caret, which is the most useful
+            // part of it: a config typo is almost always one character, one line up.
+            Error::Config(format!("{} is not valid TOML: {err}", path.display()))
+        })?;
+        parsed.source = Some(path.to_path_buf());
+        Ok(parsed)
+    }
+
+    /// The file a config is read from when nothing names one.
+    ///
+    /// Prefers the platform data directory, because that is where the database lives and
+    /// a brain is one thing; `~/.kiomon` is the fallback the database path also uses, so a
+    /// user on an old path keeps working.
+    #[must_use]
+    pub fn default_path() -> Option<PathBuf> {
+        if let Some(dir) = platform_data_dir() {
+            let candidate = dir.join(CONFIG_FILE);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        let legacy = home_dir()?.join(LEGACY_DIR).join(CONFIG_FILE);
+        Some(legacy)
+    }
+
+    /// The database path this config resolves to: `explicit`, then `$KIOMON_DB`, then the
+    /// platform convention.
+    ///
+    /// The config file holds no path of its own. A database path in a config file is a
+    /// second answer to "which brain is this", and the first thing a user would do is move
+    /// the file and get two brains.
+    ///
+    /// # Errors
+    ///
+    /// As [`resolve_db_path`].
+    pub fn resolve_db_path(&self, explicit: Option<&Path>) -> Result<PathBuf> {
+        resolve_db_path(explicit)
+    }
+
+    /// The embedder this config describes, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] with the source file named when the `[embedder]` block
+    /// is incomplete or contradicts itself. Building it here rather than lazily is
+    /// deliberate: a broken embedder is a broken configuration, and a `search` that never
+    /// touches the vector leg should still refuse to run on a config it cannot honour.
+    pub fn embedder(&self) -> Result<Option<crate::embed::Embedder>> {
+        let Some(config) = &self.embedder else {
+            return Ok(None);
+        };
+        crate::embed::Embedder::build(config)
+            .map(Some)
+            .map_err(|err| match &self.source {
+                Some(path) => Error::Config(format!("{}: {err}", path.display())),
+                None => err,
+            })
+    }
 }
 
 /// The platform's per-user data directory for this application.

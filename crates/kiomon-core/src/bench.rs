@@ -361,6 +361,14 @@ pub struct CorpusReport {
     pub reused: bool,
     /// Ids worth passing to `get` — one per size class, so a probe can pick its cost.
     pub sample_ids: Vec<String>,
+    /// How many memories the vector leg could see, which is the number that decides
+    /// whether a hybrid row is measuring the leg or measuring nothing.
+    ///
+    /// Counted from the table rather than assumed: a corpus is reused across runs, and one
+    /// built before an embedder was configured has no vectors at all. The harness fills
+    /// the gap by running `reindex --embed` — the command a user would run — and records
+    /// what it wrote here.
+    pub vectors: usize,
     /// Match counts for the planted terms.
     pub probes: Vec<Probe>,
 }
@@ -542,6 +550,12 @@ fn report(db: &Database, spec: &CorpusSpec, seconds: f64, reused: bool) -> Resul
         seconds,
         reused,
         sample_ids,
+        vectors: db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM memory_embeddings", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_or(0, |count| usize::try_from(count).unwrap_or(0)),
         probes: probes(db)?,
     })
 }

@@ -787,6 +787,14 @@ pub enum ListSort {
 }
 
 /// Which retrieval legs a search is allowed to use.
+///
+/// The vocabulary is the hosted product's (`worker/src/lib/search.ts`'s
+/// `RETRIEVAL_LEGS`, and the door's `both|lexical|vector`), because the same words have
+/// to mean the same thing when this engine answers `/api/search` in WP9. `auto` is the
+/// local default and is what `hybrid` means here: every leg the build *has*. The
+/// difference from the hosted `hybrid` is deliberate and documented — a local brain with
+/// no embedder configured is a full-text brain, not a broken one, so `auto` running
+/// lexical alone is not reported as a degradation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Legs {
     /// Every leg the build has. Falls back to lexical alone when no embedder is
@@ -799,6 +807,67 @@ pub enum Legs {
     /// Vector only. An error, not a fallback, when there is no embedder: a request for
     /// one thing is never answered with another.
     Vector,
+    /// The graph leg, which this release does not have (§9-D9).
+    ///
+    /// A leg in the vocabulary so that asking for it is possible and being told no is
+    /// explicit — the same reasoning the hosted product gives for keeping `graph` in
+    /// `RETRIEVAL_LEGS` while no leg is behind it.
+    Graph,
+}
+
+impl Legs {
+    /// The wire value, which is also what `--legs` accepts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fts => "fts",
+            Self::Vector => "vector",
+            Self::Graph => "graph",
+        }
+    }
+
+    /// Parse a `--legs` value, including the hosted spellings.
+    ///
+    /// `hybrid` and `both` are `auto`; `lexical` and `fulltext` are `fts`; `semantic` is
+    /// `vector`. A caller that read `legs` off a hosted response and asks for it back by
+    /// the name it saw must not get a usage error — the aliases are the platform's own.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" | "hybrid" | "both" => Some(Self::Auto),
+            "fts" | "lexical" | "fulltext" => Some(Self::Fts),
+            "vector" | "semantic" => Some(Self::Vector),
+            "graph" => Some(Self::Graph),
+            _ => None,
+        }
+    }
+}
+
+/// Which legs actually answered.
+///
+/// The door's shape (`{fts: bool, vector: bool}`), not this engine's enum: a caller that
+/// has to tell "lexical only", "vector only" and "both" apart needs three states, and a
+/// single string can express them only by inventing a spelling nobody else uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct LegsRun {
+    /// The lexical leg contributed candidates.
+    pub fts: bool,
+    /// The vector leg contributed candidates.
+    pub vector: bool,
+}
+
+impl LegsRun {
+    /// The human-readable name, for a log line or a one-line summary.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match (self.fts, self.vector) {
+            (true, true) => "fts+vector",
+            (true, false) => "fts",
+            (false, true) => "vector",
+            (false, false) => "none",
+        }
+    }
 }
 
 /// How search results are ordered.
@@ -875,12 +944,20 @@ pub struct SearchOutcome {
     pub hits: Vec<SearchHit>,
     /// Which rung of the ladder answered, or why none did.
     pub attempt: SearchAttempt,
-    /// The legs that ran. A `&'static str` rather than an enum because it is reported
-    /// verbatim in `--json` and the vocabulary is the contract's, not Rust's.
-    pub legs: &'static str,
-    /// True when a leg ran in a reduced form. Always false without an embedder: `auto`
-    /// falling back to lexical is the documented default, not a degradation.
+    /// The legs that answered, in the door's shape.
+    pub legs: LegsRun,
+    /// True when a leg ran in a reduced form: the embedder was configured and failed, so
+    /// the answer is lexical only. Always false without an embedder configured at all —
+    /// `auto` running lexical alone is the documented default, not a degradation.
     pub degraded: bool,
+    /// Why the answer is what it is, in the door's vocabulary: empty for a normal
+    /// answer, `vector_only` for a vector-only request, `no_query_vector` when the query
+    /// could not be embedded, `vector_leg_failed` when the leg itself failed, and
+    /// `no_embedder` when there is nothing configured to embed with. The last is a local
+    /// extension and is *not* a degradation: nothing failed.
+    pub reason: &'static str,
+    /// The model the query vector came from, when the vector leg ran.
+    pub vector_model: Option<String>,
     /// How many rows had their retrieval counter moved. Zero under `--no-record`, and
     /// zero when nothing matched.
     pub recorded: usize,
@@ -922,8 +999,18 @@ pub struct SearchHit {
     pub score: f32,
     /// The match in context, with `**` around the matched terms. Empty when the matched
     /// column produced nothing to show — see `search.rs`'s note on highlight markers for
-    /// why an unhighlighted snippet is dropped rather than shown.
+    /// why an unhighlighted snippet is dropped rather than shown. A row that only the
+    /// vector leg found has no matched term to highlight, and carries its excerpt here
+    /// instead: a result list where half the rows have no second line looks broken, and
+    /// the excerpt is what its writer said the memory was about.
     pub snippet: String,
+    /// Cosine similarity against the query, when the vector leg ranked this row.
+    ///
+    /// Not the same scale as `score` and not a substitute for it: this is a distance in
+    /// the model's own space, comparable across queries only loosely, and useful for
+    /// one thing — a caller that wants to know whether a hit was lexical or semantic,
+    /// and how strong the semantic part was.
+    pub similarity: Option<f32>,
 }
 
 /// The wire shape of a [`SearchHit`]: a [`MemorySummaryJson`] plus the two fields only a
@@ -941,6 +1028,9 @@ pub struct SearchHitJson<'a> {
     pub score: f32,
     /// See [`SearchHit::snippet`].
     pub snippet: &'a str,
+    /// See [`SearchHit::similarity`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f32>,
 }
 
 impl<'a> From<&'a SearchHit> for SearchHitJson<'a> {
@@ -949,6 +1039,7 @@ impl<'a> From<&'a SearchHit> for SearchHitJson<'a> {
             summary: MemorySummaryJson::from(&hit.memory),
             score: hit.score,
             snippet: &hit.snippet,
+            similarity: hit.similarity,
         }
     }
 }
@@ -1005,6 +1096,57 @@ pub struct AddOutcome {
     pub duplicate: bool,
     /// Anything discarded on the way in. Printed on stderr; never fatal.
     pub warnings: Vec<String>,
+}
+
+/// What writing an embedding did for one memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedState {
+    /// The vector was written.
+    Written,
+    /// A vector for this model was already there, so nothing was sent.
+    Present,
+    /// No embedder is configured, so there was nothing to write with.
+    NoEmbedder,
+}
+
+/// What a `reindex --embed` run did.
+///
+/// Counted from the database after the writes rather than from the calls made, for the
+/// reason the hosted product's backfill gives: "I sent a request" is not evidence that a
+/// row got a vector, and a count taken before the write reads as a tool that did nothing.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EmbedReport {
+    /// The model every vector in this run is labelled with.
+    pub model: String,
+    /// How many memories were asked for, before batching.
+    pub requested: usize,
+    /// How many now have a vector they did not have before.
+    pub embedded: usize,
+    /// How many already had one.
+    pub present: usize,
+    /// How many were embedded from a text that was truncated to fit the model's window.
+    pub truncated: usize,
+    /// Failures, one line each, and never fatal: a page that fails is skipped so the
+    /// next page can still be embedded.
+    pub errors: Vec<String>,
+    /// True when nothing was written and the run only reported what it would do.
+    pub dry_run: bool,
+}
+
+impl EmbedReport {
+    /// An empty report for `model`.
+    #[must_use]
+    pub fn empty(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            requested: 0,
+            embedded: 0,
+            present: 0,
+            truncated: 0,
+            errors: Vec::new(),
+            dry_run: false,
+        }
+    }
 }
 
 /// What an `update` did.

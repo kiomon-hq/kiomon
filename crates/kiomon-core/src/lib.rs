@@ -64,6 +64,7 @@ pub mod bench;
 pub mod config;
 pub mod db;
 pub mod decay;
+pub mod embed;
 pub mod error;
 pub mod fuse;
 pub mod gate;
@@ -75,13 +76,16 @@ pub mod model;
 pub mod retrieve;
 pub mod search;
 pub mod store;
+pub mod vector;
 
 #[cfg(test)]
 pub(crate) mod testing;
 
 pub use bench::{BodyClass, BodyMix, CorpusReport, CorpusSpec, Probe};
+pub use config::Config;
 pub use db::{Database, Integrity};
 pub use decay::DecayOutcome;
+pub use embed::{Backend, Embedder, EmbedderConfig, Provider};
 pub use error::{Error, ExitCode, Result};
 pub use fuse::{RRF_K, fuse, rrf_score};
 pub use gate::{AUTOPROMOTE_THRESHOLD, Verdict};
@@ -90,11 +94,11 @@ pub use lifecycle::{
     ReviewOutcome, Skipped, TaskOutcome,
 };
 pub use model::{
-    AddOutcome, DEFAULT_SNIPPET_TOKENS, ForgetOutcome, KindCount, Legs, ListQuery, ListSort,
-    MAX_TAGS, Memory, MemoryJson, MemoryKind, MemoryPatch, MemorySummaryJson, NewMemory, Relation,
-    ReviewMode, Scope, SearchAttempt, SearchHit, SearchHitJson, SearchOutcome, SearchQuery,
-    SearchSort, Stats, Status, StatusCount, UpdateOutcome, WINDOW_OVERFETCH, Workspace,
-    source_label,
+    AddOutcome, DEFAULT_SNIPPET_TOKENS, EmbedReport, EmbedState, ForgetOutcome, KindCount, Legs,
+    LegsRun, ListQuery, ListSort, MAX_TAGS, Memory, MemoryJson, MemoryKind, MemoryPatch,
+    MemorySummaryJson, NewMemory, Relation, ReviewMode, Scope, SearchAttempt, SearchHit,
+    SearchHitJson, SearchOutcome, SearchQuery, SearchSort, Stats, Status, StatusCount,
+    UpdateOutcome, WINDOW_OVERFETCH, Workspace, source_label,
 };
 pub use retrieve::{
     Applicability, ConflictNote, ContextPacket, DEFAULT_PACKET_ITEMS, EvidenceRef, Intent,

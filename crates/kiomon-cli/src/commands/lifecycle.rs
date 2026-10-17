@@ -23,8 +23,8 @@ use kiomon_core::{ExitCode, Result, Scope};
 
 use super::{open, read_scope};
 use crate::cli::{
-    Cli, DecayArgs, ForgetArgs, IdsArgs, OutcomeArg, OutcomeArgs, RateArgs, RatingArg, ReviewArgs,
-    ReviewCommand,
+    Cli, DecayArgs, ForgetArgs, IdsArgs, OutcomeArg, OutcomeArgs, RateArgs, RatingArg, ReindexArgs,
+    ReviewArgs, ReviewCommand,
 };
 use crate::out;
 
@@ -53,7 +53,7 @@ pub fn review(cli: &Cli, args: &ReviewArgs) -> Result<ExitCode> {
     match &args.command {
         ReviewCommand::List(list) => {
             let query = PendingQuery {
-                scope: read_scope(&db, list.workspace.as_deref())?,
+                scope: read_scope(&db, cli, list.workspace.as_deref())?,
                 limit: list.limit,
                 min_confidence: list.min_confidence,
             };
@@ -126,7 +126,7 @@ pub fn review(cli: &Cli, args: &ReviewArgs) -> Result<ExitCode> {
 pub fn outcome(cli: &Cli, args: &OutcomeArgs) -> Result<ExitCode> {
     let db = open(cli)?;
     let scope = if args.workspace.is_some() {
-        read_scope(&db, args.workspace.as_deref())?
+        read_scope(&db, cli, args.workspace.as_deref())?
     } else {
         Scope::All
     };
@@ -162,7 +162,7 @@ pub fn decay(cli: &Cli, args: &DecayArgs) -> Result<ExitCode> {
     let scope = if args.all_workspaces {
         Scope::All
     } else {
-        read_scope(&db, None)?
+        read_scope(&db, cli, None)?
     };
 
     let outcome = db.decay(&scope, args.dry_run)?;
@@ -277,6 +277,60 @@ pub fn rate(cli: &Cli, args: &RateArgs) -> Result<ExitCode> {
     out::emit(cli.json, outcome, |outcome| {
         println!("{}", out::rating_line(outcome));
     })?;
+    Ok(ExitCode::Success)
+}
+
+/// `kiomon reindex`
+///
+/// The vector index is the one thing that can fall behind the rows it describes: it is
+/// written by `add`, `update` and `review approve`, and a memory that arrived while the
+/// embedder was down — or before it was configured at all — has no vector until something
+/// goes back for it. This is that something, and it is manual on purpose: embedding costs
+/// a model's time, and a sweep nobody asked for is a sweep that competes with the work the
+/// user is actually waiting on.
+///
+/// # Errors
+///
+/// Returns [`kiomon_core::Error::Config`] when no embedder is configured, or `--embed` was
+/// not passed. Returns [`kiomon_core::Error::NotFound`] for an unknown workspace.
+pub fn reindex(cli: &Cli, args: &ReindexArgs) -> Result<ExitCode> {
+    if !args.embed {
+        return Err(kiomon_core::Error::Invalid(
+            "`reindex` needs to be told what to reindex: `--embed` rebuilds the vector              index. The full-text index is maintained by triggers and never needs one."
+                .to_owned(),
+        ));
+    }
+    let db = open(cli)?;
+    let scope = read_scope(&db, cli, args.workspace.as_deref())?;
+    let report = db.reindex_embeddings(&scope, Some(args.limit), args.dry_run)?;
+
+    for error in &report.errors {
+        out::warn(cli.quiet, error);
+    }
+
+    let missing = if report.dry_run {
+        report.embedded
+    } else {
+        // What is left, asked of the database rather than inferred from the counts: a
+        // report computed from its own bookkeeping is a report that cannot disagree with
+        // itself and therefore cannot be checked.
+        let (active, embedded) = db.embedding_coverage(&report.model, &scope)?;
+        usize::try_from((active - embedded).max(0)).unwrap_or(0)
+    };
+
+    out::emit(cli.json, report.clone(), |report| {
+        println!("{}", out::reindex_line(report));
+    })?;
+
+    if !report.errors.is_empty() {
+        return Ok(ExitCode::Internal);
+    }
+    if missing > 0 {
+        out::warn(
+            cli.quiet,
+            &format!("{missing} memories still have no vector; run `kiomon reindex --embed` again"),
+        );
+    }
     Ok(ExitCode::Success)
 }
 

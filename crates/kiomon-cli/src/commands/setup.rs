@@ -66,8 +66,13 @@ pub fn init(cli: &Cli, args: &InitArgs) -> Result<ExitCode> {
 /// of 1, not an error — a corrupt database is still a database whose other answers are
 /// readable, and a caller has more use for the report than for a message.
 pub fn doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
-    let path = config::resolve_db_path(cli.db.as_deref())?;
+    // `open` rather than `Database::open`, so `doctor` inspects the brain the other
+    // commands use — embedder attached — and not a bare file beside it.
+    let config = config::Config::load(cli.config.as_deref())?;
+    let path = config.resolve_db_path(cli.db.as_deref())?;
     let db = Database::open(&path)?;
+    let embedder = config.embedder()?;
+    let db = db.with_embedder(embedder.map(std::sync::Arc::new));
     let schema_version = db.schema_version()?;
 
     if args.paths_only {
@@ -75,9 +80,13 @@ pub fn doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
             path: path.display().to_string(),
             schema_version,
             expected_schema_version: Database::target_schema_version(),
-            workspace: config::default_workspace(),
+            workspace: super::default_workspace(cli)?,
             environment_db: std::env::var(config::ENV_DB).ok(),
             environment_workspace: std::env::var(config::ENV_WORKSPACE).ok(),
+            config: config.source.as_ref().map_or_else(
+                || "(none: defaults in use)".to_owned(),
+                |path| path.display().to_string(),
+            ),
         };
         out::emit(cli.json, report.clone(), |report| {
             println!("database    {}", report.path);
@@ -86,6 +95,7 @@ pub fn doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
                 report.schema_version, report.expected_schema_version
             );
             println!("workspace   {}", report.workspace);
+            println!("config      {}", report.config);
             println!(
                 "env         {}={}  {}={}",
                 config::ENV_DB,
@@ -136,12 +146,7 @@ pub fn doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
         active,
         workspaces: names(&workspaces),
         stats,
-        // The embedder arrives with WP7. Reported as absent rather than omitted, because
-        // "the vector leg is off" is a thing a user should be able to find out.
-        embedder: EmbedderReport {
-            configured: false,
-            detail: "not configured (the vector leg arrives in work package 7)".to_owned(),
-        },
+        embedder: embedder_report(&db, &config)?,
         decay: DecayReport {
             // The opportunistic nudge is a hundred rows a day (see `decay.rs`), which
             // cannot keep a large corpus current. Saying so here is what makes the nudge
@@ -159,6 +164,62 @@ pub fn doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
         ExitCode::Success
     } else {
         ExitCode::Internal
+    })
+}
+
+/// What `doctor` says about the vector leg.
+///
+/// # Errors
+///
+/// Returns whatever the coverage query raises.
+fn embedder_report(db: &Database, config: &config::Config) -> Result<EmbedderReport> {
+    use std::fmt::Write as _;
+    let Some(configured) = db.embedder() else {
+        let where_to_edit = config.source.as_ref().map_or_else(
+            || "the config file (`kiomon doctor --paths-only` prints where)".to_owned(),
+            |path| path.display().to_string(),
+        );
+        return Ok(EmbedderReport {
+            configured: false,
+            detail: format!(
+                "not configured — search is full text only. Add an [embedder] block to \
+                 {where_to_edit} for semantic search."
+            ),
+            provider: None,
+            model: None,
+            endpoint: None,
+            active: None,
+            embedded: None,
+        });
+    };
+    let (active, embedded) = db.embedding_coverage(configured.model(), &Scope::All)?;
+    let mut detail = format!("{} · model {}", configured.provider(), configured.model());
+    if let Some(endpoint) = configured.endpoint() {
+        let _ = write!(detail, " · {endpoint}");
+    }
+    if active > 0 {
+        let _ = write!(detail, " · {embedded}/{active} memories have a vector");
+        if embedded < active {
+            detail.push_str(" — `kiomon reindex --embed` fills the gap");
+        }
+    } else {
+        detail.push_str(" · nothing to embed yet");
+    }
+    if configured.provider() == "stub" {
+        // A brain built with the stub says so, in the one place a user looks. Its vectors
+        // are a hashed bag of words: two texts that share words are near, two that mean the
+        // same thing are not, and calling that semantic search would be a lie this tool
+        // should not tell even in a configuration it only ships for tests.
+        detail.push_str(" · a stub, whose vectors are not meaningful");
+    }
+    Ok(EmbedderReport {
+        configured: true,
+        detail,
+        provider: Some(configured.provider().to_owned()),
+        model: Some(configured.model().to_owned()),
+        endpoint: configured.endpoint(),
+        active: Some(active),
+        embedded: Some(embedded),
     })
 }
 
@@ -204,7 +265,7 @@ fn render_doctor(report: &DoctorReport) {
 /// Whatever opening the database or reading the counts raises.
 pub fn stats(cli: &Cli, args: &StatsArgs) -> Result<ExitCode> {
     let db = open(cli)?;
-    let scope = read_scope(&db, args.workspace.as_deref())?;
+    let scope = read_scope(&db, cli, args.workspace.as_deref())?;
     let kinds: Vec<MemoryKind> = args.kind.iter().copied().map(MemoryKind::from).collect();
     let stats = db.stats(&scope, &kinds)?;
 
@@ -264,6 +325,12 @@ pub struct PathsReport {
     pub environment_db: Option<String>,
     /// `$KIOMON_WORKSPACE`, when it is set.
     pub environment_workspace: Option<String>,
+    /// The config file that was read, or `(none: defaults in use)`.
+    ///
+    /// Printed because "the config file" is an abstraction until a user has to edit it,
+    /// and the first thing they need is the path — which is a different path on every
+    /// platform, and not the one they would guess on Windows.
+    pub config: String,
 }
 
 /// What `doctor` reports.
@@ -329,11 +396,31 @@ fn decay_detail(age_days: Option<f64>, never: bool, memories: i64) -> String {
     }
 }
 
-/// Whether the optional vector leg can run.
+/// Whether the optional vector leg can run, and how much of the corpus it can see.
+///
+/// The coverage pair is the point of this report. An embedder that is configured and a
+/// corpus with no vectors for it is the state that looks like a working semantic search
+/// and is not one — every query runs, every query returns lexical results, and nothing
+/// says why. Two integers make it visible without costing the read path a count.
 #[derive(Debug, Clone, Serialize)]
 pub struct EmbedderReport {
     /// Whether an embedder is configured.
     pub configured: bool,
     /// What a user needs to know about it.
     pub detail: String,
+    /// The provider, when one is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The model every vector is labelled with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The URL it sends to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Active memories in scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<i64>,
+    /// Of those, how many have a vector for this model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedded: Option<i64>,
 }

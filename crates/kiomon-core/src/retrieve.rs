@@ -318,6 +318,14 @@ pub struct RetrieveQuery {
     /// clock. Default on for the same reason `search` is: a memory that was handed to an
     /// agent *is* a memory that was used.
     pub record: bool,
+    /// Which legs the underlying search may use.
+    ///
+    /// `Auto` — both, when an embedder is configured — is what a caller wants almost
+    /// always, and it is why this was not a parameter until WP7: with one leg there was
+    /// nothing to choose. `Fts` is how a packet is still built on a machine whose embedder
+    /// is down *and* how the benchmark measures the packet's own cost against the lexical
+    /// search under it.
+    pub legs: Legs,
 }
 
 impl Default for RetrieveQuery {
@@ -332,6 +340,7 @@ impl Default for RetrieveQuery {
             risk_level: None,
             limit: DEFAULT_PACKET_ITEMS,
             record: true,
+            legs: Legs::Auto,
         }
     }
 }
@@ -519,12 +528,25 @@ impl Database {
             // Pinned memories still lead it, which is this contract's business, not the
             // hosted one's.
             sort: SearchSort::Relevance,
-            legs: Legs::Auto,
+            legs: query.legs,
             record: false,
         })?;
 
+        // A packet built from one leg when two were asked for is worth saying out loud.
+        // The `search` verb puts it on stderr and in `degraded`; a packet has no such
+        // field on the wire, so it becomes a warning — which is where everything a caller
+        // cannot otherwise see about this packet already goes.
+        let degraded = candidates.degraded.then(|| {
+            format!(
+                "this packet was built from the full-text leg alone ({}), so a memory that                  only meaning would have found is not in it",
+                candidates.reason
+            )
+        });
+
         if candidates.hits.is_empty() {
-            return Ok(ContextPacket::empty(query.intent));
+            let mut packet = ContextPacket::empty(query.intent);
+            packet.warnings.extend(degraded);
+            return Ok(packet);
         }
 
         let now = crate::db::now(self.conn())?;
@@ -586,7 +608,7 @@ impl Database {
         scored.sort_by(|a, b| b.score.total_cmp(&a.score));
         scored.truncate(limit);
 
-        let packet = build_packet(&scored, query.intent, &edges);
+        let packet = build_packet(&scored, query.intent, &edges, degraded);
 
         if query.record && !packet.retrieved_ids.is_empty() {
             self.record_retrieval(&packet.retrieved_ids)?;
@@ -678,12 +700,20 @@ fn in_conflict(contradicts: &BTreeMap<String, Vec<String>>, id: &str) -> bool {
 }
 
 /// Rank the candidates into buckets, and derive every warning from what is stored.
-fn build_packet(scored: &[Scored], intent: Intent, edges: &EdgeSignals) -> ContextPacket {
+fn build_packet(
+    scored: &[Scored],
+    intent: Intent,
+    edges: &EdgeSignals,
+    search_warning: Option<String>,
+) -> ContextPacket {
     let mut facts = Vec::new();
     let mut episodes = Vec::new();
     let mut evidence = Vec::new();
     let mut procedure: Option<PacketItem> = None;
     let mut warnings: Vec<String> = edges.warning.iter().cloned().collect();
+    // The search-level warning goes first: it is about the whole packet, and everything
+    // after it is about individual items.
+    warnings.extend(search_warning);
     let mut conflicts = Vec::new();
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
 

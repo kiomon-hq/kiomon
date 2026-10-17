@@ -708,8 +708,8 @@ flaky-test generator):
 | `open` p50 | ≤ 5 ms |
 | `add` p95 | ≤ 40 ms |
 | `search` p95 (fts) | ≤ 60 ms |
-| `search` p95 (hybrid, local embedder) | ≤ 250 ms |
-| `retrieve` p95, no retrieval record (WP5.5) | ≤ 45 ms |
+| `search` p95 (hybrid, local embedder) | ≤ 250 ms — **measured since WP7**, with the harness's stub embedder: 123.50 ms at n = 100 |
+| `retrieve` p95, no retrieval record (WP5.5) | ≤ 45 ms — read on the lexical leg, so the packet is compared with its own search |
 
 > **The budget measures work, not wall time, and WP1 showed why.** Process spawn alone
 > is 8.6 ms on Windows, so a `search` that does nothing costs 8.6 ms and a `search` that
@@ -973,14 +973,156 @@ import of a partial/hostile JSONL (missing fields, wrong types, huge body)
 reports per-line errors on stderr and imports the valid lines; a 100 MB export
 streams without loading it into memory.
 
-### WP7 — Vector leg (2 days, **in v1 per §9-D1**)
-`Embedder` trait, Ollama + OpenAI-compatible over `ureq`, `vector.rs` brute-force
-cosine, `--legs auto|fts|vector`, fusion with two legs, `degraded` reporting,
-`kiomon reindex --embed`.
+### WP7 — Vector leg (2 days, **in v1 per §9-D1**) — **shipped**
+`Embedder` trait, Ollama + OpenAI-compatible over `ureq` (3.x, **no TLS**: see the WP7
+record), `vector.rs` brute-force cosine, `--legs auto|fts|vector` with the hosted spellings
+as aliases, fusion with two legs, `degraded`/`reason` reporting, `kiomon reindex --embed`,
+and the config file §3.1 assigns to this work package.
 **Accept:** with no embedder configured, `--legs vector` exits 4 with a message that
 names the config key; with one configured, hybrid returns rows the lexical leg
 misses (a semantic-only query fixture); a failed embed never fails a write and says
 so on stderr; a `--legs vector` request is never answered from the lexical leg.
+**Corrections the work turned up**, all argued in the record below: TLS is out of the default
+build on a crate-count measurement; a similarity floor of zero is the only model-independent
+threshold; a draft is embedded at write time and hidden by its status; `update` re-embeds
+forcibly because a stale vector is worse than a missing one; and the harness configures a stub
+embedder, which is what makes the hybrid gate measurable in CI.
+
+### WP7's numbers, and what they found
+
+Same laptop, same 10 000-memory corpus (7.67 KiB mean body, 197 MiB), release build, warm
+cache, `C:` drive. **The spawn floor was 10.85 ms in this session against 7.75 ms in WP4's**,
+which is the machine drifting by half again rather than the code: the `work` column is the
+comparable one, and the harness prints the floor for exactly this reason.
+
+| Command | work p50 / p95 (ms) | total p50 | note |
+|---|---|---|---|
+| `open` | 3.18 / 8.54 | 14.18 | unchanged by WP7 |
+| `add` (hybrid: write + stub embed) | 4.19 / 10.27 | 15.50 | +1.5 ms over WP2's 2.6, which is the embed call |
+| **`common (hybrid)`** | **81.58 / 123.50** | 92.04 | the gate: ≤ 250 ms ✅ |
+| `common (fts)` | 30.13 / 51.53 | 42.09 | the lexical leg alone, unchanged code |
+| `common (vector)` | 61.10 / 98.19 | 72.40 | the leg on its own |
+| `retrieve (no record)` (lexical, WP5.5's gate) | 24.14 / 37.25 | 35.77 | ≤ 45 ms ✅ |
+| `retrieve (hybrid)` | 71.07 / 119.17 | 83.07 | the packet over a hybrid search |
+| `search (limit 50)` (hybrid) | 73.55 / 120.45 | 84.59 | |
+| `decay --dry-run` | 82.88 / 131.63 | 94.63 | unchanged code, a busier machine |
+
+At 1 000 memories: `common (hybrid)` 30.10 / 33.67 work, `common (fts)` 21.86, `open` 3.09,
+`add` 9.77 — so the vector leg's cost is proportional to the corpus (`vector_window` reads
+every vector in scope) and the lexical leg's is not.
+
+**The vector leg is a blob read, not arithmetic.** Ten thousand 384-dimensional vectors are
+15 MB, four million multiply-adds and about 2 ms of floating point; the 61 ms is SQLite
+handing over the bytes. Measured directly with the `sqlite3` module on the same file: the
+same rows through a `JOIN` of `memory_embeddings` and `memories` take **78.6 ms**, through a
+sequential scan of the vectors plus one indexed read of the eligible ids **28.4 ms**. The
+join lets SQLite drive from the memories index and probe the embedding table once per row —
+ten thousand random probes into a `WITHOUT ROWID` table whose rows are 1.5 KB. So
+`vector_window` is two statements and a set intersection in Rust, and the module doc says so
+where somebody about to change it will read it. Two further changes were made on the way and
+are worth naming as *not* the fix: decoding through a borrowed `ValueRef::Blob` instead of a
+`Vec<u8>` per row, and a dot product that reads the bytes in place (`vector::dot_blob`).
+Both are right, and neither moved the number outside this machine's noise.
+
+### WP7's acceptance criteria
+
+| # | Criterion | Where it is asserted |
+|---|---|---|
+| 1 | With no embedder configured, `--legs vector` exits 4 naming the config key | `crates/kiomon-cli/tests/embed.rs::a_vector_only_search_with_no_embedder_exits_four_and_names_the_config_key`, and `crates/kiomon-core/tests/vector.rs` for the same rule against the library |
+| 2 | With one configured, hybrid returns rows the lexical leg misses | `the_vector_leg_finds_a_row_the_lexical_leg_cannot` — the lexical leg is asserted *empty* first, so the test cannot pass by accident |
+| 3 | A failed embed never fails a write, and says so on stderr | `a_write_that_cannot_embed_is_still_a_write_and_says_so` plus `a_hybrid_search_on_a_dead_embedder_says_so_on_stderr_and_still_answers`, which uses a real Ollama URL with nothing listening |
+| 4 | A `--legs vector` request is never answered from the lexical leg | `a_vector_only_request_is_never_answered_from_the_lexical_leg` (both legs, and `legs.fts == false`), and the exit-4 tests above |
+
+Beyond the plan's four: the two-leg fusion and a row both legs found leading it; the workspace
+and kind filters applying to the vector leg as they do to the lexical one; a draft never
+reaching the vector leg while an archived memory keeps its (unused) vector; a vector from
+another model being neither read nor counted, through a real model switch (reopen the same
+file with a different embedder); a dimension that contradicts `dim` refused at the first
+write; `reindex --embed` paged, idempotent, dry-runnable and refusing to run without an
+embedder; `doctor` naming the config file, the provider, the URL and the coverage gap;
+`https://` refused by name; the hosted leg spellings accepted by the binary; `retrieve --legs
+fts` building a packet with a dead embedder and warning about it on `auto`; and the config
+file's `default_workspace` losing to `--workspace`.
+
+### Where WP7 contradicted the plan
+
+1. **`ureq` was not a one-line dependency.** §9-D1 and §4 say "a blocking `ureq` request".
+   `ureq` 2 pulls `url` → `idna` → ICU4X: thirty crates, and with TLS the total would have
+   been 71 against a budget of 60 (§7, Appendix B). `ureq` 3.4 does its own URI handling, so
+   the whole dependency tree is fifteen crates — and the default build takes it **without
+   TLS**, which puts the total at **49**. The consequence is honest and documented rather
+   than hidden: `url` must be `http://`, every local server this is built for is plain HTTP on
+   localhost, an `https://` URL is refused by name with the workaround, and the plan's own
+   dependency budget is what decided it. Error messages, config validation and `doctor` all
+   say so; the ring/rustls stack stays a recorded option for whoever needs a hosted endpoint
+   (about +20 crates, which fits, and +600 KiB, which also fits — it was not free enough to
+   take without a user asking for it).
+2. **The plan's `--legs auto` wording hid a bug that a test caught.** `Vector` was in the
+   "lexical too" arm of the leg match, so `--legs vector` ran the lexical leg as well and
+   reported `legs: {fts: true, vector: true}` on a request that had asked for one leg. The row
+   was correct and the report was a lie. Fixed before the first commit, and the acceptance
+   test asserts `legs.fts == false` rather than only the rows.
+3. **"Returns rows the lexical leg misses" needs a threshold that the plan never mentions.**
+   A brute-force scan ranks *every* row, so a vector-only search over a corpus where nothing
+   is similar returns the least-dissimilar rows — and the hosted product has exactly the same
+   behaviour (its ANN leg takes the top N by distance with no floor). The local rule is a
+   floor of **zero**: a candidate whose cosine is `0.0` or less points in no shared direction
+   and is not a candidate. A tuned floor was rejected on purpose — every real model is
+   anisotropic, so `0.3` separates signal from noise in one model and throws away half the
+   corpus in another — and `similarity` is on every row the leg ranked so a caller can apply
+   its own.
+4. **A draft is embedded when it is written, and the *status* is what hides it.** The plan
+   said nothing, and the first test asserted the opposite. Embedding at write time keeps
+   `add` and `approve` from having two different rules, and visibility stays a property of the
+   read path's filter — which is what makes "a draft never reaches the vector leg" a rule
+   about one `WHERE` clause instead of two mechanisms that have to agree.
+5. **A stale vector is worse than a missing one, and the first implementation produced them.**
+   `embed_ids` skips rows that already have a vector, which is right for `reindex` and wrong
+   for `update`: a body that changed left its old vector in place, and a query for the *old*
+   words still found the row — silently, and with a similarity that looked plausible. Hence
+   `reembed_ids`, used by `update` and by nothing else. The same shape exists for the titles
+   the vector covers: a test that moves only the body passes while the title's vector still
+   matches, which is why the acceptance test moves both.
+6. **§3.1's config file has three keys and this has two.** `review_mode` is a column on the
+   workspace row, written by `init --workspace <name> --review`: a config-file copy would be a
+   second place to say it and therefore a second place to be wrong, which §3.1's own
+   resolution order exists to prevent. `default_workspace` and `[embedder]` are what the file
+   holds.
+7. **The bench harness had to stop being embedder-free, and that renamed its rows.** The
+   `search common` row was the lexical leg; with a stub embedder configured for every command
+   it is a hybrid row, so the rows are now `common (fts)`, `common (hybrid)` and
+   `common (vector)`, the gates are attached to the lexical and hybrid ones separately, and
+   §7's "not measured by this build" note about the hybrid gate is gone. What replaces it is
+   narrower and true: a stub cannot measure a *model's* latency, and CI has no model.
+8. **`retrieve` needed a `--legs` flag that the plan never mentions.** Without one, WP5.5's
+   gate cannot be compared with the search under it, and a user whose embedder is down has no
+   way to ask for a packet anyway. A degraded packet now carries a warning, which is where
+   that packet's other caveats already go — the wire packet has no `degraded` field.
+
+### What WP8 inherits
+
+1. **Two dependencies to justify in the release notes**, since both were chosen on measurements
+   rather than taste: `toml` (§3.1's config file, and the plan's own instruction to take a real
+   parser instead of a hand-rolled subset) and `ureq` 3 without TLS. The crate budget is at 49
+   of 60 and the binary at 3 971 KiB of 6 MB; the remaining headroom is the release profile and
+   nothing else.
+2. **The binary grew 541 KiB**, from 3 430 to 3 971, which is 65% of the 6 MB budget. `strip`,
+   `lto`, `codegen-units = 1` and `panic = "abort"` are already in the release profile, so the
+   budget's next pressure point is whatever WP9's HTTP server adds — and it is worth measuring
+   before the daemon is designed rather than after.
+3. **The ANN trigger is a 100k measurement.** At 10 000 memories the vector leg is 61 ms and
+   it scales linearly in the corpus, so the budget's 250 ms hybrid ceiling is crossed somewhere
+   around 40 000 memories. That is an extrapolation from one size and it is written here as one:
+   the next run that matters is `kiomon bench --sizes 100000` (1.9 GiB of corpus), and the
+   decision it informs is an ANN index or a narrower candidate set, not a smaller page.
+4. **`memory_embeddings` is now written by four callers** (`add`, `update`, `review approve`,
+   `reindex`) and read by one. Anything in WP8 or WP9 that writes a memory — an importer, an
+   MCP tool call — has to go through `embed_ids` or leave a row that semantic search cannot
+   find, and `doctor`'s coverage count is what notices.
+5. **The importer's round trip now includes vectors or has to say why not** (WP6's own note,
+   restated here because the vector table is new since it was written): a 384-dimensional blob
+   per memory is real weight in an export, and an export that drops it means "re-run
+   `reindex --embed` after importing", which is a thing the export's format should say.
 
 ### WP8 — Packaging and release (1 day)
 `cargo-dist` (or `release.yml` + `taplo`-style cross-compile), shell + PowerShell
@@ -1021,7 +1163,7 @@ shape last.
 | **WP5** | ⏸ **DEFERRED** to the next sprint (§9-D9, 2026-10-17) — a scope cut, not a design change: the spec below is unchanged and is the next sprint's first work package | |
 | **WP5.5** | ✅ **DONE** 2026-10-17 | `retrieve.rs` (the packet: five intents, the applicability rule, the ranking formula, the warning strings, the summary sentence — ported from the hosted `lib/retrieve.ts` and `routes/retrieve.ts`), the CLI verb with `--intent`/`--constraint`, migration `0003_link_valid_to.sql` (the column the ported conflict query needs and `0001` did not have), a bench row and a gate, and `docs/CONTRACT.md`'s packet shape. **312 tests** (218 core + 70 CLI + 24 others), clippy clean, 3 336 KiB binary. | |
 | **WP6** | ⬜ TODO | |
-| **WP7** | ⬜ TODO | |
+| **WP7** | ✅ **DONE** 2026-10-17 | `embed.rs` (the `Embedder` trait, the `ollama` and `openai` shapes over `ureq`, the deterministic `stub`, the memory-text rule, the 20 000-character cap, the prefixes), `vector.rs` (brute-force cosine, blob encoding, the zero floor), the config file (`config.toml` with `default_workspace` and `[embedder]`, the first real TOML dependency), the write path (`add`, `update`, `reindex --embed`), `--legs auto|fts|vector|graph` with the hosted spellings as aliases, `degraded`/`reason` reporting, `doctor`'s embedder and coverage report, a `similarity` per vector-leg row, a bench row and gate for the hybrid budget, and the `--config` global flag. **376 tests** (243 core + 70 CLI + 18 CLI-embed + 21 core-vector + 9 store + others), clippy clean, **3 971 KiB** binary, **49** transitive crates of 60. | |
 | **WP8** | ⬜ TODO | |
 | **WP9** | ⬜ TODO (v1.1) | |
 

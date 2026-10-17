@@ -21,12 +21,16 @@ use crate::out;
 ///
 /// # Errors
 ///
-/// Returns [`kiomon_core::Error::Config`] for `--legs vector`, which this build cannot
-/// serve, and [`kiomon_core::Error::NotFound`] for an unknown workspace.
+/// Returns [`kiomon_core::Error::Config`] for `--legs vector` with no embedder configured,
+/// for an embedder that does not answer, and [`kiomon_core::Error::NotFound`] for an
+/// unknown workspace.
 pub fn search(cli: &Cli, args: &SearchArgs) -> Result<ExitCode> {
     let db = open(cli)?;
-    let scope = read_scope(&db, args.workspace.as_deref())?;
+    let scope = read_scope(&db, cli, args.workspace.as_deref())?;
 
+    // The embedder is asked for one query vector, and it is the only call on this path
+    // that can take longer than the whole rest of the command. `--legs fts` exists for
+    // exactly this reason, and the config decides whether `auto` involves it at all.
     let outcome = db.search(&SearchQuery {
         text: args.query.clone(),
         scope,
@@ -65,6 +69,26 @@ pub fn search(cli: &Cli, args: &SearchArgs) -> Result<ExitCode> {
         }
     }
 
+    // A degraded answer is reported on stderr, before the results, and never folded into
+    // them: the rows on stdout are what the other leg found, and a reader piping them into
+    // `jq` must not have to parse prose to find out that half the search did not run.
+    if outcome.degraded {
+        out::warn(
+            cli.quiet,
+            &format!(
+                "the vector leg did not run ({}), so these results are full text only.                  `kiomon doctor` checks the embedder.",
+                outcome.reason
+            ),
+        );
+    } else if outcome.reason == "no_embedder" && args.legs.as_str() != "fts" {
+        // Not a degradation — nothing failed — but "why is my search not semantic" has
+        // exactly one answer, and it is cheaper to say it than to be asked.
+        out::warn(
+            cli.quiet,
+            "no embedder is configured, so this search was full text only. See the              [embedder] block in the config file (`kiomon doctor` prints its path).",
+        );
+    }
+
     if cli.json {
         let response = out::SearchResponse::new(&outcome, &args.query, args.legs.as_str());
         out::emit(true, response, |_| {})?;
@@ -89,7 +113,7 @@ pub fn search(cli: &Cli, args: &SearchArgs) -> Result<ExitCode> {
 /// whatever the candidate search raises.
 pub fn retrieve(cli: &Cli, args: &RetrieveArgs) -> Result<ExitCode> {
     let db = open(cli)?;
-    let scope = read_scope(&db, args.workspace.as_deref())?;
+    let scope = read_scope(&db, cli, args.workspace.as_deref())?;
 
     let packet = db.retrieve(&RetrieveQuery {
         intent: args.intent.into(),
@@ -99,6 +123,7 @@ pub fn retrieve(cli: &Cli, args: &RetrieveArgs) -> Result<ExitCode> {
         constraints: args.constraint.clone(),
         limit: usize::from(args.limit),
         record: !args.no_record,
+        legs: args.legs.into(),
         ..RetrieveQuery::default()
     })?;
 
@@ -152,7 +177,7 @@ pub fn get(cli: &Cli, args: &GetArgs) -> Result<ExitCode> {
 /// Returns [`Error::NotFound`] for an unknown workspace, and whatever the query raises.
 pub fn list(cli: &Cli, args: &ListArgs) -> Result<ExitCode> {
     let db = open(cli)?;
-    let scope = read_scope(&db, args.workspace.as_deref())?;
+    let scope = read_scope(&db, cli, args.workspace.as_deref())?;
 
     // Absent `--status` means `active`, never "everything": a bare `list` must not mix a
     // user's review inbox into their library. `--status any` is how you ask for both.

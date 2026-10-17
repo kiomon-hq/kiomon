@@ -77,18 +77,65 @@ caller can parse the error instead of guessing from stderr.
 | `--db <PATH>` | The database to use. Beats `$KIOMON_DB`, which beats the platform default path. |
 | `--json` | Emit one JSON document on stdout. |
 | `-q`, `--quiet` | Suppress non-error diagnostics on stderr. Never suppresses an error. |
+| `--config <PATH>` | The config file to read. Beats `$KIOMON_CONFIG`, which beats the platform default path. |
 | `--full` | Print whole field values instead of truncating them to fit a line. |
 
-All four are accepted before *or* after the subcommand.
+All five are accepted before *or* after the subcommand.
 
 **Human output is bounded** so a four-kilobyte body cannot become a four-kilobyte line in
 an agent's context window: `list` truncates each title to 120 characters unless `--full`
 is passed, and `get` truncates the body the same way. The `--json` path is never
 truncated — a machine asked for the field and gets the field.
 
-**Environment.** `$KIOMON_DB` overrides the default database path and `$KIOMON_WORKSPACE`
+**Environment.** `$KIOMON_DB` overrides the default database path, `$KIOMON_WORKSPACE`
 overrides what an absent `--workspace` means — still exactly one workspace, never all of
-them. There is no config file yet; the embedder (v1.1) is the first thing that needs one.
+them — and `$KIOMON_CONFIG` names the config file. `$KIOMON_EMBEDDER_API_KEY` supplies the
+bearer token for an embedder that wants one, and is the right place for it: a secret in a
+config file is a secret in every backup and every screenshot.
+
+## The config file
+
+TOML, at `--config <PATH>`, else `$KIOMON_CONFIG`, else `<data dir>/config.toml`
+(`%APPDATA%\kiomon\config.toml` on Windows, `~/Library/Application Support/kiomon/` on
+macOS, `$XDG_DATA_HOME/kiomon/` on Linux, `~/.kiomon/config.toml` as the fallback). Two
+keys, both optional:
+
+```toml
+# What a command without --workspace uses. $KIOMON_WORKSPACE beats this.
+default_workspace = "work"
+
+[embedder]
+# ollama (default) | openai | stub
+provider = "ollama"
+# Defaults to http://127.0.0.1:11434 for ollama; `openai` has no default.
+url = "http://127.0.0.1:11434"
+model = "nomic-embed-text"
+# Optional. Refuses a model that returns a different width, which is what a wrong model
+# name otherwise looks like: a corpus that mixes two spaces and gets quietly worse.
+dim = 768
+# Optional. Texts per HTTP call, and the seconds one call may take.
+batch = 64
+timeout_secs = 30
+# Optional. `nomic-embed-text` needs these and nothing tells you; most models need none.
+document_prefix = "search_document: "
+query_prefix = "search_query: "
+```
+
+A **missing** file is not an error: a brain with no config is a full-text brain, and every
+command works. A file that exists and does not parse **is** an error, and names the file and
+the line — silently ignoring a typo in `[embedder]` would look exactly like a broken
+embedder. An unknown key is an error too, for the same reason.
+
+**Plain HTTP only.** `url` must start with `http://`. Every server this is built for —
+Ollama, LM Studio, `llama.cpp`, vLLM, text-embeddings-inference — listens on plain HTTP on
+localhost, and the default build has no TLS: `ureq`'s rustls feature costs about twenty
+transitive crates against a budget of sixty (`plans/001-local-v1-core.md` §7, Appendix B),
+and about half a megabyte of binary. An `https://` URL is refused by name, with the
+workaround, rather than failing somewhere inside a handshake.
+
+**`provider = "stub"`** is not a search feature: its vectors are a hashed bag of words, so
+two texts that share words are near and two that mean the same thing are not. It exists for
+tests and for `kiomon bench`, and `doctor` says so in the one place a user looks.
 
 ## `--workspace` semantics
 
@@ -113,6 +160,12 @@ display labels and are never accepted as input.
 **Relations** — `derived_from` · `supports` · `contradicts` · `related_to` ·
 `precedes` · `follows` · `part_of`. All are directed except `related_to`, which is
 symmetric and therefore stored once.
+
+**Legs** (for `--legs`) — `auto` · `fts` · `vector` · `graph`. The hosted product's
+spellings are accepted as aliases: `hybrid` and `both` mean `auto`, `lexical` and `fulltext`
+mean `fts`, `semantic` means `vector`. `graph` is in the vocabulary and has no leg behind it
+(§9-D9): asking for it is an error that says so, which is the only answer that does not
+describe work that did not happen.
 
 **Intents** (for `retrieve`) — `execute` · `plan` · `answer` · `verify` · `debug`.
 They are the hosted route's vocabulary, the MCP tool's, and the Python SDK's
@@ -139,6 +192,7 @@ Every command is listed in `kiomon --help`. This section records what each one
 | `init` | Creates the database, applies the schema, and ensures the default workspace exists. **Idempotent**: running it twice is not an error, and it never resets an existing workspace's review mode. `--workspace <NAME>` also creates that workspace; its id is the name slugged (`Client: Acme` → `client-acme`). |
 | `doctor` | Reports the resolved path, the schema version, and the result of SQLite's `integrity_check`, `foreign_key_check` and FTS `integrity-check`, plus whether the full-text index agrees with the active memories. **Exit 0 when healthy, 1 when not** — and the report is printed either way. `--paths-only` skips the checks. Note that the checks are O(corpus): around 300 ms for a 43 MiB brain. |
 | `stats` | Counts by kind and status, in one grouped query. `--kind` filters every number it reports, so the parts still sum to the total. |
+| `reindex --embed` | Embeds every active memory that has no vector for the configured model, one page at a time, each page committed before the next is read — so an interrupted run keeps what it finished and running it again resumes. `--dry-run` counts without embedding, which is what to run first on a large brain. Exit `4` with no embedder configured: a reindex that wrote nothing and reported success would be worse than the message. |
 
 ### Writing
 
@@ -230,6 +284,46 @@ the excerpt, all of which are already fields of the row. An empty snippet is hon
 body opening that happens to sit under a title match reads as the place it matched.
 `--snippet-len` sets how many full-text tokens of context it carries, and `--full` is
 still what lets a long one through untruncated.
+
+#### What the legs promise
+
+| Leg | What it runs | What it costs |
+|---|---|---|
+| `fts` | The query ladder over FTS5, one statement per rung. Never touches an embedder, so it is the mode that cannot be slow because of the network. | Measured in §8 WP2 of the plan: 26 ms of work at ten thousand memories. |
+| `vector` | One embed call for the query, then a brute-force cosine scan of every stored vector in scope. | Measured in §8 WP7: 63 ms of work at ten thousand memories (384 dimensions), most of it reading 15 MB of blobs. |
+| `auto` (default) | Both, when an embedder is configured; the lexical leg alone when it is not. The two windows are fused with reciprocal rank, the platform's own rule: `1/(60+rank)` per leg, summed. | The sum of what ran. |
+
+**A request for one leg is answered by that leg.** `--legs vector` with no embedder
+configured, or with an embedder that does not answer, is exit `4` — never a lexical answer
+the caller did not ask for and cannot detect. `--legs fts` never embeds anything, including
+the query.
+
+**`auto` degrades visibly, and only when something failed.** Three states, and the JSON says
+which:
+
+| `legs` | `degraded` | `reason` | What happened |
+|---|---|---|---|
+| `{"fts": true, "vector": false}` | `false` | `no_embedder` | No embedder is configured. This is the documented default, not a failure. |
+| `{"fts": true, "vector": true}` | `false` | `""` | Both legs answered. |
+| `{"fts": true, "vector": false}` | `true` | `no_query_vector` | An embedder is configured and the query could not be embedded. The answer is lexical, and stderr says so. |
+| `{"fts": true, "vector": false}` | `true` | `vector_leg_failed` | The query embedded and the scan failed. |
+| `{"fts": false, "vector": true}` | `false` | `vector_only` | A vector-only request, answered with the vector leg. |
+
+`no_query_vector` and `vector_only` are the hosted door's own words, so a dashboard reading
+both products has one vocabulary. `no_embedder` is local: a local brain with no model is a
+full-text brain rather than a broken one, and calling that degraded would make the default a
+warning.
+
+**The vector leg has no similarity threshold, and one floor.** Candidates are ranked by
+cosine similarity and cut to the window; a candidate whose similarity is `0.0` or less is not
+a candidate at all, because a vector that points nowhere in common with the query carries no
+information. There is deliberately no tuned floor like `0.3`: every real embedding model is
+anisotropic, so a constant that separates signal from noise in one model throws away half the
+corpus in another. A caller that wants a floor has `similarity` on every row it came from.
+
+**The `similarity` field is not a score.** `score` is the fused rank — comparable only within
+one response. `similarity` is a cosine in the model's own space, present only on rows the
+vector leg ranked, and useful for one thing: telling a lexical hit from a semantic one.
 
 ### Retrieving
 
@@ -328,6 +422,25 @@ and `kiomon doctor` reports how long it has been (and says `never run` when it h
 run). If the nudge changed anything it is reported on stderr, and `decay --dry-run` is how
 you see what a full pass would do.
 
+#### Semantic search, end to end
+
+1. Put an `[embedder]` block in the config file (§[the config file](#the-config-file)).
+   `kiomon doctor` prints the path it would read, the provider it found, the URL it will
+   call, and how much of the corpus has a vector for the model in use.
+2. New memories are embedded as they are written — `add`, `update`, and `review approve`
+   (which repairs a draft whose embed failed at write time). **A failed embed never fails a
+   write**: the memory is stored, found lexically, and the warning on stderr names
+   `kiomon reindex --embed`.
+3. Memories written *before* the embedder existed have no vector, and only
+   `kiomon reindex --embed` can give them one. This is deliberate — embedding is work, and a
+   sweep nobody asked for competes with the command the user is waiting on — and `doctor`
+   reports the gap as `embedded/active` so it cannot be forgotten.
+4. **One model at a time.** Vectors from two models are not comparable, and a mixed corpus
+   does not error: it quietly gets worse. Every vector is keyed by model name, a search only
+   ever reads the configured model's rows, and `reindex --embed` deletes any other model's
+   rows as it goes. Switching models therefore costs a full re-embed, which is the honest
+   price of a corpus that only ever contains one space.
+
 ### Portability
 
 | Command | Promise |
@@ -385,8 +498,9 @@ what opening their own brain costs should not have to read the harness to find o
 
 ### A search result
 
-`search` and `list` return the same row; a search result is a list row with `score` and
-`snippet` added, and the two are the same struct so they cannot drift apart.
+`search` and `list` return the same row; a search result is a list row with `score`,
+`snippet` and sometimes `similarity` added, and the two are the same struct so they cannot
+drift apart.
 
 ```json
 {
@@ -407,9 +521,13 @@ what opening their own brain costs should not have to read the harness to find o
   "created_at": "2026-10-14T09:12:00Z",
 
   "snippet": "Run **migrations** before the deploy; the pipeline does not do it.",
-  "score": 0.016393442
+  "score": 0.016393442,
+  "similarity": 0.71
 }
 ```
+
+`similarity` is present only on a row the vector leg ranked, and only when the vector leg
+ran. A row that only the lexical leg found has no cosine because nothing compared one.
 
 `score` is the fused rank and is **relevance, not trust**. A hit with a `confidence`
 carries the writer's estimate of how reliable it is; a hit without one (an imported
@@ -433,19 +551,28 @@ something to say about how it answered and a list does not.
     "query": "why did the deploy fail",
     "attempt": {"outcome": "matched", "rung": 3, "query": "\"why\"* OR \"did\"* OR …"},
     "requested_legs": "auto",
-    "legs": "fts",
+    "legs": {"fts": true, "vector": true},
+    "vector_model": "nomic-embed-text",
     "degraded": false,
+    "reason": "",
     "recorded": 10
   },
   "meta": {"contract_version": "1", "version": "0.1.0"}
 }
 ```
 
-`requested_legs` and `legs` are both reported so a caller can tell what it asked for
-from what ran. With no embedder configured, `--legs auto` runs the lexical leg — that
-is the documented default and `degraded` stays `false`, because falling back to the only
-leg there is was not a degradation. `degraded` exists for the vector leg's reduced scan
-and is a constant `false` until there is an embedder.
+`requested_legs` and `legs` are both reported so a caller can tell what it asked for from
+what ran. `legs` is an **object**, the hosted door's shape (`{fts, vector}`), because a single
+string cannot tell "lexical only" from "both" apart without inventing a spelling — and this
+field was a string before WP7, when there was one leg.
+
+`vector_model` is present exactly when the vector leg ran, and `reason` is empty for a normal
+answer and otherwise names the reduced path. The five states are the table under
+[what the legs promise](#what-the-legs-promise); `no_embedder` is the one that is not a
+degradation.
+
+Each result row carries `similarity` **only** when the vector leg ranked it: see
+[the vector leg's rules](#what-the-legs-promise) for why it is not a score.
 
 ### A listed memory
 

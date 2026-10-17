@@ -18,9 +18,9 @@
 use serde::Serialize;
 
 use kiomon_core::{
-    Assessment, ContextPacket, DecayOutcome, Error, ExitCode, Memory, MemorySummaryJson,
-    OutcomeReport, PacketItem, RatingOutcome, Result, SearchAttempt, SearchHitJson, SearchOutcome,
-    Skipped,
+    Assessment, ContextPacket, DecayOutcome, EmbedReport, Error, ExitCode, LegsRun, Memory,
+    MemorySummaryJson, OutcomeReport, PacketItem, RatingOutcome, Result, SearchAttempt,
+    SearchHitJson, SearchOutcome, Skipped,
 };
 
 /// How wide a field may be on the human path before it is truncated.
@@ -169,10 +169,18 @@ pub struct SearchResponse<'a> {
     pub attempt: &'a SearchAttempt,
     /// What `--legs` asked for.
     pub requested_legs: &'static str,
-    /// What actually ran.
-    pub legs: &'static str,
+    /// Which legs answered. An object rather than a word: "lexical only", "vector only"
+    /// and "both" are three states, and the door reports them this way (`{fts, vector}`)
+    /// so that `serve` (WP9) has nothing to translate.
+    pub legs: LegsRun,
+    /// The model the query vector came from, when the vector leg ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_model: Option<&'a str>,
     /// See [`SearchOutcome::degraded`].
     pub degraded: bool,
+    /// Why: empty for a normal answer, otherwise the name of the reduced path. See
+    /// [`SearchOutcome::reason`].
+    pub reason: &'static str,
     /// How many rows had their retrieval counter moved.
     pub recorded: usize,
 }
@@ -187,10 +195,40 @@ impl<'a> SearchResponse<'a> {
             attempt: &outcome.attempt,
             requested_legs,
             legs: outcome.legs,
+            vector_model: outcome.vector_model.as_deref(),
             degraded: outcome.degraded,
+            reason: outcome.reason,
             recorded: outcome.recorded,
         }
     }
+}
+
+/// Render a `reindex --embed` report for a human.
+///
+/// The two numbers that matter are the ones a user can act on: how many memories were
+/// embedded, and how many are still missing one — the latter being the same number the
+/// next run will find.
+#[must_use]
+pub fn reindex_line(report: &EmbedReport) -> String {
+    let mut parts: Vec<String> = vec![format!("model {}", report.model)];
+    if report.dry_run {
+        parts.push(format!("{} would be embedded", report.embedded));
+    } else {
+        parts.push(format!("{} embedded", report.embedded));
+        if report.present > 0 {
+            parts.push(format!("{} already had a vector", report.present));
+        }
+    }
+    if report.truncated > 0 {
+        parts.push(format!(
+            "{} truncated to the model's window",
+            report.truncated
+        ));
+    }
+    if !report.errors.is_empty() {
+        parts.push(format!("{} failed", report.errors.len()));
+    }
+    parts.join("  ·  ")
 }
 
 /// The `data` block of a `review list` response.
@@ -913,9 +951,19 @@ pub(crate) const GATES: &[Gate] = &[
         limit_ms: 40.0,
     },
     Gate {
-        label: "search common",
+        label: "common (fts)",
         percentile: Percentile::P95,
         limit_ms: 60.0,
+    },
+    // §7's hybrid budget, and the number this work package is answerable for: one query
+    // embedding, a brute-force scan of every vector in scope, and a fusion of two legs on
+    // ten thousand memories. The ledger is in the plan's WP7 record; the short version is
+    // that the scan is 15 MB of blobs and a few million multiply-adds, which is tens of
+    // milliseconds and not hundreds.
+    Gate {
+        label: "common (hybrid)",
+        percentile: Percentile::P95,
+        limit_ms: 250.0,
     },
     // The packet, on the same query as `search common` and with its retrieval record off,
     // so this row is comparable with that one. The limit is the search budget rather than a

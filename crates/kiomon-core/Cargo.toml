@@ -25,6 +25,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # Only for ULID randomness. A hand-written ULID over a real CSPRNG is smaller than a
 # ULID crate plus its `rand` tree, and the format is 40 lines with tests.
 getrandom = "0.4"
+toml = "0.9"
+ureq = { version = "3", default-features = false }
 
 # A bench target with no harness and no dependency: it prints its own table. See the top
 # of `benches/store.rs` for why this is not Criterion, and `plans/001-local-v1-core.md`

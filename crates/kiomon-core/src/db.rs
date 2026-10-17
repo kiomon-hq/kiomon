@@ -71,6 +71,11 @@ pub struct Database {
     conn: Connection,
     path: PathBuf,
     in_memory: bool,
+    /// The optional embedder (WP7). `None` in every path that did not ask for one, which
+    /// is every test and every command that never touches the vector leg — the embedder
+    /// is the one thing here that can send a network request, and a `Database` that has
+    /// none cannot.
+    embedder: Option<std::sync::Arc<crate::embed::Embedder>>,
 }
 
 impl std::fmt::Debug for Database {
@@ -147,6 +152,7 @@ impl Database {
             conn,
             path,
             in_memory: false,
+            embedder: None,
         })
     }
 
@@ -170,16 +176,47 @@ impl Database {
             conn,
             path: PathBuf::from(":memory:"),
             in_memory: true,
+            embedder: None,
         })
     }
 
-    /// Open the database the environment points at.
+    /// Open the database the environment points at, with the embedder the config file
+    /// names.
+    ///
+    /// Reading the config here rather than in the binary is what makes `kiomon search`
+    /// semantic on a machine that has one, without every command having to remember to
+    /// attach it. A config file that does not parse fails here, before any query runs, and
+    /// the message names the file and the line.
     ///
     /// # Errors
     ///
-    /// As [`Database::open`], plus [`Error::Config`] when no path can be resolved.
+    /// As [`Database::open`], plus [`Error::Config`] when no path can be resolved or the
+    /// config file is not valid.
     pub fn open_default() -> Result<Self> {
-        Self::open(config::resolve_db_path(None)?)
+        let config = config::Config::load(None)?;
+        let embedder = config.embedder()?.map(std::sync::Arc::new);
+        Ok(Self::open(config.resolve_db_path(None)?)?.with_embedder(embedder))
+    }
+
+    /// Attach the embedder this process configured, or none.
+    ///
+    /// A builder rather than a parameter of [`Database::open`], because opening a file
+    /// and deciding how to embed text are two decisions with two sources — the second one
+    /// reads a config file the first one knows nothing about — and a test that opens a
+    /// database in memory must not have to answer the question at all.
+    #[must_use]
+    pub fn with_embedder(
+        mut self,
+        embedder: Option<std::sync::Arc<crate::embed::Embedder>>,
+    ) -> Self {
+        self.embedder = embedder;
+        self
+    }
+
+    /// The embedder this database was opened with.
+    #[must_use]
+    pub fn embedder(&self) -> Option<&crate::embed::Embedder> {
+        self.embedder.as_deref()
     }
 
     /// Where this database lives.

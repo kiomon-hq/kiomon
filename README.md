@@ -25,11 +25,12 @@ That is the whole product: **save once, query forever**, locally.
 ## Status
 
 **Pre-alpha, and it works.** `init`, `doctor`, `stats`, `add`, `update`, `get`, `list`,
-`search`, `review`, `rate`, `outcome`, `decay`, `pin`, `archive`, `restore` and `forget`
-all run end to end against a real SQLite file. The core loop — save something, find it
-again by a sentence, tell it whether what you found helped, and let what nobody uses fade
-— is complete. The graph (`link`, `relate`) and the vector leg are not, and each says so
-along with the work package that owns it.
+`search`, `retrieve`, `reindex`, `review`, `rate`, `outcome`, `decay`, `pin`, `archive`,
+`restore` and `forget` all run end to end against a real SQLite file. The core loop — save
+something, find it again by a sentence or by meaning, ask for what to use next, tell it
+whether what you found helped, and let what nobody uses fade — is complete. The graph
+(`link`, `relate`) is not, and says so along with the sprint that owns it. Import and
+export are the last verbs still to be written.
 
 The work packages in [`plans/001-local-v1-core.md`](plans/001-local-v1-core.md) §8 are
 being executed in order, and the plan records where reality contradicted it rather than
@@ -67,11 +68,27 @@ long, and one memory in seven containing the word `deploy`.
 | **`kiomon search "deploy"` (1 446 rows)** | **26.8 ms** | **38.9 ms** | 34.9 ms |
 | `kiomon search "deploy" --no-record` | 18.0 ms | 26.3 ms | 26.4 ms |
 | `kiomon search "deploy" --limit 50` | 21.9 ms | 33.1 ms | 30.5 ms |
+| `kiomon search "deploy" --legs vector` (384 dims) | 61.1 ms | 98.2 ms | 72.4 ms |
+| **`kiomon search "deploy"` (both legs, stub embedder)** | **81.6 ms** | **123.5 ms** | 92.0 ms |
+| `kiomon retrieve "deploy"` (context packet, lexical) | 24.1 ms | 37.3 ms | 35.8 ms |
 
-Binary **3.2 MiB** from **33** transitive crates. The plan's gates are `open` p50 ≤ 5 ms,
-`add` p95 ≤ 40 ms and `search` p95 ≤ 60 ms at ten thousand memories: all met, with the
-first write to a brand-new database file the one number that is genuinely expensive —
-**16.6 ms**, against 3 ms for the next write into the same file.
+Binary **3.9 MiB** from **49** transitive crates. The plan's gates are `open` p50 ≤ 5 ms,
+`add` p95 ≤ 40 ms, `search` p95 ≤ 60 ms (lexical) and ≤ 250 ms (hybrid) at ten thousand
+memories: all met, with the first write to a brand-new database file the one number that is
+genuinely expensive — **16.6 ms**, against 3 ms for the next write into the same file.
+
+The two vector rows come from a later session than the rest of the table, on the same
+machine — its spawn floor was 10.9 ms against 8.2 ms, which is the drift the harness prints
+the floor to expose.
+
+Both are measured with the built-in **stub** embedder — a hashed bag of words:
+microseconds, deterministic, no network. That is the point of it: what those rows measure is
+this program's work (one query embedding, a scan of every stored vector, one fusion) and not
+a model's latency, which is a property of whatever server you point it at. At ten thousand
+memories the vector leg is 61 ms of work and almost all of it is SQLite handing over 15 MB of
+blobs; four million multiply-adds cost about 2 ms. It scales with the corpus, so the 250 ms
+ceiling is crossed somewhere around 40 000 memories — an extrapolation from one size, and the
+next measurement that matters is `kiomon bench --sizes 100000`.
 
 Four things worth knowing before quoting any of these:
 
@@ -104,7 +121,7 @@ compare. `kiomon bench --repeat 3` prints each pass's median beside the verdict.
 | **Four memory kinds** | `reference` · `semantic` · `procedural` · `episodic` — Files, Facts, Routines, Moments — each with the metadata that makes it retrievable (domain, entities, claims, source refs, timestamps, triggers). |
 | **Retrieval that copes with what you actually type** | *(WP2)* A sentence is tried three ways — the phrase, then all its terms prefix-matched, then any of them — and the first that finds anything wins. Every term is quoted, so punctuation is never an error and a Japanese or accented query is never mangled. `bm25()` weights title over tags over excerpt over body, and results come back with **the match in context**. |
 | **The context packet** | `retrieve` answers a different question from `search`: not *what matches* but *what should I use, given what I am about to do*. Declare one of five intents (`execute`, `plan`, `answer`, `verify`, `debug`) and get back the applicable facts, **one** best procedure, the relevant episodes, evidence pointers, and warnings about what not to trust — expired, low confidence, superseded, contradictory. `claim` is the most specific line the writer stored, never a model's summary of it, and `constraints` are the only thing applicability is judged on. It is the payload both published SDKs lead with, and on a 10 000-memory corpus it costs about what the search under it costs (18 ms of work against 17 ms, retrieval record off). |
-| **Hybrid retrieval** | *(WP7)* The same ranking fused with an optional vector leg by reciprocal rank (`k = 60`), on the formula the hosted product uses. `--legs vector` exits `4` and names what to pass instead — it is never quietly answered from the lexical leg. |
+| **Hybrid retrieval** | The same ranking fused with a vector leg by reciprocal rank (`k = 60`), on the formula the hosted product uses. **Bring your own model**: point `[embedder]` at Ollama or any OpenAI-compatible server and every write embeds itself; nothing is downloaded, no ONNX runtime is linked, and a brain with no `[embedder]` block is a full-text brain rather than a broken one. `--legs fts` never touches the network, `--legs vector` exits `4` with the config key to add rather than being quietly answered from the lexical leg, and `auto` says *why* when the vector leg did not run. `kiomon reindex --embed` backfills what predates the embedder, and `doctor` reports the coverage gap. |
 | **Lifecycle** | Confidence, importance, strength, pin, archive, rating, and honest decay — unpinned memories weaken on a per-kind half-life (`episodic 30d`, `procedural 90d`, `semantic 180d`, stretched up to 2× by use), and pass below `0.05` into the archive rather than into oblivion. `reference` memories never decay: a file you saved is not a claim that gets less true. Decay is a command, not a daemon, and `add` nudges it at most once a day; `doctor` tells you when it has not run. |
 | **Review inbox** | Agent writes below the confidence threshold land pending until approved, and **a pending memory is not in the index at all** — a review inbox that leaks into retrieval is worse than none. `review approve` activates and indexes it, `review reject` archives it rather than deleting it, and a draft's `--derived-from` provenance waits on the row until it is allowed to become an edge. |
 | **Knowledge graph** | **Not in v1** — deferred to the next sprint (§9-D9 of the plan). The schema is here and `--ref` already writes a `derived_from` edge, but `link`, `unlink`, `relate` and the auto-link pass are not, and they say *deferred* rather than *coming in this release*: an agent that waits for a package it cannot look up waits for nothing. |
@@ -117,7 +134,11 @@ compare. `kiomon bench --repeat 3` prints each pass's median beside the verdict.
 ## What it deliberately is not
 
 - **Not a cloud client.** No network call on any default path. The one optional
-  exception is the embedder you configure yourself, which is off unless you set it.
+  exception is the embedder you configure yourself, which is off unless you set it — and
+  which this build reaches over **plain HTTP only** (`http://`), because TLS in the default
+  build costs about twenty transitive crates against the plan's budget of sixty. Ollama, LM
+  Studio, `llama.cpp`, vLLM and text-embeddings-inference all serve plain HTTP on localhost;
+  an `https://` URL is refused by name with the workaround.
 - **Not an LLM.** No tagging, no extraction, no summarisation, no chat. The agent
   supplies `entities`, `claims`, and `domain` when it writes — which is exactly what
   the hosted product's `draft_memory` tool asks for to skip its paid pass.
@@ -158,6 +179,15 @@ Not yet packaged — build it from source for now (`cargo build --release`). The
 kiomon add --kind semantic --title "Staging deploys need a manual migration"            --body "Run migrations before the deploy; the pipeline does not do it."            --tag deploy --tag staging --domain infra
 
 kiomon search "why did the deploy fail"   # ranked, with the match in context
+
+# Optional: semantic search, over a model you already run.
+# Put this in the config file `kiomon doctor --paths-only` prints:
+#   [embedder]
+#   provider = "ollama"
+#   model = "nomic-embed-text"
+# Then backfill what you already had, and search by meaning:
+kiomon reindex --embed
+kiomon search "the rollout went sideways" # finds it without sharing a word
 kiomon search "café" --kind semantic      # accents and CJK work
 kiomon list                               # unranked: strongest first, one line each
 kiomon get k_01JC9W5K2Q                   # the whole memory

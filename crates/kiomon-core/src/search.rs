@@ -46,7 +46,7 @@ use crate::error::{Error, Result};
 use crate::fuse;
 use crate::model::SearchSort::Relevance;
 use crate::model::{
-    Legs, Memory, SearchAttempt, SearchHit, SearchOutcome, SearchQuery, SearchSort,
+    Legs, LegsRun, Memory, SearchAttempt, SearchHit, SearchOutcome, SearchQuery, SearchSort,
     WINDOW_OVERFETCH,
 };
 use crate::store::{MEMORY_COLUMNS, kind_filter, row_to_memory, scope_clause};
@@ -170,39 +170,65 @@ fn normalize_snippet(raw: &str) -> String {
 impl Database {
     /// Search the brain.
     ///
-    /// One ranked read plus, unless recording is off, one counter bump per returned row.
-    /// The bump is not telemetry: `retrieval_count` and `last_retrieved_at` are the decay
-    /// clock's stretch factor, so a memory that keeps being used is a memory that keeps
-    /// mattering.
+    /// One ranked read per leg plus, unless recording is off, one counter bump per
+    /// returned row. The bump is not telemetry: `retrieval_count` and
+    /// `last_retrieved_at` are the decay clock's stretch factor, so a memory that keeps
+    /// being used is a memory that keeps mattering.
+    ///
+    /// # The legs, and what a failure of one is
+    ///
+    /// `--legs fts` is one statement and no network, always. `--legs vector` is the
+    /// embedder and the brute-force scan and nothing else, and a failure there is an
+    /// **error**: a caller that asked for meaning and got substring matches has been
+    /// given something it cannot detect. `--legs auto` runs lexical and, when an embedder
+    /// is configured, the vector leg as well; when the embedder fails there it answers
+    /// from the lexical leg and *says so* — `degraded` plus a `reason`, which is what the
+    /// hosted product's door reports, and the reason a silent lexical fallback is not
+    /// acceptable: it looks like a relevance regression and is diagnosable as nothing.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Config`] for [`crate::model::Legs::Vector`], which this build
-    /// cannot serve, and [`Error::Database`] if a query fails.
+    /// Returns [`Error::Config`] when `--legs vector` was asked for and no embedder is
+    /// configured, when the query could not be embedded, or when the graph leg was asked
+    /// for — plus the embedder's own configuration errors. Returns [`Error::Database`]
+    /// when a query fails.
     pub fn search(&self, query: &SearchQuery) -> Result<SearchOutcome> {
-        let legs = match query.legs {
-            Legs::Auto | Legs::Fts => "fts",
-            // Not a fallback. The platform learned this the expensive way: answering a
-            // request for one thing with another thing returns something the caller did
-            // not ask for and cannot detect. §4.2 of the plan says never silently
-            // approximate, and exit code 4 exists so that "I cannot" is distinguishable
-            // from "there is nothing".
-            Legs::Vector => {
-                return Err(Error::Config(
-                    "`--legs vector` needs an embedder, and this build has none: the vector \
-                     leg arrives with the embedder. Use `--legs fts`, or `--legs auto`, \
-                     which is full text only until then."
-                        .to_owned(),
-                ));
-            }
-        };
+        // The plan's rule, in one line: a request for one leg is answered by that leg.
+        // `vector` used to run the lexical leg too, which made `legs` report `fts: true` on a
+        // vector-only request — a row that looks like a fusion and is a leak of the leg the
+        // caller asked not to use.
+        let want_fts = query.legs != Legs::Vector;
+        // Not a fallback. The platform learned this the expensive way: answering a
+        // request for one thing with another thing returns something the caller did not
+        // ask for and cannot detect. §4.2 of the plan says never silently approximate,
+        // and exit code 4 exists so that "I cannot" is distinguishable from "there is
+        // nothing".
+        if query.legs == Legs::Graph {
+            return Err(Error::Deferred {
+                command: "search --legs graph",
+            });
+        }
+        if query.legs == Legs::Vector && self.embedder().is_none() {
+            return Err(Error::Config(
+                "`--legs vector` needs an embedder, and none is configured. Add an \
+                 [embedder] block to the config file — `provider = \"ollama\"` and \
+                 `model = \"nomic-embed-text\"` is the shortest one that works — or run \
+                 `--legs fts`, which never touches the network."
+                    .to_owned(),
+            ));
+        }
 
         let Some(ladder) = Ladder::new(&query.text) else {
             return Ok(SearchOutcome {
                 hits: Vec::new(),
                 attempt: SearchAttempt::NothingAsked,
-                legs,
+                legs: LegsRun {
+                    fts: query.legs != Legs::Vector,
+                    vector: false,
+                },
                 degraded: false,
+                reason: "",
+                vector_model: None,
                 recorded: 0,
             });
         };
@@ -211,71 +237,67 @@ impl Database {
         // could set to zero.
         let window = query.limit.max(1).saturating_mul(WINDOW_OVERFETCH);
 
-        // Zipped with an explicit 1-based counter rather than tracked by `enumerate`,
-        // because the number is reported to a caller and read by a human: "rung 2 of 3"
-        // is a thing a person can reason about, and "rung 1 of 0..=2" is not.
-        let mut matched: Option<(u8, String, Vec<i64>)> = None;
-        for (rung, expression) in (1..=LADDER_RUNGS).zip(ladder.rungs()) {
-            let ranked = self.lexical_window(expression, query, window)?;
-            if !ranked.is_empty() {
-                matched = Some((rung, expression.clone(), ranked));
-                break;
-            }
-        }
-
-        let Some((rung, expression, ranked)) = matched else {
-            return Ok(SearchOutcome {
-                hits: Vec::new(),
-                attempt: SearchAttempt::Exhausted {
+        // The lexical leg, when it is wanted. The ladder is climbed for its own sake and
+        // its result is one of the fused legs, not a fallback chain that short-circuits
+        // the vector leg.
+        let (attempt, lexical) = if want_fts {
+            self.lexical_leg(query, &ladder, window)?
+        } else {
+            (
+                SearchAttempt::Exhausted {
                     query: ladder.last().to_owned(),
                 },
-                legs,
-                degraded: false,
-                recorded: 0,
-            });
+                None,
+            )
         };
 
-        // Fusion is handed the window, not the page: the page is cut after ordering, and
-        // a fusion that had already truncated to `limit` would make `--sort` and the pin
-        // hoist no-ops. With one leg this preserves the leg's order exactly, so nothing
-        // about the ranking depends on the fusion being here yet.
-        let fused = fuse::fuse(&[ranked], window as usize);
-        let window_rowids: Vec<i64> = fused.iter().map(|(mem_id, _)| *mem_id).collect();
-        let mut by_rowid = self.memories_by_rowid(&window_rowids)?;
+        // The vector leg. Its own method because a search is two legs and the second one
+        // has four ways to go wrong: no embedder, an embedder that will not answer, a leg
+        // that fails after answering, and a vector-only request that must error rather than
+        // fall back. All four are rules a reader needs to see together.
+        let VectorLeg {
+            rows: vector,
+            similarities,
+            model: vector_model,
+            degraded,
+            reason,
+        } = self.vector_leg(query, window)?;
 
-        // The window and the page, kept side by side: the page is what the caller gets and
-        // the window is what they were cut from, and the snippets are asked for by the
-        // rowid the window knows and the page does not carry.
-        let mut hits: Vec<SearchHit> = Vec::with_capacity(window_rowids.len());
-        let mut page_rowids: Vec<i64> = Vec::with_capacity(window_rowids.len());
-        for (mem_id, score) in fused {
-            // A row in the leg and not in the table means the two queries disagreed about
-            // the corpus, which two statements in autocommit can do if another process
-            // purged a memory between them. Skipping is right: the row is gone.
-            if let Some(memory) = by_rowid.remove(&mem_id) {
-                page_rowids.push(mem_id);
-                hits.push(SearchHit {
-                    memory,
-                    score,
-                    snippet: String::new(),
+        let run = LegsRun {
+            fts: lexical.is_some(),
+            vector: vector.is_some(),
+        };
+
+        // Nothing from either leg. Reported before the empty page so the outcome still
+        // says which legs ran and whether one of them was reduced.
+        let (lexical, vector) = match (lexical, vector) {
+            (None, None) => {
+                return Ok(SearchOutcome {
+                    hits: Vec::new(),
+                    attempt,
+                    legs: run,
+                    degraded,
+                    reason,
+                    vector_model,
+                    recorded: 0,
                 });
             }
-        }
+            // A window survives only when a leg produced one: an empty `Some(vec![])` would
+            // add a seat at the fusion table that can never win, and `legs` is derived from
+            // those options.
+            (None, Some(vector)) => (None, Some(vector)),
+            (Some(lexical), vector) => (Some(lexical), vector),
+        };
 
-        cut(&mut hits, query.sort, query.limit as usize);
-        page_rowids.truncate(hits.len());
-
-        // Snippets last, and only for the page — see `snippets` for why this is a
-        // statement of its own rather than a column of the ranked one.
-        let mut snippets = self.snippets(&expression, query.snippet_tokens, &page_rowids)?;
-        for (index, hit) in hits.iter_mut().enumerate() {
-            // `page_rowids` is in the same order as `hits` — both were built in the loop
-            // above and then cut together — so the index pairs them.
-            hit.snippet = page_rowids
-                .get(index)
-                .and_then(|rowid| snippets.remove(rowid))
-                .map_or_else(String::new, |raw| normalize_snippet(&raw));
-        }
+        let hits = self.fuse_page(
+            query,
+            [lexical, vector],
+            &similarities,
+            match &attempt {
+                SearchAttempt::Matched { query, .. } => Some(query.as_str()),
+                _ => None,
+            },
+        )?;
 
         let recorded = if query.record {
             let ids: Vec<String> = hits.iter().map(|hit| hit.memory.id.clone()).collect();
@@ -286,14 +308,197 @@ impl Database {
 
         Ok(SearchOutcome {
             hits,
-            attempt: SearchAttempt::Matched {
-                rung,
-                query: expression,
-            },
-            legs,
-            degraded: false,
+            attempt,
+            legs: run,
+            degraded,
+            reason,
+            vector_model,
             recorded,
         })
+    }
+
+    /// Climb the ladder and return the first rung that matched.
+    ///
+    /// Zipped with an explicit 1-based counter rather than tracked by `enumerate`, because
+    /// the number is reported to a caller and read by a human: "rung 2 of 3" is a thing a
+    /// person can reason about, and "rung 1 of 0..=2" is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] if a rung's query fails.
+    fn lexical_leg(
+        &self,
+        query: &SearchQuery,
+        ladder: &Ladder,
+        window: u32,
+    ) -> Result<(SearchAttempt, Option<Vec<i64>>)> {
+        let mut attempt = SearchAttempt::NothingAsked;
+        for (rung, expression) in (1..=LADDER_RUNGS).zip(ladder.rungs()) {
+            let ranked = self.lexical_window(expression, query, window)?;
+            if !ranked.is_empty() {
+                return Ok((
+                    SearchAttempt::Matched {
+                        rung,
+                        query: expression.clone(),
+                    },
+                    Some(ranked),
+                ));
+            }
+            if rung == LADDER_RUNGS {
+                attempt = SearchAttempt::Exhausted {
+                    query: expression.clone(),
+                };
+            }
+        }
+        Ok((attempt, None))
+    }
+
+    /// Fuse the legs, hydrate the window, cut the page, and fill the snippets.
+    ///
+    /// Fusion is handed the windows and not the pages: the page is cut after ordering, and a
+    /// fusion that had already truncated to `limit` would make `--sort` and the pin hoist
+    /// no-ops. With one leg this preserves the leg's order exactly; with two it is the
+    /// platform's `rrf.ts` over both — reciprocal rank, not score, so a leg's score scale
+    /// never has to be comparable with the other's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] if the window cannot be read or a snippet query fails.
+    fn fuse_page(
+        &self,
+        query: &SearchQuery,
+        legs: [Option<Vec<i64>>; 2],
+        similarities: &HashMap<i64, f32>,
+        expression: Option<&str>,
+    ) -> Result<Vec<SearchHit>> {
+        let window = query.limit.max(1).saturating_mul(WINDOW_OVERFETCH);
+        let legs: Vec<Vec<i64>> = legs
+            .into_iter()
+            .flatten()
+            .filter(|leg| !leg.is_empty())
+            .collect();
+        let fused = fuse::fuse(&legs, window as usize);
+        let window_rowids: Vec<i64> = fused.iter().map(|(mem_id, _)| *mem_id).collect();
+        let mut by_rowid = self.memories_by_rowid(&window_rowids)?;
+
+        // The window and the page, kept side by side: the page is what the caller gets and
+        // the window is what they were cut from, and the snippets are asked for by the rowid
+        // the window knows and the page does not carry.
+        let mut hits: Vec<SearchHit> = Vec::with_capacity(window_rowids.len());
+        let mut page_rowids: Vec<i64> = Vec::with_capacity(window_rowids.len());
+        for (mem_id, score) in fused {
+            // A row in the leg and not in the table means the two queries disagreed about
+            // the corpus, which two statements in autocommit can do if another process purged
+            // a memory between them. Skipping is right: the row is gone.
+            if let Some(memory) = by_rowid.remove(&mem_id) {
+                page_rowids.push(mem_id);
+                hits.push(SearchHit {
+                    memory,
+                    score,
+                    snippet: String::new(),
+                    similarity: similarities.get(&mem_id).copied(),
+                });
+            }
+        }
+
+        cut(&mut hits, query.sort, query.limit as usize);
+        page_rowids.truncate(hits.len());
+
+        // Snippets last, and only for the page — see `snippets` for why this is a statement
+        // of its own rather than a column of the ranked one. A page with no lexical match at
+        // all (`--legs vector`) has no expression to ask with, so it asks for nothing.
+        if let Some(expression) = expression {
+            let mut snippets = self.snippets(expression, query.snippet_tokens, &page_rowids)?;
+            for (index, hit) in hits.iter_mut().enumerate() {
+                // `page_rowids` is in the same order as `hits` — both were built in the loop
+                // above and then cut together — so the index pairs them.
+                hit.snippet = page_rowids
+                    .get(index)
+                    .and_then(|rowid| snippets.remove(rowid))
+                    .map_or_else(String::new, |raw| normalize_snippet(&raw));
+            }
+        }
+        // A row the vector leg found alone has no matched term to highlight, and an empty
+        // snippet makes it look like a broken result. Its excerpt is what its writer said the
+        // memory was about, and it is already display text.
+        for hit in &mut hits {
+            if hit.snippet.is_empty() {
+                hit.snippet = hit.memory.excerpt.trim().to_owned();
+            }
+        }
+        Ok(hits)
+    }
+
+    /// The vector leg, and everything that can go wrong in it.
+    ///
+    /// Returns the ranked rowids when the leg ran, plus everything the outcome has to
+    /// report when it did not: whether the answer is degraded, why, and which model the
+    /// query vector came from.
+    ///
+    /// # Errors
+    ///
+    /// Returns the embedder's own error when `--legs vector` was asked for. A vector-only
+    /// request is never answered from the lexical leg, so a failure there is a failure and
+    /// not a degradation — the one branch where this function does not report and continue.
+    fn vector_leg(&self, query: &SearchQuery, window: u32) -> Result<VectorLeg> {
+        let mut state = VectorLeg::idle();
+        // A `Ladder` only exists when the query had terms in it (`Ladder::new` returns
+        // `None` for an empty one), so there is nothing further to check about it here.
+        if query.legs == Legs::Fts {
+            // Nothing to ask: a lexical search never embeds, and an empty query has no
+            // vector worth computing. `reason` stays empty for the lexical case, which is
+            // not a leg that failed but a leg that was not asked for.
+            if query.legs == Legs::Vector {
+                state.reason = "vector_only";
+            }
+            return Ok(state);
+        }
+        let Some(embedder) = self.embedder() else {
+            state.reason = "no_embedder";
+            return Ok(state);
+        };
+        let query_vector = match embedder.embed_query(&query.text) {
+            // A query that could not be embedded is a degradation for `auto` and a failure
+            // for `vector`, and the reason is the door's own name for it, so a dashboard
+            // reading both products has one vocabulary.
+            Err(error) => {
+                if query.legs == Legs::Vector {
+                    return Err(error);
+                }
+                state.degraded = true;
+                state.reason = "no_query_vector";
+                return Ok(state);
+            }
+            Ok(vector) => vector,
+        };
+        match self.vector_window(
+            embedder.model(),
+            &query_vector,
+            &query.scope,
+            &query.kinds,
+            window,
+        ) {
+            Err(error) => {
+                if query.legs == Legs::Vector {
+                    return Err(error);
+                }
+                state.degraded = true;
+                state.reason = "vector_leg_failed";
+            }
+            Ok((candidates, _scanned)) => {
+                state.model = Some(embedder.model().to_owned());
+                if !candidates.is_empty() {
+                    for candidate in &candidates {
+                        state.similarities.insert(candidate.mem_id, candidate.score);
+                    }
+                    state.rows = Some(candidates.into_iter().map(|hit| hit.mem_id).collect());
+                }
+                if query.legs == Legs::Vector {
+                    state.reason = "vector_only";
+                }
+            }
+        }
+        Ok(state)
     }
 
     /// One leg's ranked window: the rowids of the best `limit` rows for one FTS5
@@ -476,6 +681,37 @@ fn cut(hits: &mut Vec<SearchHit>, sort: SearchSort, limit: usize) {
         hits.sort_by_key(|hit| !hit.memory.pinned);
     }
     hits.truncate(limit);
+}
+
+/// What the vector leg produced, and what a caller has to say about it.
+///
+/// A struct rather than four mutable locals threaded through the leg's branches: the four
+/// travel together, and one of them (`reason`) has to be empty for a normal answer, which is
+/// the field most easily forgotten in a match arm.
+struct VectorLeg {
+    /// The ranked rowids, when the leg ran and found candidates.
+    rows: Option<Vec<i64>>,
+    /// Cosine similarity per rowid, for the page's `similarity` field.
+    similarities: HashMap<i64, f32>,
+    /// The model the query vector came from.
+    model: Option<String>,
+    /// Whether the leg ran in a reduced form.
+    degraded: bool,
+    /// Why, in the door's vocabulary. Empty for a normal answer.
+    reason: &'static str,
+}
+
+impl VectorLeg {
+    /// Nothing has run yet: the state every early return starts from.
+    fn idle() -> Self {
+        Self {
+            rows: None,
+            similarities: HashMap::new(),
+            model: None,
+            degraded: false,
+            reason: "",
+        }
+    }
 }
 
 #[cfg(test)]
