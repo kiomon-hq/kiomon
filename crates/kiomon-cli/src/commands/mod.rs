@@ -40,7 +40,7 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
 
         Command::Add(args) => write::add(cli, args),
         Command::Update(args) => write::update(cli, args),
-        Command::Import(args) => write::import(cli, args),
+        Command::Import(args) => portability::import(cli, args),
         Command::Link(args) => write::link(cli, args),
         Command::Unlink(args) => write::unlink(cli, args),
         Command::Relate(args) => write::relate(cli, args),
@@ -65,23 +65,16 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
     }
 }
 
-/// What a command that its work package has not written yet returns.
-///
-/// The work-package number is in the message on purpose: this project is being built in
-/// public against `plans/001-local-v1-core.md`, and "not implemented yet (work package
-/// 4)" is a more useful thing to read than "not implemented". The variant disappears by
-/// WP8.
-pub(crate) fn pending(command: &'static str, wp: u8) -> Result<ExitCode> {
-    Err(Error::Unimplemented { command, wp })
-}
+// WP6 emptied this file of its last caller. `pending` lived here from WP0, when `export`
+// and `import` returned it; every verb in the plan's §6.1 now either works or says why it
+// does not (§9-D9). `Error::Unimplemented` stays for the package that next needs it —
+// WP9's `serve` routes, which are answered by that same envelope rather than by a new one.
 
 /// Refuse a command this release deliberately left out (§9-D9).
 ///
-/// The message is different from [`pending`]'s on purpose. "Work package 5" describes a
-/// package in a plan that is being executed, which a caller reasonably reads as "coming in
-/// this release"; `link` and `relate` are not, and an agent that waits for them waits for
-/// nothing. Whoever needs the graph is told that it is the next sprint's work, not that it
-/// is on its way.
+/// `link` and `relate` are not "coming in this release", and an agent that waits for them
+/// waits for nothing. Whoever needs the graph is told that it is the next sprint's work,
+/// not that it is on its way.
 pub(crate) fn deferred(command: &'static str) -> Result<ExitCode> {
     Err(Error::Deferred { command })
 }

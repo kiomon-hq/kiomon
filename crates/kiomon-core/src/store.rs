@@ -36,11 +36,12 @@ use crate::error::{Error, Result};
 use crate::gate;
 use crate::hash;
 use crate::id;
+use crate::import::{ExportRecord, ImportBatch, ImportOutcome, ImportRow, ImportState};
 use crate::metadata;
 use crate::model::{
-    AddOutcome, EmbedReport, EmbedState, ForgetOutcome, KindCount, ListQuery, ListSort, Memory,
-    MemoryKind, MemoryPatch, NewMemory, Relation, ReviewMode, Scope, Stats, Status, StatusCount,
-    UpdateOutcome,
+    AddOutcome, EmbedReport, EmbedState, ForgetOutcome, KindCount, ListQuery, ListSort,
+    MAX_BODY_BYTES, MAX_EXCERPT, MAX_TITLE, Memory, MemoryKind, MemoryPatch, NewMemory, Relation,
+    ReviewMode, Scope, Stats, Status, StatusCount, UpdateOutcome,
 };
 
 /// Every column a [`Memory`] needs, in one place so a query cannot half-populate a row.
@@ -54,6 +55,14 @@ pub(crate) const MEMORY_COLUMNS: &str = "
     last_retrieved_at, feedback_score, feedback_count, pinned, status, expires_at,
     created_at, updated_at
 ";
+
+/// How many columns [`MEMORY_COLUMNS`] holds.
+///
+/// The export's `SELECT` appends one column to that list, and a mapper that read by
+/// position would need to know where the list ends. Counting here, once, next to the list
+/// itself, is what keeps the two from drifting — `MEMORY_COLUMNS` is a string, so nothing
+/// else can count it.
+pub(crate) const MEMORY_COLUMN_COUNT: usize = 23;
 
 /// The timestamp expression every date column is written with: RFC 3339, UTC, second
 /// precision, produced by SQLite's clock so there is exactly one clock in the system.
@@ -69,6 +78,52 @@ const INSERT_MEMORY_SQL: &str = "INSERT INTO memories (
         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
         strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
         strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+     )";
+
+/// The text limits every write shares, checked in one place.
+///
+/// One rule for `add`, `update` and `import` rather than a stricter importer: a memory the
+/// file may hold and the CLI may not is a memory the user cannot fix, and the numbers are
+/// the hosted route's own (see [`MAX_TITLE`]) so a local memory is one the hosted product
+/// would accept too.
+fn check_text_limits(title: &str, excerpt: &str, body: &str) -> Result<()> {
+    let title_len = title.chars().count();
+    if title_len > MAX_TITLE {
+        return Err(Error::Invalid(format!(
+            "the title is {title_len} characters, over the {MAX_TITLE}-character limit"
+        )));
+    }
+    let excerpt_len = excerpt.chars().count();
+    if excerpt_len > MAX_EXCERPT {
+        return Err(Error::Invalid(format!(
+            "the excerpt is {excerpt_len} characters, over the {MAX_EXCERPT}-character limit"
+        )));
+    }
+    if body.len() > MAX_BODY_BYTES {
+        return Err(Error::Invalid(format!(
+            "the body is {} bytes, over the {MAX_BODY_BYTES}-byte limit. A memory is a              memory, not a file: save the path instead.",
+            body.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The insert an imported line uses, with the id and the lifecycle supplied.
+///
+/// `created_at` and `updated_at` are `COALESCE`d rather than required: a hand-written line
+/// has no reason to carry them, and "now" is the only other honest answer. Everything else
+/// is the file's own value, including the counters and `strength` — see [`insert_imported`].
+const INSERT_IMPORTED_SQL: &str = "INSERT INTO memories (
+        id, workspace_id, kind, title, excerpt, body, tags, tags_text,
+        memory_metadata, source, source_url, confidence, importance, strength,
+        corroboration_count, retrieval_count, last_retrieved_at, feedback_score,
+        feedback_count, pinned, status, expires_at, content_hash, pending_derived_from,
+        created_at, updated_at
+     ) VALUES (
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+        ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+        COALESCE(?25, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        COALESCE(?26, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
      )";
 
 /// The update statement, with `COALESCE` for "leave this alone".
@@ -252,6 +307,16 @@ impl Database {
                     .to_owned(),
             ));
         }
+
+        // Checked on the row that would result rather than on the patch: a body that was
+        // already over the limit — imported by an older build, or written before the limit
+        // existed — must not become un-editable, and `--title` alone must not slip past a
+        // body check nobody ran.
+        check_text_limits(
+            patch.title.as_deref().unwrap_or(&existing.title),
+            patch.excerpt.as_deref().unwrap_or(&existing.excerpt),
+            patch.body.as_deref().unwrap_or(&existing.body),
+        )?;
 
         let tags = patch
             .tags
@@ -821,6 +886,136 @@ impl Database {
         Ok(out)
     }
 
+    /// One page of an export, oldest id first.
+    ///
+    /// Keyset pagination on `id`, not `LIMIT/OFFSET`: the ULID sorts chronologically, so
+    /// `id > cursor` is both the order and the cursor, and page five thousand costs what
+    /// page one costs. An export of a 100 000-memory brain is 100 000 rows, and the
+    /// difference between keyset and offset on that is the difference between streaming
+    /// and quadratic.
+    ///
+    /// The whole row comes back, `pending_derived_from` included, so the caller does not
+    /// have to go back for it per draft — one query per page is the budget, and a
+    /// per-row lookup for the sake of a column nobody usually has would break it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] if a page cannot be read.
+    pub fn export_page(
+        &self,
+        scope: &Scope,
+        status: Option<Status>,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<ExportRecord>> {
+        // `fmt::Write` so a clause is appended with `write!` rather than a throwaway
+        // `format!` per filter — the same choice `list` makes, for the same reason.
+        use std::fmt::Write as _;
+
+        let mut sql =
+            format!("SELECT {MEMORY_COLUMNS}, pending_derived_from FROM memories WHERE 1 = 1");
+        let mut values: Vec<Sql> = Vec::new();
+        let (clause, scope_values) = scope_clause(None, scope);
+        sql.push_str(&clause);
+        values.extend(scope_values);
+        if let Some(status) = status {
+            // The `as_str()` enum literal is the one interpolation this file allows: it
+            // cannot be user input, and a bound parameter here would stop SQLite using
+            // the status half of `idx_mem_ws_status_created` for the filter.
+            let _ = write!(sql, " AND status = '{}'", status.as_str());
+        }
+        if let Some(cursor) = after {
+            sql.push_str(" AND id > ?");
+            values.push(Sql::Text(cursor.to_owned()));
+        }
+        sql.push_str(" ORDER BY id ASC LIMIT ?");
+        values.push(Sql::Integer(i64::from(limit)));
+
+        let mut statement = self.conn().prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            let memory = row_to_memory(row)?;
+            let pending: Option<String> = row.get(MEMORY_COLUMN_COUNT)?;
+            Ok(ExportRecord::from_memory(&memory, pending.as_deref()))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Write a page of imported rows, in one transaction.
+    ///
+    /// Three outcomes per row, in this order: the id is already here, the *content* is
+    /// already here under another id, or the row is written. The order is what makes
+    /// re-importing an export a no-op — a second `import` of the same file finds every id
+    /// present and writes nothing — and the content check is what keeps two exports of one
+    /// brain (one from before a memory was re-saved under a new id) from producing a
+    /// duplicate.
+    ///
+    /// `dry_run` runs the whole thing in a transaction and rolls it back, so the counts a
+    /// dry run reports are the counts the real run would produce, including duplicates
+    /// *inside* the file being imported. Nothing else can tell that story without a second
+    /// implementation of the same rules, and a second implementation is where the two
+    /// would disagree.
+    ///
+    /// A workspace the page mentions is created if it is missing. An export carries the
+    /// workspace ids it was written from, and refusing to restore one because the target
+    /// has not heard of it would make the format a fair-weather one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] if a statement fails, and [`Error::Invalid`] if an id
+    /// cannot be generated. Rows are validated before they arrive, so a data problem is a
+    /// caller bug rather than something this reports per row.
+    pub fn import_batch(&self, rows: &[ImportRow], dry_run: bool) -> Result<ImportBatch> {
+        let transaction = self.conn().unchecked_transaction()?;
+        let mut batch = ImportBatch {
+            outcomes: Vec::with_capacity(rows.len()),
+            created_workspaces: Vec::new(),
+            committed: false,
+        };
+
+        for row in rows {
+            let created_here = ensure_workspace_for(&transaction, &row.workspace_id)?;
+            if created_here && !batch.created_workspaces.contains(&row.workspace_id) {
+                batch.created_workspaces.push(row.workspace_id.clone());
+            }
+
+            let id = match &row.id {
+                Some(id) => id.clone(),
+                None => id::new_memory_id()?,
+            };
+            let state = if memory_exists(&transaction, &id)? {
+                ImportState::Exists
+            } else if find_duplicate_near(
+                &transaction,
+                &row.workspace_id,
+                &row.content_hash,
+                &row.as_new(),
+            )
+            .is_some()
+            {
+                ImportState::Duplicate
+            } else {
+                insert_imported(&transaction, &id, row)?;
+                ImportState::Written
+            };
+            batch.outcomes.push(ImportOutcome { id, state });
+        }
+
+        if dry_run {
+            // Rolled back rather than never written: the counts above had to be computed
+            // by doing the work, and undoing it is the only way to report them without
+            // keeping a second copy of the rules.
+            transaction.rollback()?;
+        } else {
+            transaction.commit()?;
+            batch.committed = true;
+        }
+        Ok(batch)
+    }
+
     /// How many rows the full-text index holds.
     ///
     /// Worth its own method rather than a raw count because it is a diagnostic, not an
@@ -855,6 +1050,96 @@ impl Database {
 /// Returns [`Error::Invalid`] for an empty title, a confidence or importance outside
 /// `0.0..=1.0`, or more than [`MAX_TAGS`] tags. Returns [`Error::Database`] if the insert
 /// fails.
+/// Insert one imported row, with the id and the lifecycle it came with.
+///
+/// Separate from [`insert_one`] rather than a flag on it because they answer different
+/// questions. `insert_one` is a *write*: it generates an id, runs the write gate, decides
+/// the status, and refuses a duplicate. An import is a *restore*: the id, the status, the
+/// counts and the timestamps are the file's, and the job is to reproduce them exactly —
+/// a restored brain whose drafts had activated, or whose `created_at` was today, would
+/// have lost the thing the file was for.
+///
+/// What it does not skip is validation: tags are normalised, the envelope is checked, and
+/// the text limits apply, all before the row gets here.
+fn insert_imported(
+    transaction: &rusqlite::Transaction<'_>,
+    id: &str,
+    row: &ImportRow,
+) -> Result<()> {
+    transaction.execute(
+        INSERT_IMPORTED_SQL,
+        params![
+            id,
+            row.workspace_id,
+            row.kind,
+            row.title,
+            row.excerpt,
+            row.body,
+            encode_tags(&row.tags),
+            metadata::tags_text(&row.tags),
+            row.memory_metadata.to_string(),
+            row.source,
+            row.source_url,
+            row.confidence,
+            row.importance,
+            row.strength,
+            row.corroboration_count,
+            row.retrieval_count,
+            row.last_retrieved_at,
+            row.feedback_score,
+            row.feedback_count,
+            row.pinned,
+            row.status,
+            row.expires_at,
+            row.content_hash,
+            row.pending_derived_from,
+            row.created_at,
+            row.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Whether this id is already in the table.
+///
+/// Checked before the insert rather than caught after it: a `UNIQUE` violation aborts the
+/// transaction, and one line that duplicates a row should cost that line and not the
+/// ninety-nine beside it.
+fn memory_exists(transaction: &rusqlite::Transaction<'_>, id: &str) -> Result<bool> {
+    let count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM memories WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Create a workspace an import names, and say whether this call is what created it.
+///
+/// The name and the id are the same string: an export carries ids, and inventing a display
+/// name for one — title-casing it, splitting the hyphens — would be this module guessing at
+/// something a user typed once. `init --workspace` is where names come from.
+fn ensure_workspace_for(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+) -> Result<bool> {
+    let count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM workspaces WHERE id = ?1",
+        params![workspace_id],
+        |row| row.get(0),
+    )?;
+    if count > 0 {
+        return Ok(false);
+    }
+    crate::db::ensure_workspace_on(
+        transaction,
+        workspace_id,
+        workspace_id,
+        ReviewMode::Autonomous,
+    )?;
+    Ok(true)
+}
+
 fn insert_one(
     transaction: &rusqlite::Transaction<'_>,
     workspace_id: &str,
@@ -870,6 +1155,7 @@ fn insert_one(
     }
     check_unit_range("--confidence", new.confidence)?;
     check_unit_range("--importance", Some(new.importance))?;
+    check_text_limits(title, &new.excerpt, &new.body)?;
     if new.source.trim().is_empty() {
         return Err(Error::Invalid(
             "--source needs a value; omit it to record a `user_saved` memory".to_owned(),
@@ -1827,6 +2113,211 @@ mod tests {
             stats.total,
             "the status counts must agree with the total they are part of"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Export paging and the import batch (WP6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_page_is_the_size_it_was_asked_for_and_the_cursor_continues() {
+        // The property the export's memory bound rests on. Asserted at the store level
+        // because from the command line a page is invisible: the walk looks the same
+        // whether it pages or reads everything, until the brain is too big to read.
+        let db = testing::db();
+        for index in 0..7 {
+            add_semantic(&db, &format!("Note {index}"), "body");
+        }
+
+        let scope = Scope::One("default".to_owned());
+        let first = db.export_page(&scope, None, None, 3).unwrap();
+        assert_eq!(first.len(), 3);
+        let mut seen: Vec<String> = first.iter().filter_map(|row| row.id.clone()).collect();
+
+        let second = db
+            .export_page(&scope, None, seen.last().map(String::as_str), 3)
+            .unwrap();
+        assert_eq!(second.len(), 3);
+        seen.extend(second.iter().filter_map(|row| row.id.clone()));
+
+        let third = db
+            .export_page(&scope, None, seen.last().map(String::as_str), 3)
+            .unwrap();
+        assert_eq!(
+            third.len(),
+            1,
+            "the last page is short, and that ends the walk"
+        );
+        seen.extend(third.iter().filter_map(|row| row.id.clone()));
+
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 7, "every row came back exactly once");
+        assert_eq!(seen, sorted, "the walk is in id order, which is time order");
+    }
+
+    #[test]
+    fn an_export_page_can_be_asked_for_one_status_or_for_every_one() {
+        let db = testing::db();
+        add_semantic(&db, "Active one", "body");
+        let archived = add_semantic(&db, "Archived one", "body");
+        assert_eq!(
+            db.archive(std::slice::from_ref(&archived)).unwrap().moved,
+            vec![archived.clone()]
+        );
+
+        let scope = Scope::One("default".to_owned());
+        let active = db
+            .export_page(&scope, Some(Status::Active), None, 10)
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].title, "Active one");
+
+        let every = db.export_page(&scope, None, None, 10).unwrap();
+        assert_eq!(every.len(), 2, "no filter means every status");
+    }
+
+    #[test]
+    fn an_export_page_carries_a_drafts_staged_provenance() {
+        // The one column that is not part of the memory's own shape: a draft's
+        // `--derived-from` waits on the row until approval, and an export that dropped it
+        // would lose the provenance a restore is for.
+        let db = testing::db();
+        let parent = add_semantic(&db, "Parent", "body");
+        db.add(
+            &NewMemory::new(MemoryKind::Semantic, "A draft")
+                .workspace("default")
+                .body("body")
+                .source("agent_reflection")
+                .confidence(0.1)
+                .derived_from(vec![parent.clone()]),
+        )
+        .unwrap();
+
+        let page = db
+            .export_page(&Scope::One("default".to_owned()), None, None, 10)
+            .unwrap();
+        let draft = page
+            .iter()
+            .find(|row| row.title == "A draft")
+            .expect("the draft is in the export when the status filter allows it");
+        assert_eq!(draft.derived_from, vec![parent]);
+        assert_eq!(draft.status, Some(Status::PendingApproval));
+    }
+
+    #[test]
+    fn an_import_writes_restores_and_declines_in_that_order() {
+        let db = testing::db();
+        let existing = add_semantic(&db, "Already here", "body");
+
+        let rows = vec![
+            row_of("k_01M56XYP4ATEW6PQP8MJ6Y2JQ7", "Brand new", "body one"),
+            row_of(&existing, "Renamed but same id", "body two"),
+            row_of("k_01M56XYP4ATEW6PQP8MJ6Y2JQ8", "Already here", "body"),
+        ];
+        let batch = db.import_batch(&rows, false).unwrap();
+        assert!(batch.committed);
+        assert_eq!(batch.written(), 1);
+        assert_eq!(
+            batch
+                .outcomes
+                .iter()
+                .filter(|outcome| outcome.state == ImportState::Exists)
+                .count(),
+            1,
+            "the id is already here: {batch:?}"
+        );
+        assert_eq!(
+            batch
+                .outcomes
+                .iter()
+                .filter(|outcome| outcome.state == ImportState::Duplicate)
+                .count(),
+            1,
+            "the content is already here under another id: {batch:?}"
+        );
+
+        // The restored row keeps the file's id and content.
+        let restored = db.get("k_01M56XYP4ATEW6PQP8MJ6Y2JQ7").unwrap();
+        assert_eq!(restored.body, "body one");
+        let untouched = db.get(&existing).unwrap();
+        assert_eq!(
+            untouched.title, "Already here",
+            "a line that names an existing id changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_batch_reports_what_it_would_do_and_writes_nothing() {
+        let db = testing::db();
+        let rows = vec![
+            row_of("k_01M56XYP4ATEW6PQP8MJ6Y2JQ7", "One", "body"),
+            row_of("k_01M56XYP4ATEW6PQP8MJ6Y2JQ7", "One", "body"),
+        ];
+        let batch = db.import_batch(&rows, true).unwrap();
+        assert!(!batch.committed);
+        assert_eq!(batch.written(), 1, "the second line duplicates the first");
+        assert_eq!(batch.skipped(), 1);
+        assert!(
+            db.get("k_01M56XYP4ATEW6PQP8MJ6Y2JQ7").is_err(),
+            "a dry run must not write, not even the rows it counted"
+        );
+    }
+
+    #[test]
+    fn an_import_creates_the_workspace_the_file_names() {
+        let db = testing::db();
+        let mut row = row_of("k_01M56XYP4ATEW6PQP8MJ6Y2JQ7", "From elsewhere", "body");
+        row.workspace_id = "work-stuff".to_owned();
+        let batch = db.import_batch(&[row], false).unwrap();
+        assert_eq!(batch.created_workspaces, vec!["work-stuff"]);
+        let stored = db.get("k_01M56XYP4ATEW6PQP8MJ6Y2JQ7").unwrap();
+        assert_eq!(stored.workspace_id, "work-stuff");
+    }
+
+    /// A validated import row, built the way the importer builds one.
+    fn row_of(id: &str, title: &str, body: &str) -> ImportRow {
+        let mut record: ExportRecord =
+            serde_json::from_str(r#"{"kind":"semantic","title":"placeholder"}"#)
+                .expect("the placeholder record");
+        record.id = Some(id.to_owned());
+        record.title = title.to_owned();
+        record.body = body.to_owned();
+        record.into_row(None).expect("a valid row")
+    }
+
+    #[test]
+    fn a_write_over_a_text_limit_is_refused_and_the_row_below_it_is_not() {
+        // One rule for every door: `add`, `update` and `import` share this check, so a
+        // memory the file may hold and the CLI may not is not a state this engine has.
+        let db = testing::db();
+        let long_title = "t".repeat(MAX_TITLE + 1);
+        let error = db
+            .add(&NewMemory::new(MemoryKind::Semantic, &long_title).body("body"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&MAX_TITLE.to_string()), "{error}");
+
+        let huge = "b".repeat(MAX_BODY_BYTES + 1);
+        let error = db
+            .add(&NewMemory::new(MemoryKind::Semantic, "Huge").body(huge))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&MAX_BODY_BYTES.to_string()), "{error}");
+
+        let id = add_semantic(&db, "At the limit", "body");
+        let error = db
+            .update(
+                &id,
+                &MemoryPatch {
+                    title: Some("x".repeat(MAX_TITLE + 1)),
+                    ..MemoryPatch::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&MAX_TITLE.to_string()), "{error}");
     }
 
     #[test]

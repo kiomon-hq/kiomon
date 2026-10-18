@@ -505,7 +505,11 @@ fn migrate(conn: &mut Connection) -> Result<bool> {
 }
 
 /// Insert a workspace if it is not there, leaving an existing one untouched.
-fn ensure_workspace_on(
+///
+/// `pub(crate)` because `import` restores rows that name a workspace the target may never
+/// have heard of, and the rule for making one has to be the rule `init` uses — a second
+/// implementation of "what an id looks like" is a second answer to it.
+pub(crate) fn ensure_workspace_on(
     conn: &Connection,
     id: &str,
     name: &str,

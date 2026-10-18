@@ -24,13 +24,14 @@ That is the whole product: **save once, query forever**, locally.
 
 ## Status
 
-**Pre-alpha, and it works.** `init`, `doctor`, `stats`, `add`, `update`, `get`, `list`,
-`search`, `retrieve`, `reindex`, `review`, `rate`, `outcome`, `decay`, `pin`, `archive`,
-`restore` and `forget` all run end to end against a real SQLite file. The core loop — save
-something, find it again by a sentence or by meaning, ask for what to use next, tell it
-whether what you found helped, and let what nobody uses fade — is complete. The graph
-(`link`, `relate`) is not, and says so along with the sprint that owns it. Import and
-export are the last verbs still to be written.
+**Pre-alpha, and it works.** `init`, `doctor`, `stats`, `add`, `update`, `export`,
+`import`, `get`, `list`, `search`, `retrieve`, `reindex`, `review`, `rate`, `outcome`,
+`decay`, `pin`, `archive`, `restore` and `forget` all run end to end against a real SQLite
+file. The core loop — save something, find it again by a sentence or by meaning, ask for
+what to use next, tell it whether what you found helped, let what nobody uses fade, and get
+the whole thing out as a file you own — is complete, with one deliberate hole: the graph.
+`link` and `relate` are not in this release and say so along with the sprint that owns
+them (§9-D9 of the plan).
 
 The work packages in [`plans/001-local-v1-core.md`](plans/001-local-v1-core.md) §8 are
 being executed in order, and the plan records where reality contradicted it rather than
@@ -72,7 +73,7 @@ long, and one memory in seven containing the word `deploy`.
 | **`kiomon search "deploy"` (both legs, stub embedder)** | **81.6 ms** | **123.5 ms** | 92.0 ms |
 | `kiomon retrieve "deploy"` (context packet, lexical) | 24.1 ms | 37.3 ms | 35.8 ms |
 
-Binary **3.9 MiB** from **49** transitive crates. The plan's gates are `open` p50 ≤ 5 ms,
+Binary **4.0 MiB** from **49** transitive crates. The plan's gates are `open` p50 ≤ 5 ms,
 `add` p95 ≤ 40 ms, `search` p95 ≤ 60 ms (lexical) and ≤ 250 ms (hybrid) at ten thousand
 memories: all met, with the first write to a brand-new database file the one number that is
 genuinely expensive — **16.6 ms**, against 3 ms for the next write into the same file.
@@ -129,7 +130,7 @@ compare. `kiomon bench --repeat 3` prints each pass's median beside the verdict.
 | **Workspaces** | isolation is a `WHERE` clause. `--workspace` stays where you point it; `--workspace '*'` is an explicit opt-in to every workspace. |
 | **Agent-grade CLI** | every command takes `--json`, exit codes are stable and documented, and diagnostics never pollute stdout — so `kiomon search … \| jq` always works. A search reports which of its three query forms answered, and which legs ran, so an agent can see *why* it got what it got. |
 | **Measured, not asserted** | `kiomon bench` measures this build on your machine: cold-process timings per command, the corpus's shape, the process-spawn floor, and the plan's budget applied as a pass or a fail. It ships in the binary so the numbers above are falsifiable. |
-| **Yours** | `export` to JSONL and `import` back. The brain is a file you own and can read. |
+| **Yours** | `export` to JSONL (one memory per line, the stored row, nothing derived) or to a directory of markdown documents, and `import` back from either — a file, a directory of notes, or stdin. **Ids, status and timestamps are the file's**, so a restore is a restore, and re-importing the same file changes nothing. Line errors are reported with their line number and the rest of the file still imports. What is *not* in an export is stated rather than implied: no vectors (they are model-specific and `import` re-embeds as it writes), no edges (there is no graph yet), and `vectors_included: false` in every summary. |
 
 ## What it deliberately is not
 
@@ -191,6 +192,8 @@ kiomon search "the rollout went sideways" # finds it without sharing a word
 kiomon search "café" --kind semantic      # accents and CJK work
 kiomon list                               # unranked: strongest first, one line each
 kiomon get k_01JC9W5K2Q                   # the whole memory
+kiomon export --output brain.jsonl        # the brain as a file you own
+kiomon import --db other.db brain.jsonl   # and back, ids and statuses intact
 kiomon doctor                             # integrity, schema version, index agreement
 kiomon stats
 kiomon bench --gate                       # measure this machine against the budget

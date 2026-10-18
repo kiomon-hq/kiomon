@@ -37,7 +37,7 @@
 //! | [`bench`] | the measurement corpus, so a number has a shape to mean |
 //! | `lifecycle` / `decay` | the review inbox, feedback, and forgetting *(WP4)* |
 //! | `links` | typed edges and the auto-link pass *(WP5 — deferred, §9-D9)* |
-//! | `import` | JSONL and markdown in and out *(WP6)* |
+//! | [`import`] | JSONL and markdown in and out *(WP6)* |
 //! | `embed` / `vector` | the optional vector leg *(WP7)* |
 //!
 //! # Example
@@ -70,6 +70,7 @@ pub mod fuse;
 pub mod gate;
 pub mod hash;
 pub mod id;
+pub mod import;
 pub mod lifecycle;
 pub mod metadata;
 pub mod model;
@@ -89,16 +90,17 @@ pub use embed::{Backend, Embedder, EmbedderConfig, Provider};
 pub use error::{Error, ExitCode, Result};
 pub use fuse::{RRF_K, fuse, rrf_score};
 pub use gate::{AUTOPROMOTE_THRESHOLD, Verdict};
+pub use import::{ExportRecord, ImportBatch, ImportOutcome, ImportRow, ImportState};
 pub use lifecycle::{
     AppliedOutcome, Assessment, IdsOutcome, OutcomeReport, PendingQuery, Rating, RatingOutcome,
     ReviewOutcome, Skipped, TaskOutcome,
 };
 pub use model::{
     AddOutcome, DEFAULT_SNIPPET_TOKENS, EmbedReport, EmbedState, ForgetOutcome, KindCount, Legs,
-    LegsRun, ListQuery, ListSort, MAX_TAGS, Memory, MemoryJson, MemoryKind, MemoryPatch,
-    MemorySummaryJson, NewMemory, Relation, ReviewMode, Scope, SearchAttempt, SearchHit,
-    SearchHitJson, SearchOutcome, SearchQuery, SearchSort, Stats, Status, StatusCount,
-    UpdateOutcome, WINDOW_OVERFETCH, Workspace, source_label,
+    LegsRun, ListQuery, ListSort, MAX_BODY_BYTES, MAX_EXCERPT, MAX_TAGS, MAX_TITLE, Memory,
+    MemoryJson, MemoryKind, MemoryPatch, MemorySummaryJson, NewMemory, Relation, ReviewMode, Scope,
+    SearchAttempt, SearchHit, SearchHitJson, SearchOutcome, SearchQuery, SearchSort, Stats, Status,
+    StatusCount, UpdateOutcome, WINDOW_OVERFETCH, Workspace, source_label,
 };
 pub use retrieve::{
     Applicability, ConflictNote, ContextPacket, DEFAULT_PACKET_ITEMS, EvidenceRef, Intent,

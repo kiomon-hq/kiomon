@@ -40,11 +40,12 @@ succeeded and the answer is no.
 `2` and `1` are deliberately distinct. An agent that receives `2` can conclude a
 memory no longer exists; an agent that receives `1` should try again later.
 
-`4` is for a request whose *shape* was valid. Today the only thing that raises it is
-`--legs vector`, because this build has no embedder: the message names what to do
-instead, since an exit code that is a wall is not an answer. `--legs vector` is never
-answered from the lexical leg — the platform learned that the expensive way, and
-returning something other than what was asked for is undetectable by the caller.
+`4` is for a request whose *shape* was valid and whose environment cannot serve it:
+today that is `--legs vector` with no embedder configured, and `reindex --embed` for the
+same reason. The message names what to do instead, since an exit code that is a wall is
+not an answer. `--legs vector` is never answered from the lexical leg — the platform
+learned that the expensive way, and returning something other than what was asked for is
+undetectable by the caller.
 
 > clap's own exit code for a usage error is also `2`. The binary catches parse
 > failures and remaps them to `3` for exactly this reason, and
@@ -200,7 +201,7 @@ Every command is listed in `kiomon --help`. This section records what each one
 |---|---|
 | `add` | One transaction. Either the memory exists and is indexed, or it was a duplicate and the existing id is returned with `duplicate: true` and exit `0`, or nothing was written. An identical memory is never stored twice unless `--force`. |
 | `update` | Re-indexes when a field retrieval can see — title, excerpt, body, tags — changed. A no-op update is not an error. |
-| `import` | Streams. A malformed line is reported on stderr with its number and skipped; valid lines are still imported. Exit is `1` if any line failed, `0` if none did. |
+| `import` | Restores a JSONL export, a markdown file, a directory of either, or stdin. **Ids, status and timestamps are the file's** — this is a restore, not a re-typing — and a line whose id already exists changes nothing. Streams, and reports a malformed line on stderr with its number and the fragment it could not read, then keeps going. Exit `0` if anything landed, `3` if *nothing* could be read (see [portability](#portability)). |
 | `link` / `unlink` | Idempotent. Linking twice is not an error. |
 | `relate` | **Not in this release** — the graph is deferred to the next sprint (plan §9-D9). Exits `1` and says so; it never returns an empty list, because "no relations" and "relations are not implemented" are different facts and an agent cannot tell them apart from a success. |
 
@@ -212,7 +213,9 @@ read path until it is approved. That is the whole point of the inbox.
 
 **Validation is fail-open for metadata and fail-closed for kind.** A malformed
 `--metadata` object degrades to `{}` with a warning on stderr and the memory is still
-stored. An unknown `--kind` is rejected with exit `3`.
+stored. An unknown `--kind` is rejected with exit `3`. Text *limits* are fail-closed and
+shared by every door — title 300 characters, excerpt 600, body 1 MiB — so `add`,
+`update`, `review approve` and `import` cannot disagree about what a memory may hold.
 
 ### Reading
 
@@ -445,7 +448,56 @@ you see what a full pass would do.
 
 | Command | Promise |
 |---|---|
-| `export` | Streams JSONL (or markdown) as it reads, so a large brain exports without loading into memory. Exported ids are stable and are preserved by `import`. |
+| `export` | Streams one memory per line, in `id` order, a page of five hundred at a time. The records are the **stored rows** — no derived labels, no nesting — and their field names are the memory object's own. `--format markdown` writes one document per memory into `--output <DIR>` instead, and refuses to write to stdout because a concatenation of documents is not markdown. An absent `--status` means `active`, so an export is a library's export and not the review inbox's; `--status any` is everything. |
+| `import` | Reads what `export` wrote, from a file, a directory (walked, sorted, `*.jsonl`/`*.ndjson`/`*.json` and `*.md`), or `-` for stdin. Every line is validated and reported individually; `--dry-run` prints the counts and keeps nothing. |
+
+**A line is the row.** Every field of the memory object from
+[the search response](#a-search-response) except the derived labels, plus `workspace_id`,
+the counters, `pending_derived_from` as `derived_from`, and `status`. A field that is
+absent takes its column default; `kind` and `title` must be present, and a line without
+them is an error naming the missing field.
+
+```json
+{"id":"k_01JC9W5K2Q…","workspace_id":"default","kind":"semantic","title":"Staging deploys need a manual migration","excerpt":"","body":"Run migrations before the deploy.","tags":["deploy"],"memory_metadata":{"domain":"infra"},"source":"user_saved","source_url":null,"confidence":0.9,"importance":0.5,"strength":0.84,"corroboration_count":1,"retrieval_count":3,"last_retrieved_at":"2026-10-14T09:12:00Z","feedback_score":0.0,"feedback_count":0,"pinned":false,"status":"active","expires_at":null,"created_at":"2026-10-14T09:12:00Z","updated_at":"2026-10-14T09:12:00Z"}
+```
+
+**Three things are deliberately not in an export**, and a caller that wants a *backup*
+has to know all three:
+
+- **Vectors.** A 384-dimensional vector is about 4 KB of base64, is valid only for the
+  model that made it, and can be regenerated from the text. `import` embeds as it writes
+  when an embedder is configured, and `kiomon reindex --embed` is what to run when it is
+  not — a restored brain with no model finds nothing by meaning until then.
+- **Edges.** The graph is not in v1 (§9-D9 of the plan): nothing can write a
+  `related_to` or a `contradicts` edge, so exporting rows no verb can create would make
+  the file look richer than the tool. A *draft's* staged provenance is a column rather
+  than an edge, so it does travel, as `derived_from`.
+- **Workspaces.** A record names its workspace id; a restored brain whose workspaces did
+  not exist gets them created, in the default (autonomous) review mode, because the
+  review mode is a property of the workspace row and not of a memory.
+
+**The verdict on each line**, in the order the checks run: the id is already here
+(`exists`), the *content* is already here under another id (`duplicate`), or the row is
+written. That order is what makes re-importing the same file a no-op, and the content
+check is what keeps two exports of one brain from doubling it.
+
+**A malformed line is a message, not a failure.** `path:line: message` on stderr, with
+the fragment that could not be read, and the run continues. Exit `3` only when *nothing*
+could be read: a script has to be able to tell "five of a hundred landed" from "none
+did", and only the summary can tell it the first.
+
+**Markdown is a view, not a format.** `--format markdown` writes frontmatter with eleven
+keys — `id`, `kind`, `title`, `workspace`, `status`, `tags`, `source`, `url`,
+`confidence`, `importance`, `created` — and the body below it. Importing a note with no
+frontmatter gives it a `reference` memory whose title is its first `# heading` (or its
+filename), because that is what a directory of notes looks like. A value that would read
+back as a list, a number or a boolean is quoted; everything else is bare.
+
+**Limits, and why import has them.** A memory's title is at most **300 characters**, its
+excerpt **600**, and its body **1 MiB** — on every door, `add` and `update` included, so
+a memory the file may hold and the CLI may not is not a state this engine has. A line
+longer than 2 MiB is refused and drained to its newline, so one absurd line cannot become
+a flood of them.
 
 ### Measurement
 

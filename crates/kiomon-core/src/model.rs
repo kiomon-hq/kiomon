@@ -277,6 +277,24 @@ pub const DEFAULT_WORKSPACE_NAME: &str = "Default";
 /// so the cap is also a bound on a write's cost.
 pub const MAX_TAGS: usize = 20;
 
+/// The longest title a memory may carry, in characters.
+///
+/// The hosted route's own limit (`z.string().min(1).max(300)`), so a memory written here
+/// is one the hosted product would also accept — that symmetry is the point of sharing the
+/// vocabulary, and a local title the cloud would refuse makes an export a partial one.
+pub const MAX_TITLE: usize = 300;
+
+/// The longest excerpt, in characters. Also the route's (`max(600)`).
+pub const MAX_EXCERPT: usize = 600;
+
+/// The largest body, in bytes.
+///
+/// There is no equivalent on the hosted route, which is behind an HTTP body limit this
+/// process does not have. One mebibyte is not a memory — it is a file — and the cap is
+/// what makes importing a directory of logs a reportable error instead of a database that
+/// has to be rebuilt.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
 /// How a workspace admits agent-authored writes.
 ///
 /// The distinction is the review inbox's whole configuration. It lives on the

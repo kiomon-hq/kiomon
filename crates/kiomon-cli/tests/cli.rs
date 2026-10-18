@@ -236,29 +236,31 @@ fn diagnostics_never_reach_stdout() {
 }
 
 #[test]
-fn unimplemented_commands_name_the_work_package_that_owns_them() {
-    // The table *is* the list of what does not work yet, asserted rather than assumed:
-    // when a work package lands, its row leaves this table and becomes a real test. A
-    // command that silently did nothing would fail here, and so would one that claimed to
-    // be finished before it was.
+fn every_verb_that_does_not_work_says_which_sprint_owns_it() {
+    // The table *is* the list of what does not work yet, asserted rather than assumed: when
+    // a work package lands, its row leaves this table and becomes a real test. WP6 emptied
+    // it of `export` and `import`; what is left is the graph, which is not "later in v1"
+    // but "not in v1 at all" (§9-D9), and this asserts the difference rather than trusting
+    // it — a caller has to be able to tell "coming in this release" from "not coming".
     let sandbox = Sandbox::new();
     let db = sandbox.db_arg();
-    let cases: [(&str, &[&str], u8); 2] = [
-        ("export", &["export", "--db", &db], 6),
-        ("import", &["import", "nothing.jsonl", "--db", &db], 6),
+    let cases: [(&str, &[&str]); 3] = [
+        ("link", &["link", "k_a", "k_b", "--db", &db]),
+        ("unlink", &["unlink", "k_a", "k_b", "--db", &db]),
+        ("relate", &["relate", "k_a", "--db", &db]),
     ];
-    for (name, args, wp) in cases {
+    for (name, args) in cases {
         let out = run(args);
-        assert_eq!(
-            code(&out),
-            1,
-            "`{name}` should be an internal not-implemented"
-        );
+        assert_eq!(code(&out), 1, "`{name}` should be a refusal");
         let text = stderr(&out);
         assert!(text.contains(name), "`{name}`: {text}");
         assert!(
-            text.contains(&format!("work package {wp}")),
-            "`{name}` should name work package {wp}: {text}"
+            text.contains("next sprint"),
+            "`{name}` should say it is the next sprint's work: {text}"
+        );
+        assert!(
+            !text.contains("work package"),
+            "`{name}` must not promise a work package in this release: {text}"
         );
     }
 }
@@ -1258,7 +1260,9 @@ fn malformed_metadata_warns_on_stderr_and_still_writes() {
 #[test]
 fn human_output_is_one_bounded_line_per_memory() {
     let sandbox = Sandbox::new();
-    let long = "x".repeat(500);
+    // The longest title the engine accepts: `MAX_TITLE` is 300, and it is the write path
+    // that refuses more, so this is the widest fixture a truncation test can have.
+    let long = "x".repeat(300);
     add(&sandbox, &["--kind", "semantic", "--title", &long]);
 
     let out = run(&["list", "--db", &sandbox.db_arg()]);
@@ -1267,13 +1271,13 @@ fn human_output_is_one_bounded_line_per_memory() {
     assert_eq!(text.lines().count(), 1, "one memory, one line: {text:?}");
     assert!(
         text.chars().count() < 200,
-        "a 500-character title must not become a 500-character line: {} chars",
+        "a 300-character title must not become a 300-character line: {} chars",
         text.chars().count()
     );
 
     // `--full` is how you ask for the whole thing.
     let full = run(&["list", "--db", &sandbox.db_arg(), "--full"]);
-    assert!(stdout(&full).chars().count() > 400);
+    assert!(stdout(&full).chars().count() > 250);
 }
 
 #[test]
@@ -1677,7 +1681,7 @@ fn search_output_is_bounded_and_shows_the_match_on_a_second_line() {
             "--kind",
             "semantic",
             "--title",
-            &format!("Deploy note {}", "padded pads a fair bit ".repeat(20)),
+            &format!("Deploy note {}", "padded pads a fair bit ".repeat(10)),
             "--body",
             &format!("deploy {}", "padding ".repeat(400)),
         ],

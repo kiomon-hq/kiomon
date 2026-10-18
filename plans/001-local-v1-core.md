@@ -965,13 +965,19 @@ document with every diagnostic on stderr.
    `unlink` are deferred, not pending, so the CLI test table in `crates/kiomon-cli/tests/cli.rs`
    has one family left to empty.
 
-### WP6 — Import, export, and portability (1 day)
+### WP6 — Import, export, and portability (1 day) — **shipped**
 JSONL in/out, markdown out, directory import, `--workspace` mapping, id
 preservation on import.
 **Accept:** export → fresh DB → import → `search` returns the same ids and titles;
 import of a partial/hostile JSONL (missing fields, wrong types, huge body)
 reports per-line errors on stderr and imports the valid lines; a 100 MB export
 streams without loading it into memory.
+**Corrections the work turned up**, argued in the record below: a line is the *stored row*
+and not a rendering of it; three numbers (title 300, excerpt 600, body 1 MiB) are enforced
+on `add` and `update` too, so one rule covers every door; a failed import exits 3 and a
+partial one exits 0; vectors and edges are deliberately absent from the file, which is
+therefore not a backup of semantic search; and the walk is keyset-paginated because an
+offset cursor makes page five thousand cost five thousand pages of skipping.
 
 ### WP7 — Vector leg (2 days, **in v1 per §9-D1**) — **shipped**
 `Embedder` trait, Ollama + OpenAI-compatible over `ureq` (3.x, **no TLS**: see the WP7
@@ -987,6 +993,140 @@ build on a crate-count measurement; a similarity floor of zero is the only model
 threshold; a draft is embedded at write time and hidden by its status; `update` re-embeds
 forcibly because a stale vector is worse than a missing one; and the harness configures a stub
 embedder, which is what makes the hybrid gate measurable in CI.
+
+### WP6's numbers, and what they found
+
+Same laptop, release build, warm cache, `C:` drive, measured with a sampling loop around
+the process (`target/measure.ps1`, not committed: the interesting number is the *private*
+memory, not the working set, and the reason is in the table's own note).
+
+| Command | Wall time | peak working set | peak private |
+|---|---|---|---|
+| `export` a 197 MiB brain (10 000 rows) → 86 MB JSONL | 0.92 s | 151.8 MiB | 67.0 MiB |
+| `import` that file into a fresh database (10 000 rows) | 9.30 s | 61.4 MiB | 56.6 MiB |
+| `import` the file **doubled** (172 MB, 20 000 lines: 10 000 written, 10 000 `exists`) | 9.78 s | 61.2 MiB | 56.8 MiB |
+| `import --dry-run` over the same file (parse, validate, dedupe, roll back) | 1.23 s | 41.2 MiB | — |
+| `export --format markdown` of the 1 000-memory corpus (1 000 files) | 1.22 s | 24.2 MiB | 11.5 MiB |
+
+**The memory number that matters is private bytes, and it does not grow with the file.**
+Doubling the input from 86 MB to 172 MB moved the peak by 0.2 MiB — 56.6 → 56.8 — because
+what is held is one page of five hundred records plus SQLite's 16 MiB page cache, not the
+file. The working-set column is bigger and jumpier (24–152 MiB across the runs above)
+because SQLite maps the database file (`mmap_size` is 256 MiB) and mapped pages count
+towards the resident set while remaining the operating system's to evict. Both numbers are
+printed here so nobody has to pick the flattering one.
+
+**An import is a commit, not a parse.** The dry run does the same per-row work — parse,
+validate, the existence check, the content-hash lookup, the insert — and rolls it back, and
+it costs 1.23 s against the real run's 9.30 s. The difference is the twenty commits (five
+hundred rows each) that actually reach the disk. It also means the missing quarter of an
+hour of naive per-row commits is the page size, and that a `--dry-run` on a large file is
+cheap enough to be the thing you run first, which is what the contract tells a user to do.
+
+**The volume, again.** The same import into a database on `E:` took 18.22 s against 9.30 s
+on `C:` — the WP0 and WP1 lesson, third sighting, and the reason the harness prints the
+corpus's path. Nothing in this record is from `E:`.
+
+### WP6's acceptance criteria
+
+| # | Criterion | Where it is asserted |
+|---|---|---|
+| 1 | Export → a fresh database → import → `search` returns the same ids and titles | `crates/kiomon-cli/tests/portability.rs::a_round_trip_into_a_fresh_database_returns_the_same_ids_and_titles`, through `search` rather than `get`, because an id that only survives being asked for by name has not survived |
+| 2 | A partial/hostile JSONL reports per line on stderr and imports the valid lines | `a_hostile_file_imports_the_valid_lines_and_reports_the_rest_on_stderr` (eight lines: valid, not JSON, unknown kind, missing kind, over-long title, over-long body, out-of-range confidence, valid), plus `one_absurd_line_is_one_error_and_not_thousands` for a single 3 MiB line |
+| 3 | A 100 MB export streams without loading it into memory | the table above: 86 MB and 172 MB at a flat 57 MiB of private memory, plus `a_brain_that_does_not_fit_in_one_page_still_exports_completely` (520 rows, two pages) and `a_page_is_the_size_it_was_asked_for_and_the_cursor_continues` at the store level |
+
+Beyond the plan's three: a status surviving the round trip (a draft comes back a draft, and
+is still invisible to `search`); the packet's own reads surviving it (`confidence`, the
+envelope's `steps` → the procedure's `claim`); `--status any` and the default `active`; the
+`--workspace` override and a workspace the file names being created; markdown written,
+read back through a directory, and refused on stdout; the id/duplicate/`exists` verdict in
+that order; a dry run that writes nothing and still counts duplicates *inside* the file;
+re-import as a no-op; the 2 MiB line cap draining to the next newline; `import -` from
+stdin; an import embedding what it wrote when an embedder answers and saying
+`reindex --embed` when it does not; and a hand-written line keeping the id it declared.
+
+### Where WP6 contradicted the plan
+
+1. **"Export the memory" needed a decision: the row or the rendering.** The contract's
+   memory object carries `kind_label` and `source_label`, which are derived from `kind` and
+   `source`, and a JSONL line that carried them would be a file with two answers to one
+   question — and the wrong one after somebody edits a label. So a line is the *stored* row,
+   field for field, plus `workspace_id` and `status`; the labels are not in it, and
+   `import` ignores unknown fields rather than refusing a file from a slightly different
+   version. What is in it that the wire object does not have is `derived_from` (a draft's
+   staged provenance — see item 4).
+2. **The limits had to apply to `add` as well, which the plan did not ask for.** WP6's own
+   acceptance says a huge body must be a per-line error, which is only coherent if the same
+   body is an error through `--body` too: a memory the file may hold and the CLI may not is
+   a memory the user cannot fix. `MAX_TITLE = 300` and `MAX_EXCERPT = 600` are the hosted
+   route's numbers, so a memory written here is one the hosted product would also accept;
+   `MAX_BODY_BYTES = 1 MiB` has no hosted equivalent (the route is behind an HTTP body
+   limit this process does not have) and is a local decision, recorded here as one.
+3. **"Reports per-line errors on stderr and imports the valid lines" says nothing about the
+   exit code, and both of the obvious answers are wrong.** Exit `1` if any line failed makes
+   a successful restore of 99 999 of 100 000 memories look like a failure; exit `0` always
+   makes a file that nothing could be read from look like one that worked. The rule is that
+   a *partial* import is exit `0` with the count on stdout and the errors on stderr, and
+   only "nothing landed" is exit `3` — the file, not the environment, was what could not be
+   read.
+4. **A draft's provenance is a column, and the edges are not in the format.** The
+   `pending_derived_from` staging from WP4 has no other home: an export that dropped it
+   would lose the ids the review inbox was holding for approval. Edges are the opposite
+   case — nothing in v1 can write a `related_to` or a `contradicts` edge (§9-D9), so a
+   format that exported them would describe a graph the tool cannot produce — and the
+   record says so rather than quietly omitting a column list.
+5. **An export is not a backup of semantic search, and that has to be said where a user
+   looks.** Vectors are 4 KB per memory of base64 that only the model that made them can
+   use; `import` re-embeds what it writes when an embedder is configured and says
+   `reindex --embed` when it is not, `export`'s summary says `vectors_included: false`, and
+   `docs/CONTRACT.md` lists what is missing from the file. A "backup" that silently drops
+   half of retrieval is the worst kind of omission, because it is only discovered after the
+   restore.
+6. **Keyset paging, not `LIMIT/OFFSET`.** The export reads a page, writes it, and asks for
+   the next one *after the last id it saw*. An offset cursor would make page five thousand
+   cost five thousand pages of skipping — the classic quadratic export — and the ULID is
+   already the sort key, so the cursor is free. The store-level test pages a seven-row
+   corpus three at a time, which is the only way to assert a walk that is invisible at
+   command level until a brain is too large to read.
+7. **A workspace's review mode is not in the format, and cannot be.** A record names its
+   workspace; the review mode is a property of the workspace *row*, written by
+   `init --workspace`, and the export has no place to put it. A restored workspace is
+   therefore created `autonomous` — the same mode `init --workspace` uses — and a user who
+   had a reviewed workspace has to say so again. Written down rather than papered over: the
+   alternative (inferring `review` from a page containing a draft) would be inferring a
+   trust decision from a status, which is exactly the kind of guess §5.1 exists to avoid.
+8. **The line-length cap is the reader's, and it is not the body cap.** A 2 MiB line is
+   refused *and drained to its newline*; without the drain a single 3 GiB line would be
+   reported as millions of errors, one per buffer. The body cap (1 MiB) is what a memory
+   may hold; the line cap is what the reader will hold for one line, and they are different
+   numbers because a line is a JSON object around a body with escapes.
+9. **`--status all` does not exist; the vocabulary is `any`.** `list` already spelled the
+   everything-value `any`, and `export` follows it. Finding this out is what the CLI test
+   table is for: the plan's prose said "`--workspace` mapping" without saying what the
+   status flag on an export would be called.
+
+### What WP8 inherits
+
+1. **The last unimplemented verb family is empty.** `export` and `import` were the two rows
+   left in `crates/kiomon-cli/tests/cli.rs`'s table of what does not work yet; the table now
+   holds only `link`, `unlink` and `relate`, which are deferred rather than pending, and the
+   test asserts the *difference* — no "work package" promise for a verb that is not coming
+   in this release. `Error::Unimplemented` stays in the enum for WP9's routes.
+2. **The binary is now 4.0 MiB-ish and the crate count unchanged at 49** (WP6 added no
+   dependency: `serde_json` and `std::io` were already here). The release notes for WP8
+   should say what the two dependencies from WP7 were for and that WP6 cost nothing.
+3. **The export format is a promise to a later version.** A line's field names, the markdown
+   frontmatter's eleven keys, and the `exists`/`duplicate`/`written` verdict order are the
+   parts a future release cannot change without breaking a file somebody kept. They belong
+   in `docs/DESIGN.md` (WP8) as a stability statement, not only in `docs/CONTRACT.md` as a
+   description.
+4. **`serve` (WP9) inherits a restored-brain story.** `/api/memories/batch-draft` maps onto
+   the same insert path as `add`, and a hosted export is JSONL-shaped; whoever writes the
+   route should route it through `import::ExportRecord` rather than inventing a second
+   parser, because the round trip is the part that has to keep working.
+5. **Nothing here needs the graph, and that is load-bearing for §9-D9.** The portability
+   format was designed with no edges in it, so the graph sprint can add an optional field
+   without a format migration — and `derived_from` is already the shape it would take.
 
 ### WP7's numbers, and what they found
 
@@ -1162,7 +1302,7 @@ shape last.
 | **WP4** | ✅ **DONE** 2026-10-16 | `lifecycle.rs` (the review inbox, `pin`/`archive`/`restore`/`rate`/`outcome` with the hosted product's credit rules), `decay.rs` (the formula, the paged command, the resumable daily nudge), migration `0002_lifecycle.sql`, the five lifecycle commands wired end to end, `doctor` reporting when decay last ran, and the CONTRACT's lifecycle section rewritten around what the verbs *actually* move. **274 tests** (192 core + 58 CLI + 24 others), clippy clean, 3 324 KiB binary. |
 | **WP5** | ⏸ **DEFERRED** to the next sprint (§9-D9, 2026-10-17) — a scope cut, not a design change: the spec below is unchanged and is the next sprint's first work package | |
 | **WP5.5** | ✅ **DONE** 2026-10-17 | `retrieve.rs` (the packet: five intents, the applicability rule, the ranking formula, the warning strings, the summary sentence — ported from the hosted `lib/retrieve.ts` and `routes/retrieve.ts`), the CLI verb with `--intent`/`--constraint`, migration `0003_link_valid_to.sql` (the column the ported conflict query needs and `0001` did not have), a bench row and a gate, and `docs/CONTRACT.md`'s packet shape. **312 tests** (218 core + 70 CLI + 24 others), clippy clean, 3 336 KiB binary. | |
-| **WP6** | ⬜ TODO | |
+| **WP6** | ✅ **DONE** 2026-10-18 | `import.rs` (the JSONL record, the line validator, the markdown view and its reader, the filename rule), `store::export_page` (keyset paging over the row's own columns) and `store::import_batch` (one transaction per page, `exists`/`duplicate`/`written` in that order, workspaces created from the file), `portability.rs` (the streaming writer, the directory walk, the per-line reporter, the 2 MiB line cap with its drain), `MAX_TITLE`/`MAX_EXCERPT`/`MAX_BODY_BYTES` enforced on every door, and the `--config`-aware text limits in `docs/CONTRACT.md`. **426 tests** (268 core + 70 CLI + 25 CLI-portability + 18 CLI-embed + 21 core-vector + others), clippy clean, no new dependencies. | |
 | **WP7** | ✅ **DONE** 2026-10-17 | `embed.rs` (the `Embedder` trait, the `ollama` and `openai` shapes over `ureq`, the deterministic `stub`, the memory-text rule, the 20 000-character cap, the prefixes), `vector.rs` (brute-force cosine, blob encoding, the zero floor), the config file (`config.toml` with `default_workspace` and `[embedder]`, the first real TOML dependency), the write path (`add`, `update`, `reindex --embed`), `--legs auto|fts|vector|graph` with the hosted spellings as aliases, `degraded`/`reason` reporting, `doctor`'s embedder and coverage report, a `similarity` per vector-leg row, a bench row and gate for the hybrid budget, and the `--config` global flag. **376 tests** (243 core + 70 CLI + 18 CLI-embed + 21 core-vector + 9 store + others), clippy clean, **3 971 KiB** binary, **49** transitive crates of 60. | |
 | **WP8** | ⬜ TODO | |
 | **WP9** | ⬜ TODO (v1.1) | |

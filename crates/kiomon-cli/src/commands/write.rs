@@ -14,8 +14,8 @@ use std::path::Path;
 use kiomon_core::metadata;
 use kiomon_core::{Error, ExitCode, MemoryPatch, NewMemory, Result, Scope};
 
-use super::{decay_if_due, deferred, open, pending, write_workspace};
-use crate::cli::{AddArgs, Cli, ImportArgs, LinkArgs, RelateArgs, UnlinkArgs, UpdateArgs};
+use super::{decay_if_due, deferred, open, write_workspace};
+use crate::cli::{AddArgs, Cli, LinkArgs, RelateArgs, UnlinkArgs, UpdateArgs};
 use crate::out;
 
 /// `kiomon add`
@@ -155,15 +155,6 @@ pub fn update(cli: &Cli, args: &UpdateArgs) -> Result<ExitCode> {
         }
     })?;
     Ok(ExitCode::Success)
-}
-
-/// `kiomon import`
-///
-/// # Errors
-///
-/// Always [`Error::Unimplemented`], until WP6.
-pub fn import(_cli: &Cli, _args: &ImportArgs) -> Result<ExitCode> {
-    pending("import", 6)
 }
 
 /// `kiomon link`
