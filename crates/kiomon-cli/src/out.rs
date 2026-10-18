@@ -34,7 +34,7 @@ pub const DEFAULT_WIDTH: usize = 120;
 pub struct Meta {
     /// The JSON contract version — `kiomon_core::CONTRACT_VERSION`.
     pub contract_version: &'static str,
-    /// The version of this build.
+    /// The version of this build, including the commit it came from.
     pub version: &'static str,
 }
 
@@ -44,7 +44,11 @@ impl Meta {
     pub const fn current() -> Self {
         Self {
             contract_version: kiomon_core::CONTRACT_VERSION,
-            version: kiomon_core::VERSION,
+            // The CLI's stamp, not the library's: a caller that logs one response should
+            // be able to say which binary answered, and the commit lives there. The crate
+            // version is the same number, so nothing downstream loses the release number
+            // by gaining the commit.
+            version: crate::VERSION,
         }
     }
 }
@@ -1116,7 +1120,7 @@ pub fn render_bench(response: &BenchResponse) -> String {
     let _ = writeln!(
         out,
         "kiomon bench — {} on {} ({} cpus), binary {}",
-        env!("CARGO_PKG_VERSION"),
+        crate::VERSION,
         response.os,
         response.cpus,
         response

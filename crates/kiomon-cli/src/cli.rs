@@ -32,7 +32,12 @@ use kiomon_core::{Legs, MemoryKind, Relation, SearchSort, Status};
 #[derive(Debug, Parser)]
 #[command(
     name = "kiomon",
-    version,
+    // Same string for `-V` and `--version`: clap would otherwise print the bare crate
+    // version for the short flag and whatever `long_version` said for the long one, and a
+    // build number that depends on which spelling a bug report used is a build number that
+    // gets misreported.
+    version = crate::VERSION,
+    long_version = crate::VERSION,
     about = "A fast, local memory for your coding agent",
     disable_help_subcommand = true,
     propagate_version = true,

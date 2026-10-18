@@ -113,6 +113,63 @@ fn version_is_printed_on_stdout_and_exits_zero() {
     );
 }
 
+/// Both spellings, from one string.
+///
+/// The bug this catches is real and quiet: `clap` reads `version` for `-V` and
+/// `long_version` for `--version`, so a build that sets only one of them reports a
+/// different build to a bug report than to a script. They also have to agree on the commit,
+/// which is why the assertion is equality and not "each contains something".
+#[test]
+fn both_version_spellings_report_the_same_build() {
+    let short = run(&["-V"]);
+    let long = run(&["--version"]);
+    assert_eq!(code(&short), 0);
+    assert_eq!(code(&long), 0);
+    assert_eq!(stdout(&short), stdout(&long));
+
+    // Trimmed, because the line arrives with its newline and the parse below is exact.
+    let text = stdout(&long).trim().to_owned();
+    let rest = text
+        .strip_prefix("kiomon ")
+        .unwrap_or_else(|| panic!("unexpected version line: {text}"));
+    // `0.1.0 (git <sha>)`, where the sha is twelve hex characters — or `unknown` in a build
+    // with no repository, which is what `cargo package --verify` and `cargo install` do.
+    let (version, tail) = rest
+        .split_once(" (git ")
+        .unwrap_or_else(|| panic!("expected the commit after the version: {text}"));
+    assert_eq!(version, env!("CARGO_PKG_VERSION"), "{text}");
+    let inner = tail
+        .strip_suffix(')')
+        .unwrap_or_else(|| panic!("unterminated commit in: {text}"));
+    // A dirty tree is reported and is not an error here: a local build of this test has one
+    // by definition, since committing the test is what would clear it.
+    let commit = inner.strip_suffix("-dirty").unwrap_or(inner);
+    if commit != "unknown" {
+        assert!(
+            commit.len() >= 7 && commit.chars().all(|c| c.is_ascii_hexdigit()),
+            "expected a hex commit sha or `unknown`, got: {commit}"
+        );
+    }
+}
+
+/// The response envelope names the build, so a caller that logs one response can say which
+/// binary answered it. The commit is the part that makes a bug report actionable.
+#[test]
+fn every_json_response_names_the_build_and_its_commit() {
+    let value = json(&["stats", "--json"]);
+    let version = value["meta"]["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("meta.version is not a string: {value}"));
+    assert!(
+        version.contains(" (git "),
+        "meta.version should carry the commit, got: {version}"
+    );
+    assert!(
+        version.starts_with(env!("CARGO_PKG_VERSION")),
+        "meta.version should start with the crate version, got: {version}"
+    );
+}
+
 #[test]
 fn help_is_printed_on_stdout_and_exits_zero() {
     let out = run(&["--help"]);

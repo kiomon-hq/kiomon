@@ -31,6 +31,14 @@ jobs:
       # `--all-targets` so tests and benches are linted too: they are the code most
       # likely to carry an `unwrap` nobody reviews.
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The installers are the two files in this repository that run on a user's machine
+      # before they have anything else, and neither is compiled or tested by anything else
+      # here. `shellcheck -s sh` forces the POSIX dialect: install.sh is piped into an
+      # interpreter whose flags the user has not read, so a bash-ism in it is a bug.
+      - name: shellcheck the installers
+        run: |
+          shellcheck -s sh install.sh
+          shellcheck scripts/package.sh
 
   test:
     name: test (${{ matrix.os }})

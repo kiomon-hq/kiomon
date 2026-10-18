@@ -88,6 +88,43 @@ leaks into retrieval is worse than no review inbox, so indexing now happens in
 `approve` and the pending path writes the row without a trigger firing.
 ```
 
+## Releasing
+
+A release is a tag and nothing else: `git tag -a v0.1.0 -m "0.1.0" && git push origin
+v0.1.0` runs `.github/workflows/release.yml`, which verifies the tagged commit (including
+the performance budget), builds five targets on native runners, checksums the archives,
+publishes the GitHub Release, and publishes `kiomon-core` and then `kiomon-cli`.
+
+Four things to check before tagging, all of which the workflow checks again:
+
+1. `CHANGELOG.md` has a `## [x.y.z]` section. The workflow extracts it as the release body.
+2. `kiomon --version` reports `x.y.z (git <sha>)` — the version *and* the commit, because a
+   bug report needs both. The build stamp comes from `crates/kiomon-cli/build.rs`.
+3. `cargo package -p kiomon-core --allow-dirty --no-verify` succeeds, and
+   `cargo package -p kiomon-cli --list --allow-dirty` lists what you expect. The CLI cannot
+   be packaged before its dependency is on crates.io, so its full package is verified by the
+   release workflow and not before the first release.
+4. The installers still work against a real archive. Both halves of that are local:
+
+```sh
+cargo build --release
+version=0.1.0
+mkdir -p "dist/download/v$version"
+bash scripts/package.sh --version "$version" --target x86_64-unknown-linux-gnu   --binary target/release/kiomon --out dist
+mv dist/kiomon-*.tar.gz "dist/download/v$version/"
+(cd "dist/download/v$version" && sha256sum kiomon-* | sort -k2 > SHA256SUMS)
+
+KIOMON_RELEASES_URL="file://$PWD/dist" bash install.sh --version "v$version" --dry-run
+```
+
+Then run it without `--dry-run` and check `--version` on what it installed. `curl` reads a
+`file://` URL like any other, so this exercises the real download, the real checksum
+comparison and the real extraction — everything except GitHub's redirect to its CDN.
+
+`KIOMON_RELEASES_URL` is read by `install.sh` for exactly this reason: a mirror, an
+air-gapped install, and a test of the installer itself are the same feature. `install.ps1`
+takes `-ReleasesUrl` and `-Dir`.
+
 ## Licensing
 
 By contributing you agree that your contribution is licensed under the repository's

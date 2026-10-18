@@ -1264,12 +1264,138 @@ file's `default_workspace` losing to `--workspace`.
    per memory is real weight in an export, and an export that drops it means "re-run
    `reindex --embed` after importing", which is a thing the export's format should say.
 
-### WP8 — Packaging and release (1 day)
+### WP8 — Packaging and release (1 day) — **shipped**
 `cargo-dist` (or `release.yml` + `taplo`-style cross-compile), shell + PowerShell
 installers, `kiomon init` onboarding text, crates.io publish for `kiomon-core`.
 **Accept:** a clean machine installs via one command and `kiomon init && kiomon add
 && kiomon search` works; `kiomon --version` reports a git sha; the release workflow
 builds all four targets from a tag with no manual steps.
+**Corrections the work turned up**, argued in the record below: `cargo-dist` is a dependency
+the budget does not need when the packaging is a thirty-line script the installers can be
+tested against; five targets rather than four, because Intel macOS is a real machine and
+cross-compiling to it is a `--target` flag; the version line carries the **commit** and not
+only the release number, in `--version`, in every JSON `meta`, and in the bench header; and
+the init text is five lines rather than a tour.
+
+### WP8's numbers, and what they found
+
+No corpus and no table this time: WP8 changes no read path and no write path, and the
+performance budget is enforced by CI on every release candidate rather than re-measured here.
+What it produced instead is the two files that decide whether anybody ever runs this — and
+they were both tested by running them, against a real release made by `scripts/package.sh`
+and served over `file://` and over a local HTTP server:
+
+| What was run | Result |
+|---|---|
+| `scripts/package.sh` → tar.gz + zip, then `sha256sum` → `SHA256SUMS` | both archives carry `kiomon-0.1.0/{kiomon[.exe],LICENSE,NOTICE,README.md}`; the zip is 2.0 MiB, the tar.gz 2.0 MiB |
+| `install.sh` against the tar.gz, checksum verified | 1.1 s, installs, prints the version of the binary it just installed |
+| `install.sh` against a corrupted archive | exits `1`, `checksum mismatch … Nothing was installed.`, and `/tmp/inst3` does not exist |
+| `install.sh --target x86_64-unknown-linux-gnu` on Windows | downloads, verifies, extracts, installs, and says `not executed: built for x86_64-unknown-linux-gnu` |
+| `install.ps1` against the zip | downloads, verifies, extracts, and prints `installed kiomon 0.1.0 (git 844fa1720402-dirty)` |
+| `kiomon init && kiomon add && kiomon search` from the installed binary | all three, plus `doctor` and a `--json` envelope whose `meta.version` names the commit |
+| `cargo package -p kiomon-core --no-verify` | 31 files, 185 KiB compressed, with the three migrations and `build.rs`'s absence accounted for: the *core* crate needs no stamp |
+| `cargo package -p kiomon-cli --list` | includes `build.rs` — the release stamp must ship, or a published crate would build without one |
+
+**One binary, five targets, and no `cargo-dist`.** The plan offered `cargo-dist` as the first
+option; it is a tool that generates a workflow, an installer, and a manifest schema, and the
+budget it spends is not measured in crates but in *review*: a generated `release.yml` is a file
+nobody on this project has read completely. What shipped instead is a `release.yml` that is
+about 200 lines, `scripts/package.sh` that is 100, and two installers that are each one file —
+all of which the record above shows being executed. The one thing `cargo-dist` would have given
+that is genuinely missing is a generated Homebrew formula and an npm shim; both are recorded
+below as follow-ups rather than pretended away.
+
+**Nine things the work turned up:**
+
+1. **`--version` needed a build script, and the build script needed to be careful about three
+   things.** A stamp that is not watched for staleness is a stamp that reports the previous
+   commit; a stamp that fails without a repository breaks `cargo install` and
+   `cargo package --verify`, which build from a tarball with no `.git`; and a stamp that
+   ignores a dirty tree lets a binary claim to be the tag it was not built from. So
+   `crates/kiomon-cli/build.rs` watches `.git/HEAD`, the branch that `HEAD` names, the index
+   and `packed-refs`; falls back to `unknown`; and suffixes `-dirty` when a tracked file
+   differs from `HEAD` — with untracked files deliberately ignored, since a `target/`
+   directory would otherwise mark every local build dirty. Tested both ways: a clean build in
+   a copy of the tree with no `.git` prints `0.1.0 (git unknown)`, and a build with
+   `KIOMON_GIT_SHA=deadbeefcafe` prints exactly that.
+2. **`clap` prints two different versions.** `-V` reads `version` and `--version` reads
+   `long_version`, so setting one leaves the other reporting a different build to whoever used
+   the other spelling. Both are set to the same `const`, and
+   `both_version_spellings_report_the_same_build` asserts equality rather than two `contains`.
+3. **The commit belongs in `meta.version` too.** Every JSON response already carried
+   `meta.version`; it carried the crate version, which is the same for every build between two
+   tags. A caller that logs one response and files one bug report should be able to say which
+   binary answered, so the field is the CLI's stamped string and the bench header prints it as
+   well. `every_json_response_names_the_build_and_its_commit` is the test; the contract change
+   is additive, so `contract_version` stays at 1.
+4. **The assets are named without a version, and that is the whole reason `install.sh` needs no
+   API call.** `releases/latest/download/kiomon-x86_64-unknown-linux-gnu.tar.gz` is a static
+   path; resolving `latest` to a tag would need an authenticated, rate-limited API request to
+   do what a URL already does. The version lives inside the archive, where `--version` also
+   reports it.
+5. **`install.sh` had to be POSIX `sh`, and the first draft was not.** It is piped into an
+   interpreter whose flags the user has not read, and `local` is not POSIX. The second draft
+   also had `[ -n "${KIOMON_VERSION:-}" ] && VERSION="$KIOMON_VERSION"` — under `set -e` that
+   is a script which exits when the test is false, which is to say whenever nobody sets the
+   variable. Both are recorded here because a shell lint would have found the second and not
+   the first.
+6. **`KIOMON_RELEASES_URL` is a feature, not a test hook.** The same override serves a mirror,
+   an air-gapped install, and the test above, and `install.sh --target` is the same argument
+   one level down: staging an ARM64 binary on an x86 machine to copy into a container is a
+   real task, and it is also how the installer's download-verify-extract path got tested on
+   the authoring machine, which cannot execute the Linux binary it installed.
+7. **The installers verify by default, and the checksum parser had to accept two spellings.**
+   `sha256sum` writes `<hash>  <file>` on Linux and `<hash> *<file>` from its Windows build;
+   an installer that only understood the first would refuse a valid download on the platform
+   this project is developed on. Both forms are accepted, and the checksum is compared against
+   a whole field so a lookalike name cannot satisfy the check.
+8. **`cargo package -p kiomon-cli` cannot be run before the release.** It resolves
+   `kiomon-core = "0.1.0"` from the registry, which is the correct behaviour and means the
+   first release is the first verification of the second crate. `cargo package --list` works
+   offline and is what the pre-release checklist uses; the release workflow's `publish` job is
+   ordered core-then-cli with a five-minute index wait, because a crate cannot be published
+   against a dependency the registry has not indexed yet.
+9. **Writing the changelog was a documentation check on the CLI, and it found one real hole.**
+   `expires_at` is in the schema, `decay` acts on it, the packet warns about it, and `rate`,
+   `outcome` and `import` all write it — but `add` cannot set it, so a user cannot say "this is
+   true for a week" at the moment they save something. It is **not** fixed here, and the
+   reason is the reason this project exists: the flag's shape belongs with the hosted write
+   API (`expiresAt` as an absolute instant, or a `ttl` beside it — that decision is one the two
+   products must make together and not twice), and inventing a local `--ttl 30d` grammar in a
+   packaging work package is exactly the drift §9-D9 was written to avoid. It is the first item
+   of the follow-up list below.
+
+### WP8's acceptance criteria
+
+| # | Criterion | Where it is satisfied |
+|---|---|---|
+| 1 | A single command on a clean machine, then `init && add && search` works | the table above: `install.sh` and `install.ps1`, each run end to end to an archive made by `scripts/package.sh`, then the installed binary through the three-command loop. `release.yml` re-runs the same loop on every target it builds, from the binary it just built, before it is packaged |
+| 2 | `kiomon --version` reports a git sha | `kiomon 0.1.0 (git 844fa1720402-dirty)`, from `build.rs`; asserted by the two tests in `crates/kiomon-cli/tests/cli.rs`, and asserted again by `release.yml` against the tag's own sha, because the binary asserting itself is not the same as the release asserting the binary |
+| 3 | A tag builds four targets with no manual steps | `release.yml`: five targets (the plan's four plus Intel macOS, which is `--target` on an ARM runner), a `verify` job that runs the full test suite and the performance gates on the tagged commit, checksums generated in one job from the files being released, `gh release create --verify-tag`, then the two crates |
+
+### What WP9 inherits
+
+1. **The `serve` port is where the fourth dependency would go, and the budget is at 49 of 60.**
+   A loopback HTTP/1.1 server over `std::net` needs no crate and no async runtime, which is
+   what §9-D8 already asks for; the temptation to reach for `axum` or `hyper` is the thing to
+   measure against the plan's crate budget before writing the first line.
+2. **`kiomon-cli`'s `main.rs` is the process shell, and WP9 adds two more.** The version stamp,
+   the parser, the stream discipline and the exit-code mapping live there. `serve` and `mcp`
+   are two new `main.rs` files over the same `kiomon-core` verb layer, not two new engines —
+   and if a third process shell needs the JSON envelope, it moves out of `out.rs` and into the
+   library.
+3. **`meta.version` now carries a commit, which a server should pass through.** `/api/retrieve`
+   answering with a different `version` than the CLI on the same machine would be a needless
+   difference; the packet is already a verbatim port and the envelope should be one too.
+4. **The installers know nothing about a version** beyond the URL they were given, so a v1.1
+   release needs no change to either of them. What it does need is a `serve` story for a user
+   who installed with `install.sh` and wants the daemon managed — and the answer, consistent
+   with "no daemon until §9's trigger", is a documented line in a user's own service manager
+   rather than a `kiomon service install`.
+5. **Two follow-ups the packaging work exposed and did not do**, both argued above: a Homebrew
+   formula and an npm shim (the two things `cargo-dist` would have generated), and `add
+   --expires-at`/`--ttl` with the hosted write shape. Neither is urgent; both are recorded so
+   that "not yet" is a decision and not an oversight.
 
 ### WP9 — `serve` + `mcp`: two transports, one verb layer (2½ days) — **v1.1, per §9-D8**
 Loopback HTTP/1.1 — `std::net` and threads, no async runtime — answering the hosted
@@ -1304,7 +1430,7 @@ shape last.
 | **WP5.5** | ✅ **DONE** 2026-10-17 | `retrieve.rs` (the packet: five intents, the applicability rule, the ranking formula, the warning strings, the summary sentence — ported from the hosted `lib/retrieve.ts` and `routes/retrieve.ts`), the CLI verb with `--intent`/`--constraint`, migration `0003_link_valid_to.sql` (the column the ported conflict query needs and `0001` did not have), a bench row and a gate, and `docs/CONTRACT.md`'s packet shape. **312 tests** (218 core + 70 CLI + 24 others), clippy clean, 3 336 KiB binary. | |
 | **WP6** | ✅ **DONE** 2026-10-18 | `import.rs` (the JSONL record, the line validator, the markdown view and its reader, the filename rule), `store::export_page` (keyset paging over the row's own columns) and `store::import_batch` (one transaction per page, `exists`/`duplicate`/`written` in that order, workspaces created from the file), `portability.rs` (the streaming writer, the directory walk, the per-line reporter, the 2 MiB line cap with its drain), `MAX_TITLE`/`MAX_EXCERPT`/`MAX_BODY_BYTES` enforced on every door, and the `--config`-aware text limits in `docs/CONTRACT.md`. **426 tests** (268 core + 70 CLI + 25 CLI-portability + 18 CLI-embed + 21 core-vector + others), clippy clean, no new dependencies. | |
 | **WP7** | ✅ **DONE** 2026-10-17 | `embed.rs` (the `Embedder` trait, the `ollama` and `openai` shapes over `ureq`, the deterministic `stub`, the memory-text rule, the 20 000-character cap, the prefixes), `vector.rs` (brute-force cosine, blob encoding, the zero floor), the config file (`config.toml` with `default_workspace` and `[embedder]`, the first real TOML dependency), the write path (`add`, `update`, `reindex --embed`), `--legs auto|fts|vector|graph` with the hosted spellings as aliases, `degraded`/`reason` reporting, `doctor`'s embedder and coverage report, a `similarity` per vector-leg row, a bench row and gate for the hybrid budget, and the `--config` global flag. **376 tests** (243 core + 70 CLI + 18 CLI-embed + 21 core-vector + 9 store + others), clippy clean, **3 971 KiB** binary, **49** transitive crates of 60. | |
-| **WP8** | ⬜ TODO | |
+| **WP8** | ✅ **DONE** 2026-10-18 | `crates/kiomon-cli/build.rs` (the commit stamp: watched refs, `unknown` without a repository, `-dirty` for a modified tree), `crate::VERSION` in `--version`, `-V`, `meta.version` and the bench header; `install.sh` (POSIX, target detection, checksum verified by default, `--dry-run`, `--target`, `KIOMON_RELEASES_URL`) and `install.ps1` (Windows PowerShell 5.1, zip, user-PATH edit); `scripts/package.sh` (the archive layout both installers expect, five targets); `.github/workflows/release.yml` (verify on the tagged commit, five native builds, the tag's own sha asserted from the binary, one job's checksums, `--verify-tag` release, core-then-cli crates.io publish with an index wait); `CHANGELOG.md`; `docs/DESIGN.md` (the long-form argument this project has been writing into work-package records); README install section and CONTRIBUTING release checklist. **428 tests** (268 core + 72 CLI + 25 CLI-portability + 18 CLI-embed + 21 core-vector + others), clippy clean, no new dependencies. | |
 | **WP9** | ⬜ TODO (v1.1) | |
 
 ### The numbers so far, and what they cost

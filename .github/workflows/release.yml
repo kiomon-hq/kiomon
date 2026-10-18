@@ -1,0 +1,275 @@
+# Release
+#
+# <!-- SPDX-License-Identifier: Apache-2.0 -->
+#
+# One tag, and nothing else. `git tag -a v0.1.0 -m "0.1.0" && git push origin v0.1.0` runs
+# the whole thing: verify, build five targets, checksum, publish the GitHub Release, publish
+# the crates.
+#
+# Three properties this workflow is built for, in the order they matter:
+#
+# 1. **The binary proves which commit it is.** Every build is asked `--version` and must
+#    answer with the tag's version *and* the tag's sha. A build that says `-dirty`, or a sha
+#    that is not `$GITHUB_SHA`, fails the job rather than shipping.
+# 2. **Nothing is uploaded unverified.** Checksums are generated once, in one job, from the
+#    files that the release is made of, so `SHA256SUMS` cannot disagree with itself.
+# 3. **A re-run is safe.** The release is created if it does not exist and uploaded over if
+#    it does; a crate version already on crates.io is skipped rather than failing the tag.
+#
+# `scripts/package.sh` makes the archives, and it is the same script a laptop can run — see
+# the WP8 record in `plans/001-local-v1-core.md`.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Read-only by default, and the one job that writes says so: a workflow that can change the
+# repository should be a workflow whose write permission is a line somebody had to add.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # The tag is a claim about a commit. Everything a push to main has to pass, the tagged
+  # commit has to pass too — including the performance budget, which is the one check that
+  # a release could plausibly skip and should not.
+  verify:
+    name: verify the tagged commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked
+      - name: The performance budget, on the commit being released
+        run: |
+          set -o pipefail
+          ./target/release/kiomon bench --sizes 1000,10000 --runs 200 --repeat 1 --gate --json \
+            | tee bench.json
+      - name: The changelog has a section for this version
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -qE "^## \[${version//./\\.}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$version]' section"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench
+          path: bench.json
+
+  # Five targets, four runners: `x86_64-apple-darwin` is the one cross-compilation, because
+  # GitHub's arm64 macOS runner has both architectures' SDKs and a second Intel runner would
+  # be a second machine for a `--target` flag's worth of work. Everything else is built on
+  # the architecture it runs on, so a green job is a binary that actually linked.
+  build:
+    name: build (${{ matrix.target }})
+    needs: [verify]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: The binary must report the tag's version and the tag's commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/kiomon"
+          [ -f "$bin" ] || bin="$bin.exe"
+          case "${{ matrix.cross }}" in
+            # A cross-built binary cannot be executed here; its stamp comes from the same
+            # build script and the same checkout, and is asserted on the other macOS lane.
+            true) echo "skipping the version check: cross-compiled"; exit 0 ;;
+          esac
+          reported=$("$bin" --version)
+          echo "$reported"
+          version="${GITHUB_REF_NAME#v}"
+          sha=$(git rev-parse --short=12 HEAD)
+          case "$reported" in
+            *"$version (git $sha)"*) ;;
+            *) echo "::error::$reported does not name $version at $sha"; exit 1 ;;
+          esac
+          case "$reported" in
+            *-dirty*)
+              echo "::error::a release build must not come from a dirty tree"
+              exit 1
+              ;;
+          esac
+          # The smoke test the release promises a user: init, add, search, from the binary.
+          tmp=$(mktemp -d)
+          "$bin" init --db "$tmp/brain.db"
+          "$bin" add --db "$tmp/brain.db" --kind semantic --title "smoke test" --body "installed and ran" --confidence 0.9
+          "$bin" search --db "$tmp/brain.db" --legs fts smoke | grep -q "smoke test"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/kiomon"
+          [ -f "$bin" ] || bin="$bin.exe"
+          bash scripts/package.sh \
+            --version "${GITHUB_REF_NAME#v}" \
+            --target "${{ matrix.target }}" \
+            --binary "$bin" \
+            --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/kiomon-${{ matrix.target }}.*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish the GitHub release
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+
+      # One job generates every checksum, from the files being released. Two jobs writing
+      # their own lines into one file is how a `SHA256SUMS` ends up disagreeing with the
+      # archive beside it.
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          sha256sum kiomon-* | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+          # Every asset must have a line, and every line an asset.
+          [ "$(wc -l < SHA256SUMS)" -eq "$(ls kiomon-* | wc -l)" ]
+          sha256sum -c SHA256SUMS
+
+      - name: Release notes from the changelog
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # The section between this version's heading and the next `## `, verbatim.
+          # `index(...) == 1` and not equality: the heading carries a date after the version,
+          # so comparing against the version alone finds nothing. The link definitions at the
+          # bottom of the file are markdown plumbing, not release notes, and are dropped.
+          awk -v want="## [$version]" '
+            /^## / { inside = (index($0, want) == 1) }
+            inside && $0 !~ /^\[[^]]+\]:/ { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "no changelog section for $version; the release body will be generated"
+            echo "" > notes.md
+          fi
+
+      - name: Create the release, or upload over the existing one
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            if [ -s notes.md ]; then
+              gh release create "$tag" dist/* --title "kiomon $tag" --notes-file notes.md --verify-tag
+            else
+              gh release create "$tag" dist/* --title "kiomon $tag" --generate-notes --verify-tag
+            fi
+          fi
+          gh release view "$tag" --json assets --jq '.assets[].name'
+
+  # `kiomon-core` first, then the CLI: the CLI depends on the version being in the registry,
+  # and cargo will not publish a crate whose path dependency is not resolvable there. The
+  # wait is the crates.io index catching up, which is minutes and not seconds.
+  #
+  # The token is checked in a step and not in a job-level `if`: `secrets` is not one of the
+  # contexts a job-level condition can read, so guarding the job that way is a workflow that
+  # does not run at all.
+  publish:
+    name: publish to crates.io
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Should this job publish?
+        id: check
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "no CARGO_REGISTRY_TOKEN secret; skipping the crates.io publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/kiomon-core/$version")
+          echo "crates.io says $code for kiomon-core $version"
+          if [ "$code" = "200" ]; then
+            echo "kiomon-core $version is already published; nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish kiomon-core, then kiomon-cli
+        if: steps.check.outputs.skip == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cargo publish -p kiomon-core --locked
+          # The index is not instant. Five minutes is generous for a crate that was just
+          # published and much cheaper than a release that has to be finished by hand.
+          for attempt in $(seq 1 30); do
+            if curl -sf -o /dev/null "https://crates.io/api/v1/crates/kiomon-core/$version"; then
+              break
+            fi
+            echo "waiting for kiomon-core $version in the index ($attempt/30)"
+            sleep 10
+          done
+          cargo publish -p kiomon-cli --locked

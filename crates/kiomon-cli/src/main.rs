@@ -29,6 +29,23 @@ use clap::Parser;
 
 use cli::Cli;
 
+/// What this build is: the release number, and the commit inside it.
+///
+/// The release number is a promise about the wire; the commit is a promise about the
+/// binary. Both are needed to answer "is this the build with the fix in it", and neither
+/// is enough alone. `build.rs` stamps [`env!("KIOMON_GIT_SHA")`] — or `unknown` when the
+/// source had no repository, as a crates.io tarball does not.
+///
+/// It reaches three places, on purpose: `--version`, every JSON response's `meta.version`,
+/// and the bench report's header. An integration that logs one response, and a CI artifact
+/// that records one number, should each name the commit that produced them.
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (git ",
+    env!("KIOMON_GIT_SHA"),
+    ")"
+);
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,

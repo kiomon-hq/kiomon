@@ -167,16 +167,38 @@ transaction per command. No async runtime: every v1 operation is local I/O bound
 a single file, and a runtime would cost binary size and cold-start variance for
 nothing.
 
-The full argument — the scope cut, the schema, the retrieval ladder, the decay
-formula, the performance budget, and what was rejected — is in
-**[`plans/001-local-v1-core.md`](plans/001-local-v1-core.md)**.
+[`docs/DESIGN.md`](docs/DESIGN.md) is the long form of why the machine is shaped this
+way — the rules each decision protects, the storage layout, the two read paths, what is
+deliberately absent, and the numbers that settled each argument. The scope cut, the schema,
+the retrieval ladder, the decay formula, the performance budget, and what was rejected are
+in **[`plans/001-local-v1-core.md`](plans/001-local-v1-core.md)**, whose work-package
+records are the archaeology behind both.
+
+## Install
+
+One command, from a release archive, checksum verified:
+
+```sh
+# Linux and macOS
+curl -fsSL https://raw.githubusercontent.com/kiomon-hq/kiomon/main/install.sh | sh
+
+# Windows, in PowerShell
+irm https://raw.githubusercontent.com/kiomon-hq/kiomon/main/install.ps1 | iex
+```
+
+Both take `--dry-run` to print what they would do first, which is what you should run
+before piping anything from the internet into a shell. Prebuilt for Linux (x86-64, ARM64),
+macOS (Apple silicon, Intel) and Windows (x86-64); `install.sh --target <triple>` stages a
+build for another platform. From source:
+
+```sh
+cargo install --path crates/kiomon-cli        # or: cargo build --release
+```
 
 ## Quickstart
 
-Not yet packaged — build it from source for now (`cargo build --release`). There is no
-`init` step: the first write creates the database.
-
 ```sh
+kiomon init                               # creates the database and the default workspace
 kiomon add --kind semantic --title "Staging deploys need a manual migration"            --body "Run migrations before the deploy; the pipeline does not do it."            --tag deploy --tag staging --domain infra
 
 kiomon search "why did the deploy fail"   # ranked, with the match in context
