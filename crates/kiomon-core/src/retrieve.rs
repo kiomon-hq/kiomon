@@ -397,8 +397,10 @@ pub struct EvidenceRef {
 /// Two memories that disagree, both of which are in the packet.
 ///
 /// Surfaced, never resolved: which one is right is the caller's call, and this engine has
-/// no basis to make it. Always empty until the graph exists (§9-D9) — because nothing can
-/// write a `contradicts` edge yet, not because the check is missing.
+/// no basis to make it. Empty when nothing contradicts anything — which is most corpora,
+/// since a contradiction is a claim somebody made and not a similarity a ranker inferred —
+/// and never empty merely because the check is missing: a failed read is reported in
+/// `warnings` instead.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConflictNote {
     /// One side.
@@ -627,8 +629,9 @@ impl Database {
     /// **Fail-open, but not silently.** A typed-edge read is an enrichment: it decides
     /// whether a warning is printed, not what the packet contains, so a database failure
     /// here must not fail a retrieval. It must not be invisible either — `conflicts: []`
-    /// because nothing can write a contradiction yet (§9-D9) and `conflicts: []` because
-    /// the read failed are different facts, so the failure goes in the packet's warnings.
+    /// because nothing contradicts anything and `conflicts: []` because the read failed are
+    /// different facts, so the failure goes in the packet's warnings. Since WP5 the first
+    /// one is reachable: `link --relation contradicts` writes the edge this reads.
     fn typed_edges(&self, hits: &[SearchHit]) -> EdgeSignals {
         let mut superseded_by = BTreeMap::new();
         let mut contradicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -997,8 +1000,11 @@ pub fn source_ref_for(memory: &Memory) -> Option<String> {
 /// The summary sentence, in the hosted wording.
 ///
 /// The hosted version appends ` Graph activation added N linked candidates.` when its graph
-/// leg contributed. Local has no graph (§9-D9), so this cannot say that — and a summary
-/// claiming a contribution the packet did not have would be worse than a shorter sentence.
+/// leg contributed. The local packet does not walk the graph — its graph *leg* is v1.1
+/// (§4.3) even though the graph itself landed in WP5 — so this cannot say that, and a
+/// summary claiming a contribution the packet did not have would be worse than a shorter
+/// sentence. The graph's contribution to a local packet is the `conflicts` and supersession
+/// warnings, which are reported where they belong rather than in the count.
 #[must_use]
 pub fn summary_for(intent: Intent, facts: usize, procedure: bool, episodes: usize) -> String {
     let fact_word = if facts == 1 { "fact" } else { "facts" };
@@ -1042,7 +1048,7 @@ fn meta_list<'a>(envelope: &'a Value, key: &str) -> impl Iterator<Item = String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::NewMemory;
+    use crate::model::{NewMemory, Relation};
     use crate::testing;
     use serde_json::json;
 
@@ -1306,7 +1312,10 @@ mod tests {
         );
         assert_eq!(packet.facts[0].kind, "semantic");
         assert_eq!(packet.facts[0].applicability, "unknown");
-        assert!(packet.conflicts.is_empty(), "nothing can contradict yet");
+        assert!(
+            packet.conflicts.is_empty(),
+            "no edge in this fixture contradicts anything"
+        );
         assert!(packet.warnings.is_empty(), "nothing here is dubious");
     }
 
@@ -1932,6 +1941,151 @@ mod tests {
         assert_eq!(
             packet.summary, "No memories matched intent \"answer\".",
             "the empty summary a caller sees for an empty workspace, too"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The graph in a packet (WP5)
+    // -----------------------------------------------------------------------
+
+    /// Two memories on one subject, so both land in one packet.
+    fn a_pair(db: &Database) -> (String, String) {
+        let older = db
+            .add(
+                &NewMemory::new(MemoryKind::Semantic, "staging deploy migrations are manual")
+                    .body("A deploy to staging needs a manual migration.")
+                    .confidence(0.9),
+            )
+            .expect("the older memory must be written")
+            .id;
+        let newer = db
+            .add(
+                &NewMemory::new(
+                    MemoryKind::Semantic,
+                    "staging deploy migrations are automatic",
+                )
+                .body("The deploy to staging runs its migration automatically now.")
+                .confidence(0.9),
+            )
+            .expect("the newer memory must be written")
+            .id;
+        (older, newer)
+    }
+
+    #[test]
+    fn a_contradiction_written_by_hand_becomes_a_packet_conflict() {
+        // The packet's conflict read was ported in WP5.5 when nothing could write the edge
+        // it reads, so `conflicts: []` was the only reachable answer. This is the test that
+        // makes the other branch real: `link --relation contradicts` is the writer.
+        let db = testing::db();
+        let (older, newer) = a_pair(&db);
+        assert!(
+            db.retrieve(&query(Intent::Verify, "staging deploy migrations"))
+                .expect("a packet")
+                .conflicts
+                .is_empty(),
+            "no edge, no conflict"
+        );
+
+        db.link(&crate::model::NewLink {
+            source_id: newer.clone(),
+            target_id: older.clone(),
+            relation: Relation::Contradicts,
+            score: None,
+        })
+        .expect("the fixture contradiction must be written");
+
+        let packet = db
+            .retrieve(&query(Intent::Verify, "staging deploy migrations"))
+            .expect("a packet");
+        assert_eq!(packet.conflicts.len(), 1, "the pair is reported once");
+        let note = &packet.conflicts[0];
+        assert!(
+            [&note.memory_id_a, &note.memory_id_b].contains(&&older)
+                && [&note.memory_id_a, &note.memory_id_b].contains(&&newer),
+            "both ends are named: {note:?}"
+        );
+        assert_eq!(note.note, CONFLICT_NOTE);
+        assert!(
+            packet
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Conflicting memories")),
+            "a caller that reads only the warnings still learns about it: {:?}",
+            packet.warnings
+        );
+        assert!(
+            packet.retrieved_ids.contains(&older) && packet.retrieved_ids.contains(&newer),
+            "a conflict is surfaced, never auto-resolved by dropping a side"
+        );
+    }
+
+    #[test]
+    fn a_superseded_memory_is_warned_about_and_still_returned() {
+        // WP5 extended the relation vocabulary for exactly this: the packet reads
+        // `supersedes`, and before migration 0004 nothing could write one.
+        let db = testing::db();
+        let (older, newer) = a_pair(&db);
+        db.link(&crate::model::NewLink {
+            source_id: newer.clone(),
+            target_id: older.clone(),
+            relation: Relation::Supersedes,
+            score: None,
+        })
+        .expect("the fixture supersession must be written");
+
+        let packet = db
+            .retrieve(&query(Intent::Execute, "staging deploy migrations"))
+            .expect("a packet");
+        assert!(
+            packet.warnings.iter().any(|warning| {
+                warning.contains("is superseded by") && warning.contains(&newer)
+            }),
+            "the warning names the memory that replaced it: {:?}",
+            packet.warnings
+        );
+        assert!(
+            packet.retrieved_ids.contains(&older),
+            "demoted, never dropped: the caller can still see what was replaced"
+        );
+        assert!(packet.retrieved_ids.contains(&newer));
+    }
+
+    #[test]
+    fn a_closed_conflict_is_not_reported() {
+        // `valid_to` is how a settled argument stays settled, and the packet's read is
+        // `WHERE valid_to IS NULL`. Nothing writes the column yet, so the fixture closes
+        // the edge with SQL — the test is about the reader honouring the column.
+        let db = testing::db();
+        let (older, newer) = a_pair(&db);
+        db.link(&crate::model::NewLink {
+            source_id: newer.clone(),
+            target_id: older.clone(),
+            relation: Relation::Contradicts,
+            score: None,
+        })
+        .expect("the fixture contradiction must be written");
+        db.conn()
+            .execute(
+                "UPDATE memory_links SET valid_to = '2026-01-01T00:00:00Z'",
+                [],
+            )
+            .expect("the fixture must close the edge");
+
+        let packet = db
+            .retrieve(&query(Intent::Verify, "staging deploy migrations"))
+            .expect("a packet");
+        assert!(
+            packet.conflicts.is_empty(),
+            "a resolved contradiction is not a conflict"
+        );
+        assert!(
+            !packet
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Conflicting")),
+            "{:?}",
+            packet.warnings
         );
     }
 }

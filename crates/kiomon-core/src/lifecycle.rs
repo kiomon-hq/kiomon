@@ -501,6 +501,16 @@ impl Database {
                     |row| row.get(0),
                 )
                 .unwrap_or(None);
+            // Read before the status flip, because the auto-link pass needs the text and the
+            // scope, and the row is about to become findable — but the status flip is what
+            // makes the index row exist, so the text is read here and used below.
+            let text: Option<(String, String, String)> = transaction
+                .query_row(
+                    "SELECT workspace_id, title, body FROM memories WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .ok();
 
             transaction.execute(
                 "UPDATE memories
@@ -514,8 +524,16 @@ impl Database {
             if let Some(raw) = pending {
                 let targets: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
                 if !targets.is_empty() {
-                    crate::store::link_derived_from(&transaction, id, &targets)?;
+                    crate::links::link_derived_from(&transaction, id, &targets)?;
                 }
+            }
+            // The same activation hook `add` uses: a memory becomes findable here, so this
+            // is where it joins the graph. The row is in the index by now — the status flip
+            // is what the `mem_au` trigger watches for — so the ladder can see it (and is
+            // told to exclude it). A failure is not a failed approval: the memory is active
+            // and findable, and an edge is enrichment (see `store::insert_one`).
+            if let Some((workspace_id, title, body)) = text {
+                let _ = crate::links::auto_link(&transaction, id, &workspace_id, &title, &body);
             }
             moved.push(id.clone());
         }

@@ -661,6 +661,30 @@ fn single_probes(corpus: &CorpusReport) -> Vec<Probe> {
             }
         }),
     });
+    // The graph read, over the corpus's own planted edges (`bench::plant_graph` writes
+    // five neighbours per memory, which is the auto-link cap). One memory's neighbourhood,
+    // so the row measures two index seeks and a handful of row lookups rather than a size
+    // of graph — and it is on the corpus's sample id, the same one `get` reads, so the two
+    // rows can be read against each other.
+    probes.push(Probe {
+        label: "relate",
+        query: None,
+        matches: 0,
+        collect_ids: false,
+        args: Box::new({
+            let db = db.clone();
+            let id = id.clone();
+            move |_| {
+                Some(vec![
+                    "--db".to_owned(),
+                    db.clone(),
+                    "relate".to_owned(),
+                    "--quiet".to_owned(),
+                    id.clone(),
+                ])
+            }
+        }),
+    });
     // Last, because it is the most expensive row in the suite and because it is the one
     // that reads the whole corpus: running it earlier would put its page cache under
     // every row after it.
@@ -766,6 +790,8 @@ fn display_label(label: &str) -> String {
         | "add (cold file)"
         | "stats"
         | "get"
+        | "relate"
+        | "decay (dry run)"
         | "retrieve (no record)"
         | "retrieve (hybrid)" => label.to_owned(),
         name if name.starts_with("list")
@@ -849,10 +875,10 @@ fn one_capturing(
 /// their work package: a budget with a silent hole in it is a budget that looks better
 /// than it is.
 fn rejected_names() -> Vec<&'static str> {
-    vec![
-        DEFERRED_GATE,
-        "relate — no graph, deferred to the next sprint (§9-D9)",
-    ]
+    // WP5 removed the last row that was a *missing capability* (`relate` and the graph).
+    // What is left is not a hole in the build: it is a number this program cannot own,
+    // because a stub embedder has no model latency and CI has no model.
+    vec![DEFERRED_GATE]
 }
 
 /// This process's peak resident set, where the platform makes it free.

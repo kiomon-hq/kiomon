@@ -299,7 +299,9 @@ CREATE TABLE memory_links (
     id         INTEGER PRIMARY KEY,
     source_id  TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
     target_id  TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    relation   TEXT NOT NULL DEFAULT 'related_to',
+    relation   TEXT NOT NULL DEFAULT 'related_to'
+               CHECK (relation IN ('derived_from', 'supports', 'contradicts', 'supersedes',
+                                   'related_to', 'precedes', 'follows', 'part_of')),
     directed   INTEGER NOT NULL DEFAULT 0,
     score      REAL,
     origin     TEXT NOT NULL DEFAULT 'manual',   -- manual | auto | agent
@@ -309,6 +311,15 @@ CREATE TABLE memory_links (
 );
 CREATE INDEX idx_link_source ON memory_links(source_id);
 CREATE INDEX idx_link_target ON memory_links(target_id);
+
+-- `related_to` is the one symmetric relation, so it is stored once with the smaller id as
+-- its source: `A related_to B` and `B related_to A` are the same statement, and
+-- `UNIQUE (source_id, target_id, relation)` cannot tell that the reverse pair is the same
+-- edge. ULIDs sort by creation time, so the rule reads as "the older memory is the source".
+-- The `relate` read looks at both columns, which is what makes the order invisible.
+--
+-- The `supersedes` relation and the CHECK above arrived with `0004_link_supersedes.sql`:
+-- the packet reads `supersedes` and the original seven-name list could not write one.
 
 -- Optional vector leg. BLOB = little-endian f32, cosine-normalised on write.
 CREATE TABLE memory_embeddings (
@@ -535,7 +546,16 @@ Synchronous, bounded, no LLM — the highest-value cheap win:
 4. If `source_refs` were supplied, write `derived_from` edges (directed) —
    these are the provenance trails the platform wires on activation.
 
-Cost: one extra FTS query per write (~1 ms at 10k rows). Contradiction detection
+Cost: one extra FTS query per write. §5.2 estimated ~1 ms at 10 000 rows and the
+measurement was two orders of magnitude out — a kilobyte is about a hundred and fifty
+words, rung 3 of the ladder is an `OR` across all of them, and FTS5 scores and sorts every
+row in the corpus that shares any of them: 60 ms per write on a 1 000-memory corpus, which
+would have made the `add` budget unreachable and the corpus generator unusable. The pass
+still reads a kilobyte, and queries the first **twelve distinct terms** of it
+(`links::AUTO_LINK_MAX_TERMS`), which is ~1 ms and still a similarity signal — beyond a
+dozen, a bag-of-words score saturates into "how many common words does the row have".
+
+Contradiction detection
 (`contradicts` edges, quarantine) is deliberately v1.1: it needs claim-level
 comparison and is where the platform itself still runs a heuristic.
 
@@ -711,6 +731,14 @@ flaky-test generator):
 | `search` p95 (hybrid, local embedder) | ≤ 250 ms — **measured since WP7**, with the harness's stub embedder: 123.50 ms at n = 100 |
 | `retrieve` p95, no retrieval record (WP5.5) | ≤ 45 ms — read on the lexical leg, so the packet is compared with its own search |
 
+`relate` is measured and deliberately **not** gated: it is two index seeks plus one row
+lookup per neighbour, and at ten thousand memories it costs 2.90 ms of work — less than
+`get`, because the corpus's five planted neighbours are already in the page cache. A gate on
+a number that small would be a gate on process spawn, which is exactly the mistake §7's
+reading rule exists to prevent. Its row is in the report so a regression is visible; the
+gate it would need is a *shape* one (a per-neighbour query, say), and the row is what a
+reader compares against `get` to see it.
+
 > **The budget measures work, not wall time, and WP1 showed why.** Process spawn alone
 > is 8.6 ms on Windows, so a `search` that does nothing costs 8.6 ms and a `search` that
 > does everything allowed costs 8.6 + `open` + the query. The harness must therefore
@@ -789,22 +817,25 @@ three decaying kinds; `pinned` and `reference` rows never decay; `--dry-run`
 mutates nothing; a `--workspace` with `review_mode='review'` sends a
 `confidence=1.0` write to the inbox.
 
-### WP5 — The graph: links, auto-link, relate (2 days) — **DEFERRED (§9-D9)**
+### WP5 — The graph: links, auto-link, relate (2 days) — **shipped**
 `links.rs`, `link`/`unlink`/`relate`, the synchronous auto-link pass on activate,
 `origin` tagging, `derived_from` from `source_refs`.
 **Accept:** auto-link writes ≤5 edges and never a self-edge; `derived_from` edges
 are directed and `related_to` are not; `relate` returns 1-hop neighbours with
 relation + title + excerpt; purge cascades.
+**Corrections the work turned up**, argued in the record below: §5.2's cost estimate was
+two orders of magnitude out and the fix is a twelve-term query rather than a kilobyte of
+text; the relation vocabulary was missing `supersedes`, which the packet had been reading
+since WP5.5, and adding it needed migration `0004` (a table rebuild — SQLite cannot alter a
+`CHECK`); bulk corpus generation is not activation, so `insert_many` skips auto-linking and
+the corpus plants its own graph in one statement; `INSERT OR IGNORE` was silently
+swallowing schema violations, and the four writers now use `ON CONFLICT DO NOTHING`; and
+`--depth 2` is refused rather than answered with one hop.
 
-**Deferred to the next sprint by the owner on 2026-10-17.** Nothing below this line
-changes; what changes is that v1 does not wait for it. What already exists, and is tested:
-the `memory_links` table (directed and symmetric, with the `related_to` canonicalisation
-rule), `add --ref` writing a `derived_from` edge, `forget` cascading to every edge that
-touches the row, and a draft's `pending_derived_from` staging that `approve` wires up.
-What v1 does not do: write `related_to`, write `contradicts`/`supersedes`, read any of it
-back through a verb, or auto-link a memory against its neighbours. The three verbs and
-`get --relations` therefore stay stubs — but they now say **deferred**, because a message
-naming work package 5 of an in-flight plan reads as "coming in this release".
+WP5 was deferred to the next sprint by the owner on 2026-10-17 (§9-D9) and landed on
+2026-10-19. The deferral cost nothing: everything it inherited — the table, the
+canonicalisation rule, the `forget` cascade, the `pending_derived_from` staging, and the
+packet's typed-edge read — was already in place and is exercised by the tests below.
 
 ### WP5.5 — `retrieveMemory`: the intent-aware packet (1 day) — **in v1, per §9-D8**
 The `retrieve` verb and the packet: `summary`, `facts` / `procedure` (**one**, not a list)
@@ -841,6 +872,145 @@ packet is assembled in a bounded number of statements whatever the corpus size �
 that costs one query per hit is the thing that would make `search`'s 26.8 ms look cheap;
 and `retrieve` → `outcome` works as one loop, because `retrieved_ids` is exactly what
 `outcome` is fed.
+
+### WP5's numbers, and the five things it found
+
+Same machine, release build, warm cache, `C:` drive, measured by `kiomon bench` with the
+harness's stub embedder (`--runs 100`, read against `work`). The corpus was rebuilt by the
+current generator for this run, so its size differs from the one WP7 recorded — the planted
+graph is part of the file now, and the numbers below are comparable **within this record**
+and not across records.
+
+| Command | work p50 / p95 (ms) | total p50 | note |
+|---|---|---|---|
+| `open` | 2.20 / 4.01 | 10.13 | unchanged by WP5 |
+| `add` (hybrid: write + stub embed + auto-link) | 3.17 / 5.91 | 11.29 | gate ≤ 40 ms ✅ |
+| `add (cold file)` | 28.32 | 37.33 | the first write into a brand-new file |
+| `common (fts)` | 25.99 / 30.64 | 33.91 | gate ≤ 60 ms ✅ |
+| `common (hybrid)` | 64.05 / 76.86 | 72.10 | gate ≤ 250 ms ✅ |
+| `retrieve (no record)` | 18.99 / 23.82 | 26.98 | gate ≤ 45 ms ✅ |
+| **`relate`** (five neighbours) | **2.90 / 5.48** | 10.80 | two index seeks and five row lookups — less than `search`, less than `get` |
+| `decay (dry run)` | 63.11 / 71.38 | 71.42 | unchanged code |
+
+At 1 000 memories: `add` 3.19 / 5.60, `relate` 2.77 / 5.71, `common (fts)` 11.78,
+`retrieve (no record)` 7.37. Every gate passed at both sizes, and the whole suite costs
+about eleven minutes of wall time on this machine.
+
+**The corpus's graph is planted, and the `add` row is where auto-linking is measured.**
+`insert_many` writes the corpus in bulk and skips the pass (`store::Activation::Bulk`),
+because a per-row ranking over ten thousand rows of deliberately shared vocabulary is a
+ruler that takes minutes to build; `bench::plant_graph` gives every generated memory its
+five neighbours in one statement instead, which is the fan-out `relate` has to read. The
+links a real `add` writes are measured where they are produced: the `add` row's 3.17 ms p50
+includes one ladder climb, one score normalisation, and up to five inserts.
+
+### WP5's acceptance criteria
+
+| # | Criterion | Where it is asserted |
+|---|---|---|
+| 1 | Auto-link writes ≤5 edges and never a self-edge | `links::tests::auto_linking_writes_at_most_five_edges_and_never_a_self_edge` (asserts the cap, the absence of a self-edge, and `related_to`/`auto`/`score`/`direction: null` on every edge), plus the SQL exclusion in `search::climb` so the self would not consume a slot even if the assertion were deleted |
+| 2 | `derived_from` is directed and `related_to` is not | `a_directed_edge_is_stored_as_given_and_read_from_both_ends` (both ends, `out` and `in`), `a_symmetric_edge_is_one_row_whichever_end_it_is_written_from` (one row, either order, `direction: null`), `the_canonical_order_is_the_older_memory` |
+| 3 | `relate` returns 1-hop neighbours with relation + title + excerpt | `relate_returns_the_neighbour_with_its_title_and_excerpt` plus `relate_walks_one_hop_and_says_so_when_asked_for_more` at the library, and `crates/kiomon-cli/tests/graph.rs::relate_reports_a_neighbour_with_its_relation_and_title` through the binary |
+| 4 | Purge cascades | `forgetting_a_memory_takes_its_edges_with_it`, and `forgetting_a_neighbour_takes_the_edge_with_it` through the CLI |
+
+Beyond the plan's four: an edge to a draft is refused in either direction and hidden on the
+read even when a fixture writes one around the API; auto-linking cannot cross a workspace;
+an import writes no edges; `unlink` by pair, by relation, and from either end; a closed edge
+(`valid_to`) is not a neighbour; an archived neighbour is labelled rather than hidden; a
+`contradicts` edge becomes a packet conflict and a `supersedes` edge demotes what it
+replaced — both asserted at the library and again through the binary; a missing id is exit
+`2` on both `relate` and `get --relations`; and `--depth 2` is exit `3`.
+
+### Where WP5 contradicted the plan
+
+1. **§5.2's cost estimate was two orders of magnitude out, and the fix was the query rather
+   than the text.** "One extra FTS query per write (~1 ms at 10k rows)" assumed a short
+   query. A kilobyte of body is about a hundred and fifty words; the ladder's rung 3 is an
+   `OR` across all of them; FTS5 has to score and sort every row in the corpus that shares
+   any one of them. The first implementation took a 1 000-memory corpus build past sixty
+   seconds — around 60 ms per write, which would have put the `add` p95 gate (40 ms) out of
+   reach on its own. The pass still reads the title and a kilobyte of body, and it now
+   queries the first **twelve distinct terms** of them: the title leads because it is the
+   most distinctive and comes first, and the opening of the body fills the rest. Recorded
+   in `AUTO_LINK_MAX_TERMS` with the measurement, because the number will be revisited and
+   the reasoning is the part that has to survive.
+2. **Bulk generation is not activation.** `insert_many` exists for the corpus generator, and
+   running the pass per row makes the harness's own setup the most expensive thing in the
+   suite. It is now an explicit `Activation::Single | Activation::Bulk` at the one call
+   site that has a choice, and the corpus plants its graph (`plant_graph`, five neighbours
+   per memory, one statement). Two consequences worth stating: the corpus's `relate` row is
+   a real read over a realistic fan-out, and the `add` row is where the *pass* is measured.
+3. **`INSERT OR IGNORE` swallowed a schema violation.** `link --relation supersedes`
+   reported `created: false` — "already there" — because `0001`'s `CHECK` constraint did not
+   list `supersedes` and `IGNORE` ignores *every* constraint failure, not only the uniqueness
+   one. All four edge writers now use `ON CONFLICT DO NOTHING`, which ignores the duplicate
+   case (the only benign one) and raises everything else, and
+   `a_relation_this_build_cannot_write_is_a_schema_error_and_not_a_silent_skip` pins it by
+   writing an unknown relation past the enum with raw SQL.
+4. **The relation vocabulary was missing a relation the packet reads.** WP5.5 ported
+   `retrieve`'s typed-edge read from the hosted product, where it filters
+   `relation IN ('supersedes', 'contradicts')` — and the local enum had no `Supersedes`,
+   while the `CHECK` had no room for one. So the packet's supersession branch was dead code
+   for two work packages. Adding it needed migration `0004`, which rebuilds `memory_links`
+   (SQLite cannot alter a `CHECK`) while carrying the `valid_to` column that `0003` had
+   added — the first migration in this repository that had to know about another one's
+   column, and the reason it is written as create-copy-drop-rename with the indexes
+   recreated at the end.
+5. **`--relation` spelled its values the way clap wants, not the way the wire does.**
+   `--relation derived-from` was accepted and `--relation derived_from` — the string every
+   JSON response, every plan table and the hosted product use — was a usage error. The wire
+   spelling is now primary with the kebab form as an alias, which is the same argument
+   WP7's `--legs` aliases make: a caller that read a value off a response asks for it back
+   by the name it saw.
+
+### Two leaks the work closed, and one it left open
+
+6. **`add --ref` could cite a draft.** `link_derived_from` checked that a target existed and
+   nothing else, so an active memory could carry a `derived_from` edge to a memory in the
+   review inbox. That was harmless while nothing read edges back — and it would have leaked
+   the draft's title through `relate` on the very first day the read existed. The check is
+   now `status <> 'pending_approval'`, with the same message shape as the manual write's.
+7. **The read filters a state no writer can produce.** No verb can leave a draft or a
+   closed edge on the readable end of a link; `relate` hides both anyway, and two tests
+   write those rows past the API with raw SQL to prove the filter is doing work rather than
+   describing a happy path. Defence in depth is worth two fixtures here because the inbox's
+   promise — "no read path" — is the kind of statement that quietly stops being true when a
+   third read path is added.
+8. **What WP5 did *not* do, deliberately.** A multi-hop walk (`--depth 2` is refused, not
+   approximated: a path search is a different operation from a neighbourhood, and answering
+   a request for three hops with one is undetectable by the caller); a graph *leg* in
+   `search` (§4.3 gives the fused walk to v1.1, and `search --legs graph` now says exactly
+   that instead of blaming the graph); edges in the portability format (the export still
+   carries none, `import` still writes none, and `edges_included: false` states it — this is
+   the one *real* absence in the format, because a vector can be rebuilt from text and an
+   edge cannot); and a writer for `valid_to` (a resolution has no verb, `unlink` is what a
+   caller uses today, and the read already honours the column).
+
+### What the next sprint inherits (WP9, v1.1)
+
+1. **`/api/graph` is answerable now.** Appendix C's row went from
+   `unsupported_locally` to "the read is `Database::relations`, one hop per call", and the
+   one thing the route must not do is answer a one-hop list to a `depth: 3` request — the
+   same refusal, in HTTP, that `--depth 2` makes on the command line.
+2. **The packet still does not walk the graph, and the summary sentence still does not claim
+   it does.** WP5.5 omitted ` Graph activation added N linked candidates.` because there was
+   no graph; now there is one and the sentence is *still* absent, for a different reason: a
+   fused walk is §4.3's v1.1 work. The justification in `retrieve.rs` says so rather than
+   pointing at D9. The graph's contribution to a packet is the `conflicts` entry and the
+   supersession warning, which are reported where they belong.
+3. **Two writers now run inside a write's transaction** (`link_derived_from` and
+   `auto_link`), and both degrade to a warning rather than failing the save. Whoever adds a
+   third — the MCP tool for `link`, say — should keep that property: a memory that was
+   stored but not linked is a memory, and a save rolled back because a *ranking query*
+   failed is a lost memory.
+4. **The corpus's fidelity is now additive in two dimensions** (vocabulary and graph) and
+   both are planted. A future `relate` benchmark that wants a *hard* graph — high fan-out,
+   hubs, long paths — should say so in the generator rather than by running the real pass
+   ten thousand times.
+5. **The format's next growth is an edges section**, and the plan's WP6 record already
+   described the shape: `derived_from` is a column that travels, everything else is a row.
+   An edges section needs ids that may not exist yet (the file's order is not the graph's
+   order), which is the one design question to settle before writing it.
 
 ### WP5.5's numbers, and the three things it found
 
@@ -1127,6 +1297,14 @@ stdin; an import embedding what it wrote when an embedder answers and saying
 5. **Nothing here needs the graph, and that is load-bearing for §9-D9.** The portability
    format was designed with no edges in it, so the graph sprint can add an optional field
    without a format migration — and `derived_from` is already the shape it would take.
+   **WP5 landed and the field was not added.** The format still carries no edges, `import`
+   still writes none, and the export now says `edges_included: false` so that a caller
+   restoring a brain learns the graph did not come with it. This is the one absence in the
+   file that is a real loss rather than a saving — a vector is derived data that
+   `reindex --embed` rebuilds, and an edge is a fact somebody recorded — and it is recorded
+   here as the format's next piece of work rather than as a property of the design. The
+   design question to settle first is the one an edges section cannot dodge: the file's
+   order is not the graph's, so an edge may reference an id the importer has not seen yet.
 
 ### WP7's numbers, and what they found
 
@@ -1426,7 +1604,7 @@ shape last.
 | **WP2** | ✅ **DONE** 2026-10-14 | `search.rs` (the quoted ladder, the ranked window, the snippet query, the retrieval record), `fuse.rs` (RRF, ported from `rrf.ts`), the filter and ordering flags, `docs/CONTRACT.md` §Reading rewritten as v1, and the `--json` shapes for a search. **204 tests** (`cargo test --workspace`), clippy clean, `cargo fmt --check` clean. Exit codes 0/2/3/4 each asserted through the binary, `search | jq`'s property asserted rather than assumed. |
 | **WP3** | ✅ **DONE** 2026-10-14 | `kiomon bench` (cold-process timings, the plan's gates, `--json`, the corpus generator it ships with), `crates/kiomon-core/benches/store.rs` (in-process, no Criterion — see below), a CI job that fails on a missed gate and publishes the numbers as an artifact, and the README's numbers replaced with measured ones. **146 core + 9 integration tests**, clippy clean. |
 | **WP4** | ✅ **DONE** 2026-10-16 | `lifecycle.rs` (the review inbox, `pin`/`archive`/`restore`/`rate`/`outcome` with the hosted product's credit rules), `decay.rs` (the formula, the paged command, the resumable daily nudge), migration `0002_lifecycle.sql`, the five lifecycle commands wired end to end, `doctor` reporting when decay last ran, and the CONTRACT's lifecycle section rewritten around what the verbs *actually* move. **274 tests** (192 core + 58 CLI + 24 others), clippy clean, 3 324 KiB binary. |
-| **WP5** | ⏸ **DEFERRED** to the next sprint (§9-D9, 2026-10-17) — a scope cut, not a design change: the spec below is unchanged and is the next sprint's first work package | |
+| **WP5** | ✅ **DONE** 2026-10-19 (the deferral of 2026-10-17 paid in full, §9-D9) | `links.rs` (the typed edge, the symmetric canonicalisation, the one-hop read, and the auto-link pass), `link`/`unlink`/`relate`/`get --relations` as real verbs, the activation hook on both of its entries (`add` and `review approve`), `Relation::Supersedes` + migration `0004` (the `CHECK` rebuilt, because the packet had been reading a relation nothing could write), `ON CONFLICT DO NOTHING` at the four edge writers (an `INSERT OR IGNORE` had been hiding a schema violation), the corpus's planted graph and the `relate` bench row, and the draft/workspace/closed-edge filters on the read. **476 tests** (296 core + 71 CLI + 26 CLI-portability + 18 CLI-embed + 20 CLI-graph + 21 core-vector + others), clippy clean, **4.1 MiB** binary, **49** crates. | |
 | **WP5.5** | ✅ **DONE** 2026-10-17 | `retrieve.rs` (the packet: five intents, the applicability rule, the ranking formula, the warning strings, the summary sentence — ported from the hosted `lib/retrieve.ts` and `routes/retrieve.ts`), the CLI verb with `--intent`/`--constraint`, migration `0003_link_valid_to.sql` (the column the ported conflict query needs and `0001` did not have), a bench row and a gate, and `docs/CONTRACT.md`'s packet shape. **312 tests** (218 core + 70 CLI + 24 others), clippy clean, 3 336 KiB binary. | |
 | **WP6** | ✅ **DONE** 2026-10-18 | `import.rs` (the JSONL record, the line validator, the markdown view and its reader, the filename rule), `store::export_page` (keyset paging over the row's own columns) and `store::import_batch` (one transaction per page, `exists`/`duplicate`/`written` in that order, workspaces created from the file), `portability.rs` (the streaming writer, the directory walk, the per-line reporter, the 2 MiB line cap with its drain), `MAX_TITLE`/`MAX_EXCERPT`/`MAX_BODY_BYTES` enforced on every door, and the `--config`-aware text limits in `docs/CONTRACT.md`. **426 tests** (268 core + 70 CLI + 25 CLI-portability + 18 CLI-embed + 21 core-vector + others), clippy clean, no new dependencies. | |
 | **WP7** | ✅ **DONE** 2026-10-17 | `embed.rs` (the `Embedder` trait, the `ollama` and `openai` shapes over `ureq`, the deterministic `stub`, the memory-text rule, the 20 000-character cap, the prefixes), `vector.rs` (brute-force cosine, blob encoding, the zero floor), the config file (`config.toml` with `default_workspace` and `[embedder]`, the first real TOML dependency), the write path (`add`, `update`, `reindex --embed`), `--legs auto|fts|vector|graph` with the hosted spellings as aliases, `degraded`/`reason` reporting, `doctor`'s embedder and coverage report, a `similarity` per vector-leg row, a bench row and gate for the hybrid budget, and the `--config` global flag. **376 tests** (243 core + 70 CLI + 18 CLI-embed + 21 core-vector + 9 store + others), clippy clean, **3 971 KiB** binary, **49** transitive crates of 60. | |
@@ -2045,6 +2223,16 @@ packages:
   against its neighbours — so `retrieve` (WP5.5) reports no conflicts and no superseded
   warnings, and Appendix C's `/api/graph` answers `unsupported_locally` until WP5 lands.
 
+  **The next sprint was this one: D9 was paid on 2026-10-19.** WP5 landed everything the
+  paragraph above lists as missing — `link`, `unlink`, `relate`, `get --relations`, the
+  auto-link pass, the `related_to` and `contradicts` writers, and the `supersedes` writer
+  that made the packet's demotion reachable. The cost of the deferral was zero: the
+  schema, the canonicalisation rule, the cascade and the staging column all survived it
+  unchanged, and the packet's typed-edge read was written against a table that was already
+  correct. What the deferral *did* buy is a little perspective: WP5.5's port was the thing
+  that found `valid_to` and `supersedes` missing, and had the graph been built first
+  neither hole would have been visible until a user hit it.
+
 ### D1 — Is the vector leg in v1's default build? ⚠️ biggest fork
 
 | Option | Cost | Consequence |
@@ -2267,7 +2455,7 @@ opinion invented here would be a fourth implementation of a format nobody owns.
 | `GET /api/documents/{id}` | `getMemory` | `get` (WP1) |
 | `POST /api/memories/batch-draft` | `draftMemory` | `add`, batched (`insert_many`, WP3) |
 | `POST /api/memories/record-outcome` | `recordOutcome` | `outcome` (WP4) |
-| `GET /api/graph?id&relation&depth` | `exploreMemoryGraph` | ❌ `unsupported_locally` — deferred with WP5 (§9-D9), and never an empty `200` |
+| `GET /api/graph?id&relation&depth` | `exploreMemoryGraph` | ✅ since WP5 — `Database::relations` is the read, one hop per call. `depth > 1` is `unsupported_locally` (a path search, not a neighbourhood), and the route must not answer a one-hop list to a three-hop question |
 | `PATCH /api/documents/{id}` `{"pinned": 0\|1}` | `manageMemory` pin/unpin | `pin`/`unpin` (WP1) |
 | `POST /api/documents/{id}/rate` `{"rating": n}` | `manageMemory` rate | `rate` (WP4) |
 | `POST /api/documents/{id}/{action}` | `manageMemory` archive/restore/forget/approve/reject | WP4 + WP5 verbs |

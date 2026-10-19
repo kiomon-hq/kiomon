@@ -172,6 +172,12 @@ pub enum Relation {
     Supports,
     /// This memory conflicts with the target.
     Contradicts,
+    /// This memory replaces the target — the target is the older, weaker claim.
+    ///
+    /// Directed, and read by the packet: `retrieve` demotes the target and warns
+    /// "prefer the newer memory". It was not in the plan's relation list, and the
+    /// packet's own supersession read had been dead code without it (`plans`§8 WP5).
+    Supersedes,
     /// Unspecified similarity. Undirected, and what auto-linking writes.
     RelatedTo,
     /// This memory happened before the target (episodic ordering).
@@ -184,10 +190,11 @@ pub enum Relation {
 
 impl Relation {
     /// Every relation.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::DerivedFrom,
         Self::Supports,
         Self::Contradicts,
+        Self::Supersedes,
         Self::RelatedTo,
         Self::Precedes,
         Self::Follows,
@@ -201,6 +208,7 @@ impl Relation {
             Self::DerivedFrom => "derived_from",
             Self::Supports => "supports",
             Self::Contradicts => "contradicts",
+            Self::Supersedes => "supersedes",
             Self::RelatedTo => "related_to",
             Self::Precedes => "precedes",
             Self::Follows => "follows",
@@ -825,7 +833,8 @@ pub enum Legs {
     /// Vector only. An error, not a fallback, when there is no embedder: a request for
     /// one thing is never answered with another.
     Vector,
-    /// The graph leg, which this release does not have (§9-D9).
+    /// The graph leg: a walk fused into the ranking, which is v1.1 (§4.3). The graph
+    /// itself landed in WP5 and `relate` walks it; what is missing is the *leg*.
     ///
     /// A leg in the vocabulary so that asking for it is possible and being told no is
     /// explicit — the same reasoning the hosted product gives for keeping `graph` in
@@ -1186,6 +1195,95 @@ pub struct ForgetOutcome {
     /// The ids that did not exist. Reported rather than fatal, because deleting five
     /// memories of which one was already gone should not undo the other four.
     pub missing: Vec<String>,
+}
+
+/// One typed edge, before it is written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewLink {
+    /// The memory the edge starts at.
+    pub source_id: String,
+    /// The memory the edge points to.
+    pub target_id: String,
+    /// What kind of edge it is.
+    pub relation: Relation,
+    /// Similarity, 0.0–1.0, when a measurement produced the edge.
+    pub score: Option<f64>,
+}
+
+/// What writing one edge did.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LinkOutcome {
+    /// The source **as stored**. A symmetric relation is canonicalised, so a caller that
+    /// passed the pair one way round may read it back the other way — and that row is the
+    /// only row, which is what makes `related_to` idempotent from both ends.
+    pub source_id: String,
+    /// The target as stored. See [`LinkOutcome::source_id`].
+    pub target_id: String,
+    /// The relation as stored.
+    pub relation: Relation,
+    /// False when the edge was already there. Not an error: linking twice is idempotent,
+    /// and a caller replaying a batch should not have to distinguish it from a fresh link.
+    pub created: bool,
+}
+
+/// What removing edges did.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UnlinkOutcome {
+    /// How many rows were removed. Zero means there was no such edge — the caller's
+    /// request was already satisfied, which is exit `2` and not a failure.
+    pub removed: usize,
+}
+
+/// Which way round a directed edge is, seen from the memory that was asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeDirection {
+    /// The memory asked about is the edge's source: it *does* the relation.
+    Out,
+    /// The memory asked about is the edge's target: the neighbour does it to it.
+    In,
+}
+
+impl EdgeDirection {
+    /// The wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Out => "out",
+            Self::In => "in",
+        }
+    }
+}
+
+/// One memory on the other end of an edge.
+///
+/// The neighbour's title and excerpt travel with the edge rather than only its id: a
+/// graph a caller has to dereference one node at a time is a graph nobody walks, and this
+/// is the shape the plan's WP5 acceptance names.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Neighbour {
+    /// The neighbour's id.
+    pub memory_id: String,
+    /// The kind of edge.
+    pub relation: Relation,
+    /// `out` or `in` for a directed relation; `None` for `related_to`, where the stored
+    /// direction is a canonicalisation and not a fact about the two memories.
+    pub direction: Option<EdgeDirection>,
+    /// The edge's similarity score, when it has one.
+    pub score: Option<f64>,
+    /// Who wrote the edge: `manual`, `auto`, or `agent`.
+    pub origin: String,
+    /// When the edge was written.
+    pub created_at: String,
+    /// The neighbour's kind.
+    pub kind: MemoryKind,
+    /// The neighbour's title.
+    pub title: String,
+    /// The neighbour's excerpt. Empty rather than absent.
+    pub excerpt: String,
+    /// The neighbour's status. Archived neighbours are shown with the status that says
+    /// so; a memory waiting in the review inbox is not shown at all.
+    pub status: Status,
 }
 
 /// How much is in the brain.

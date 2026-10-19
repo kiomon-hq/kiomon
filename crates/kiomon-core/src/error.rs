@@ -109,12 +109,19 @@ pub enum Error {
     /// caller: one names a package that is being worked on in this release, the other says
     /// the feature is not in this release at all. Both are honest; only one of them tells
     /// a caller to wait.
-    #[error(
-        "`{command}` is not in this release: the knowledge graph is deferred to the next sprint (see §9-D9 of plans/001-local-v1-core.md)"
-    )]
+    ///
+    /// The reason travels with the variant instead of living in one `#[error]` string,
+    /// because there is more than one of these and they are left out for different
+    /// reasons: the graph *leg* of a search was never v1's (§4.3 gives the walk to v1.1),
+    /// while the graph itself — `link`, `relate`, the auto-link pass — shipped in WP5. A
+    /// single message would have to be vague enough to cover both, and a caller that
+    /// cannot tell *why* something is missing cannot tell whether to wait for it.
+    #[error("`{command}` is not in this release: {reason}")]
     Deferred {
-        /// The subcommand, as typed.
+        /// The command, as a caller would type it.
         command: &'static str,
+        /// Why it is not, in one sentence.
+        reason: &'static str,
     },
 
     /// An internal invariant was broken. Always a bug in this crate.

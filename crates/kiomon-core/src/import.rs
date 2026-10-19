@@ -27,11 +27,15 @@
 //! not have that model. Text in, vector out: `kiomon reindex --embed` regenerates them,
 //! and `import` re-embeds as it writes when an embedder is configured.
 //!
-//! **Edges.** The graph is not in v1 (§9-D9 of the plan): nothing can write `related_to`
-//! or `contradicts`, nothing reads either back, and exporting rows that no verb can
-//! create would make the file look richer than the tool. A draft's *pending* provenance
-//! (`--derived-from` before approval) is a column rather than an edge, so it does travel,
-//! as `derived_from`.
+//! **Edges.** The graph exists since WP5 and the format still carries none of it: a
+//! restore brings back every memory and no relationships, and `import` does not auto-link
+//! what it writes, because a bulk restore is not an activation. `export`'s summary says
+//! `edges_included: false` so a caller learns that before the restore rather than after
+//! it. This is the one absence in the file that is a real loss rather than a saving — a
+//! vector is derived data that `reindex --embed` rebuilds, and an edge is a fact somebody
+//! recorded — and it is recorded as the format's next piece of work. A draft's *pending*
+//! provenance (`--derived-from` before approval) is a column rather than an edge, so it
+//! does travel, as `derived_from`.
 //!
 //! # Two limits that are not the database's
 //!

@@ -36,7 +36,7 @@
 //! | [`fuse`] | reciprocal rank fusion |
 //! | [`bench`] | the measurement corpus, so a number has a shape to mean |
 //! | `lifecycle` / `decay` | the review inbox, feedback, and forgetting *(WP4)* |
-//! | `links` | typed edges and the auto-link pass *(WP5 — deferred, §9-D9)* |
+//! | `links` | typed edges, the auto-link pass, and the one-hop read *(WP5)* |
 //! | [`import`] | JSONL and markdown in and out *(WP6)* |
 //! | `embed` / `vector` | the optional vector leg *(WP7)* |
 //!
@@ -72,6 +72,7 @@ pub mod hash;
 pub mod id;
 pub mod import;
 pub mod lifecycle;
+pub mod links;
 pub mod metadata;
 pub mod model;
 pub mod retrieve;
@@ -95,12 +96,14 @@ pub use lifecycle::{
     AppliedOutcome, Assessment, IdsOutcome, OutcomeReport, PendingQuery, Rating, RatingOutcome,
     ReviewOutcome, Skipped, TaskOutcome,
 };
+pub use links::{AUTO_LINK_BODY_BYTES, AUTO_LINK_CANDIDATES, AUTO_LINK_MIN_SCORE, AUTO_LINK_TOP_N};
 pub use model::{
-    AddOutcome, DEFAULT_SNIPPET_TOKENS, EmbedReport, EmbedState, ForgetOutcome, KindCount, Legs,
-    LegsRun, ListQuery, ListSort, MAX_BODY_BYTES, MAX_EXCERPT, MAX_TAGS, MAX_TITLE, Memory,
-    MemoryJson, MemoryKind, MemoryPatch, MemorySummaryJson, NewMemory, Relation, ReviewMode, Scope,
-    SearchAttempt, SearchHit, SearchHitJson, SearchOutcome, SearchQuery, SearchSort, Stats, Status,
-    StatusCount, UpdateOutcome, WINDOW_OVERFETCH, Workspace, source_label,
+    AddOutcome, DEFAULT_SNIPPET_TOKENS, EdgeDirection, EmbedReport, EmbedState, ForgetOutcome,
+    KindCount, Legs, LegsRun, LinkOutcome, ListQuery, ListSort, MAX_BODY_BYTES, MAX_EXCERPT,
+    MAX_TAGS, MAX_TITLE, Memory, MemoryJson, MemoryKind, MemoryPatch, MemorySummaryJson, Neighbour,
+    NewLink, NewMemory, Relation, ReviewMode, Scope, SearchAttempt, SearchHit, SearchHitJson,
+    SearchOutcome, SearchQuery, SearchSort, Stats, Status, StatusCount, UnlinkOutcome,
+    UpdateOutcome, WINDOW_OVERFETCH, Workspace, source_label,
 };
 pub use retrieve::{
     Applicability, ConflictNote, ContextPacket, DEFAULT_PACKET_ITEMS, EvidenceRef, Intent,

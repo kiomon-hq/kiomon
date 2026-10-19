@@ -46,6 +46,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "0003_link_valid_to",
         sql: include_str!("../migrations/0003_link_valid_to.sql"),
     },
+    Migration {
+        name: "0004_link_supersedes",
+        sql: include_str!("../migrations/0004_link_supersedes.sql"),
+    },
 ];
 
 /// The pragmas every connection gets.

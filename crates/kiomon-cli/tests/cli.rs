@@ -292,36 +292,6 @@ fn diagnostics_never_reach_stdout() {
     assert!(stderr(&out).contains("kiomon: "), "{}", stderr(&out));
 }
 
-#[test]
-fn every_verb_that_does_not_work_says_which_sprint_owns_it() {
-    // The table *is* the list of what does not work yet, asserted rather than assumed: when
-    // a work package lands, its row leaves this table and becomes a real test. WP6 emptied
-    // it of `export` and `import`; what is left is the graph, which is not "later in v1"
-    // but "not in v1 at all" (§9-D9), and this asserts the difference rather than trusting
-    // it — a caller has to be able to tell "coming in this release" from "not coming".
-    let sandbox = Sandbox::new();
-    let db = sandbox.db_arg();
-    let cases: [(&str, &[&str]); 3] = [
-        ("link", &["link", "k_a", "k_b", "--db", &db]),
-        ("unlink", &["unlink", "k_a", "k_b", "--db", &db]),
-        ("relate", &["relate", "k_a", "--db", &db]),
-    ];
-    for (name, args) in cases {
-        let out = run(args);
-        assert_eq!(code(&out), 1, "`{name}` should be a refusal");
-        let text = stderr(&out);
-        assert!(text.contains(name), "`{name}`: {text}");
-        assert!(
-            text.contains("next sprint"),
-            "`{name}` should say it is the next sprint's work: {text}"
-        );
-        assert!(
-            !text.contains("work package"),
-            "`{name}` must not promise a work package in this release: {text}"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // retrieve
 // ---------------------------------------------------------------------------
@@ -760,48 +730,28 @@ fn retrieve_covers_every_workspace_only_when_asked() {
 }
 
 #[test]
-fn the_graph_says_deferred_rather_than_on_its_way() {
-    // §9-D9 cut the graph from v1, so "work package 5 is coming" is the wrong thing to
-    // tell a caller: it describes a package in an in-flight plan, and WP5 is not in this
-    // release. `get --relations` is in this table because it is the same refusal reached
-    // through a flag rather than a verb — the one an agent is most likely to hit by
-    // accident, and the one where an empty success would be a lie.
+fn the_graph_verbs_no_longer_refuse_and_say_what_is_missing_instead() {
+    // This test used to be the table of what does not work yet, and the graph's three
+    // verbs were its rows until WP5. What survives is the part that is still true: the
+    // graph is here, and the missing things say which thing is missing rather than printing
+    // an empty success. A memory that does not exist is exit 2 (not a lie about an empty
+    // neighbourhood), and a *depth* this build cannot walk is exit 3 (not a one-hop answer
+    // to a three-hop question).
     let sandbox = Sandbox::new();
     let db = sandbox.db_arg();
-    let cases: [(&str, &[&str]); 4] = [
-        (
-            "link",
-            &[
-                "link",
-                "--db",
-                &db,
-                "k_01",
-                "k_02",
-                "--relation",
-                "supports",
-            ],
-        ),
-        ("unlink", &["unlink", "--db", &db, "k_01", "k_02"]),
-        ("relate", &["relate", "k_01", "--db", &db]),
-        (
-            "get --relations",
-            &["get", "--db", &db, "k_01", "--relations"],
-        ),
-    ];
-    for (name, args) in cases {
-        let out = run(args);
-        assert_eq!(code(&out), 1, "`{name}` should refuse: {}", stderr(&out));
-        let text = stderr(&out);
-        assert!(text.contains("not in this release"), "`{name}`: {text}");
-        assert!(
-            text.contains("deferred to the next sprint"),
-            "`{name}` should say where the graph went: {text}"
-        );
-        assert!(
-            !text.contains("work package"),
-            "`{name}` must not promise a work package in this release: {text}"
-        );
-    }
+    let missing = "k_01ZZZZZZZZZZZZZZZZZZZZZZZZ";
+
+    let out = run(&["relate", "--db", &db, missing]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains("no memory"), "{}", stderr(&out));
+
+    let out = run(&["get", "--db", &db, missing, "--relations"]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains("no memory"), "{}", stderr(&out));
+
+    let out = run(&["unlink", "--db", &db, missing, missing]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stdout(&out).contains("no edge"), "{}", stdout(&out));
 }
 
 #[test]

@@ -26,12 +26,12 @@ That is the whole product: **save once, query forever**, locally.
 
 **Pre-alpha, and it works.** `init`, `doctor`, `stats`, `add`, `update`, `export`,
 `import`, `get`, `list`, `search`, `retrieve`, `reindex`, `review`, `rate`, `outcome`,
-`decay`, `pin`, `archive`, `restore` and `forget` all run end to end against a real SQLite
-file. The core loop — save something, find it again by a sentence or by meaning, ask for
-what to use next, tell it whether what you found helped, let what nobody uses fade, and get
-the whole thing out as a file you own — is complete, with one deliberate hole: the graph.
-`link` and `relate` are not in this release and say so along with the sprint that owns
-them (§9-D9 of the plan).
+`decay`, `pin`, `archive`, `restore`, `forget`, `link`, `unlink` and `relate` all run end to
+end against a real SQLite file. The core loop — save something, find it again by a sentence
+or by meaning, ask for what to use next, tell it whether what you found helped, let what
+nobody uses fade, watch what relates to what, and get the whole thing out as a file you own —
+is complete. What is left is the version after this one: `kiomon serve` and `kiomon mcp`
+(v1.1), and a graph *leg* inside a search, which is a ranking walk rather than a read.
 
 The work packages in [`plans/001-local-v1-core.md`](plans/001-local-v1-core.md) §8 are
 being executed in order, and the plan records where reality contradicted it rather than
@@ -72,8 +72,9 @@ long, and one memory in seven containing the word `deploy`.
 | `kiomon search "deploy" --legs vector` (384 dims) | 61.1 ms | 98.2 ms | 72.4 ms |
 | **`kiomon search "deploy"` (both legs, stub embedder)** | **81.6 ms** | **123.5 ms** | 92.0 ms |
 | `kiomon retrieve "deploy"` (context packet, lexical) | 24.1 ms | 37.3 ms | 35.8 ms |
+| `kiomon relate <id>` (five neighbours, planted corpus graph) | 2.9 ms | 5.5 ms | 10.8 ms |
 
-Binary **4.0 MiB** from **49** transitive crates. The plan's gates are `open` p50 ≤ 5 ms,
+Binary **4.1 MiB** from **49** transitive crates. The plan's gates are `open` p50 ≤ 5 ms,
 `add` p95 ≤ 40 ms, `search` p95 ≤ 60 ms (lexical) and ≤ 250 ms (hybrid) at ten thousand
 memories: all met, with the first write to a brand-new database file the one number that is
 genuinely expensive — **16.6 ms**, against 3 ms for the next write into the same file.
@@ -125,12 +126,12 @@ compare. `kiomon bench --repeat 3` prints each pass's median beside the verdict.
 | **Hybrid retrieval** | The same ranking fused with a vector leg by reciprocal rank (`k = 60`), on the formula the hosted product uses. **Bring your own model**: point `[embedder]` at Ollama or any OpenAI-compatible server and every write embeds itself; nothing is downloaded, no ONNX runtime is linked, and a brain with no `[embedder]` block is a full-text brain rather than a broken one. `--legs fts` never touches the network, `--legs vector` exits `4` with the config key to add rather than being quietly answered from the lexical leg, and `auto` says *why* when the vector leg did not run. `kiomon reindex --embed` backfills what predates the embedder, and `doctor` reports the coverage gap. |
 | **Lifecycle** | Confidence, importance, strength, pin, archive, rating, and honest decay — unpinned memories weaken on a per-kind half-life (`episodic 30d`, `procedural 90d`, `semantic 180d`, stretched up to 2× by use), and pass below `0.05` into the archive rather than into oblivion. `reference` memories never decay: a file you saved is not a claim that gets less true. Decay is a command, not a daemon, and `add` nudges it at most once a day; `doctor` tells you when it has not run. |
 | **Review inbox** | Agent writes below the confidence threshold land pending until approved, and **a pending memory is not in the index at all** — a review inbox that leaks into retrieval is worse than none. `review approve` activates and indexes it, `review reject` archives it rather than deleting it, and a draft's `--derived-from` provenance waits on the row until it is allowed to become an edge. |
-| **Knowledge graph** | **Not in v1** — deferred to the next sprint (§9-D9 of the plan). The schema is here and `--ref` already writes a `derived_from` edge, but `link`, `unlink`, `relate` and the auto-link pass are not, and they say *deferred* rather than *coming in this release*: an agent that waits for a package it cannot look up waits for nothing. |
+| **The graph** | Typed, directed edges — `derived_from`, `supports`, `contradicts`, `supersedes`, `related_to`, `precedes`, `follows`, `part_of` — written by `link`, read by `relate` and `get --relations`, removed with the memory by `forget`. **Activation links for you**: every `add` and `approve` connects the new memory to at most five of its closest neighbours as `related_to`, from the title and the first kilobyte of the body, with a relative score floor that needs no tuning. `related_to` is symmetric, so both directions are one row; a memory waiting in the review inbox has no edges in either direction, so the inbox cannot leak through the graph. The packet reads what it finds: a `contradicts` edge becomes a `conflicts` entry and a warning, a `supersedes` edge demotes the memory it replaced and says so. |
 | **Feedback** | `rate` and `outcome` credit a memory's **confidence** and a running feedback score, so the corpus gets sharper instead of just bigger. `outcome` takes a task's end state and up to fifty assessments (`helpful`, `unused`, `misleading`, `outdated`), records every one of them before applying it, and expires what an agent reports as stale. **Neither verb touches `strength`** — decay owns that number, and a multiplier written by a rating would not survive one pass. |
 | **Workspaces** | isolation is a `WHERE` clause. `--workspace` stays where you point it; `--workspace '*'` is an explicit opt-in to every workspace. |
 | **Agent-grade CLI** | every command takes `--json`, exit codes are stable and documented, and diagnostics never pollute stdout — so `kiomon search … \| jq` always works. A search reports which of its three query forms answered, and which legs ran, so an agent can see *why* it got what it got. |
 | **Measured, not asserted** | `kiomon bench` measures this build on your machine: cold-process timings per command, the corpus's shape, the process-spawn floor, and the plan's budget applied as a pass or a fail. It ships in the binary so the numbers above are falsifiable. |
-| **Yours** | `export` to JSONL (one memory per line, the stored row, nothing derived) or to a directory of markdown documents, and `import` back from either — a file, a directory of notes, or stdin. **Ids, status and timestamps are the file's**, so a restore is a restore, and re-importing the same file changes nothing. Line errors are reported with their line number and the rest of the file still imports. What is *not* in an export is stated rather than implied: no vectors (they are model-specific and `import` re-embeds as it writes), no edges (there is no graph yet), and `vectors_included: false` in every summary. |
+| **Yours** | `export` to JSONL (one memory per line, the stored row, nothing derived) or to a directory of markdown documents, and `import` back from either — a file, a directory of notes, or stdin. **Ids, status and timestamps are the file's**, so a restore is a restore, and re-importing the same file changes nothing. Line errors are reported with their line number and the rest of the file still imports. What is *not* in an export is stated rather than implied: no vectors (they are model-specific and `import` re-embeds as it writes — `vectors_included: false`), and **no edges** (`edges_included: false`): a restored brain comes back with every memory and no graph, because the format does not carry edges yet. |
 
 ## What it deliberately is not
 
@@ -214,8 +215,10 @@ kiomon search "the rollout went sideways" # finds it without sharing a word
 kiomon search "café" --kind semantic      # accents and CJK work
 kiomon list                               # unranked: strongest first, one line each
 kiomon get k_01JC9W5K2Q                   # the whole memory
+kiomon relate k_01JC9W5K2Q                # what else is connected to this
+kiomon link k_01JC9W5K2Q k_01JC9W5K3 --relation contradicts
 kiomon export --output brain.jsonl        # the brain as a file you own
-kiomon import --db other.db brain.jsonl   # and back, ids and statuses intact
+kiomon import --db other.db brain.jsonl   # and back, ids and statuses intact (no edges)
 kiomon doctor                             # integrity, schema version, index agreement
 kiomon stats
 kiomon bench --gate                       # measure this machine against the budget

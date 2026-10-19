@@ -37,11 +37,13 @@ use crate::gate;
 use crate::hash;
 use crate::id;
 use crate::import::{ExportRecord, ImportBatch, ImportOutcome, ImportRow, ImportState};
+// The graph's write side, called from the insert path below and nowhere else in this module.
+use crate::links::{auto_link, link_derived_from};
 use crate::metadata;
 use crate::model::{
     AddOutcome, EmbedReport, EmbedState, ForgetOutcome, KindCount, ListQuery, ListSort,
-    MAX_BODY_BYTES, MAX_EXCERPT, MAX_TITLE, Memory, MemoryKind, MemoryPatch, NewMemory, Relation,
-    ReviewMode, Scope, Stats, Status, StatusCount, UpdateOutcome,
+    MAX_BODY_BYTES, MAX_EXCERPT, MAX_TITLE, Memory, MemoryKind, MemoryPatch, NewMemory, ReviewMode,
+    Scope, Stats, Status, StatusCount, UpdateOutcome,
 };
 
 /// Every column a [`Memory`] needs, in one place so a query cannot half-populate a row.
@@ -165,7 +167,13 @@ impl Database {
     pub fn add(&self, new: &NewMemory) -> Result<AddOutcome> {
         let workspace = self.resolve_workspace(&new.workspace_id)?;
         let transaction = self.conn().unchecked_transaction()?;
-        let mut outcome = insert_one(&transaction, &workspace.id, workspace.review_mode, new)?;
+        let mut outcome = insert_one(
+            &transaction,
+            &workspace.id,
+            workspace.review_mode,
+            new,
+            Activation::Single,
+        )?;
         transaction.commit()?;
         // After the commit, never inside the transaction: the embedder is a network call,
         // and a write lock held across one is a write lock held for as long as someone
@@ -212,7 +220,15 @@ impl Database {
             let (workspace_id, review_mode) = resolved
                 .as_ref()
                 .expect("the workspace was resolved immediately above");
-            if !insert_one(&transaction, workspace_id, *review_mode, new)?.duplicate {
+            if !insert_one(
+                &transaction,
+                workspace_id,
+                *review_mode,
+                new,
+                Activation::Bulk,
+            )?
+            .duplicate
+            {
                 written += 1;
             }
         }
@@ -1140,11 +1156,27 @@ fn ensure_workspace_for(
     Ok(true)
 }
 
+/// Whether an activated row should also be auto-linked to its neighbours.
+///
+/// An enum rather than a `bool` because the two callers mean different things by it and a
+/// bare `true` at a call site would not say which: `add` activates **one** memory and the
+/// auto-link pass is part of what activation costs, while `insert_many` loads a **corpus**
+/// — a per-row ranking there makes the bulk path quadratic in the corpus (see
+/// `links::AUTO_LINK_MAX_TERMS` for the measurement that showed it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Activation {
+    /// Auto-link the new memory to its nearest neighbours.
+    Single,
+    /// Write the row and stop. The corpus generator plants its graph separately.
+    Bulk,
+}
+
 fn insert_one(
     transaction: &rusqlite::Transaction<'_>,
     workspace_id: &str,
     review_mode: ReviewMode,
     new: &NewMemory,
+    activation: Activation,
 ) -> Result<AddOutcome> {
     let title = new.title.trim();
     if title.is_empty() {
@@ -1216,8 +1248,22 @@ fn insert_one(
 
     // Provenance is wired at activation, never for a draft: a `derived_from` edge from a
     // memory nobody has approved would point at something retrieval cannot return.
-    if status == Status::Active && !new.derived_from.is_empty() {
-        warnings.extend(link_derived_from(transaction, &new_id, &new.derived_from)?);
+    if status == Status::Active {
+        if !new.derived_from.is_empty() {
+            warnings.extend(link_derived_from(transaction, &new_id, &new.derived_from)?);
+        }
+        // The auto-link pass, in the same transaction as the row it links (§5.2). A failure
+        // is a warning and not a failed save: the memory is stored and findable, and an
+        // edge is enrichment. The alternative — rolling back a save because a *ranking*
+        // query went wrong — would make the graph a way to lose memories.
+        if activation == Activation::Single
+            && let Err(error) = auto_link(transaction, &new_id, workspace_id, title, &new.body)
+        {
+            warnings.push(format!(
+                "stored, but not linked to its neighbours: {error}. `kiomon link` writes an \
+                 edge by hand"
+            ));
+        }
     }
 
     Ok(AddOutcome {
@@ -1254,41 +1300,6 @@ fn find_duplicate_near(
         && hash::normalize(&candidate.title) == hash::normalize(new.title.trim())
         && hash::normalize(&candidate.body) == hash::normalize(&new.body);
     same.then_some(candidate)
-}
-
-/// Wire `derived_from` edges for ids that exist.
-///
-/// Returns a warning for each id that does not, rather than failing: an agent citing a
-/// memory that has since been forgotten should still get its new memory stored, and a
-/// write that fails because of an earlier deletion is a worse outcome than a missing
-/// edge with a note about it.
-pub(crate) fn link_derived_from(
-    conn: &rusqlite::Connection,
-    source_id: &str,
-    targets: &[String],
-) -> Result<Vec<String>> {
-    let mut warnings = Vec::new();
-    let mut insert = conn.prepare(
-        "INSERT OR IGNORE INTO memory_links
-            (source_id, target_id, relation, directed, origin, created_at)
-         VALUES (?1, ?2, ?3, 1, 'agent', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
-    )?;
-    let mut exists = conn.prepare("SELECT 1 FROM memories WHERE id = ?1")?;
-    for target in targets {
-        let trimmed = target.trim();
-        if trimmed.is_empty() || trimmed == source_id {
-            continue;
-        }
-        let found: Option<i64> = exists.query_row([trimmed], |row| row.get(0)).ok();
-        if found.is_none() {
-            warnings.push(format!(
-                "no memory with id `{trimmed}` to derive from; skipping that link"
-            ));
-            continue;
-        }
-        insert.execute(params![source_id, trimmed, Relation::DerivedFrom])?;
-    }
-    Ok(warnings)
 }
 
 /// `WHERE kind IN (…)`, built from this crate's own enum.

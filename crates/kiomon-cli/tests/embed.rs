@@ -387,7 +387,11 @@ fn the_hosted_leg_spellings_are_accepted_by_the_binary() {
 }
 
 #[test]
-fn the_graph_leg_says_it_is_deferred_rather_than_searching_hybrid() {
+fn the_graph_leg_says_it_is_not_this_release_rather_than_searching_hybrid() {
+    // Since WP5 the graph exists and `relate` walks it; what does not exist is the walk as
+    // a *ranking leg* (§4.3 gives that to v1.1). A caller that reads "the graph is not in
+    // this release" would conclude `relate` does not work, so the message has to name the
+    // leg. Never answered from another leg, which is the rule this test really guards.
     let sandbox = Sandbox::new();
     let config = sandbox.stub_config();
     add(&sandbox, &config, "Deploy runbook", "ship it");
@@ -402,7 +406,10 @@ fn the_graph_leg_says_it_is_deferred_rather_than_searching_hybrid() {
         "deploy",
     ]);
     assert_eq!(code(&out), 1, "{}", stderr(&out));
-    assert!(stderr(&out).contains("next sprint"), "{}", stderr(&out));
+    // `a graph *leg* of a search` — the asterisks are the terminal's emphasis, so the
+    // assertion is on the word that matters.
+    assert!(stderr(&out).contains("leg"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("v1.1"), "{}", stderr(&out));
     assert!(stdout(&out).is_empty());
 }
 

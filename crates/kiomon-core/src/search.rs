@@ -54,6 +54,125 @@ use crate::store::{MEMORY_COLUMNS, kind_filter, row_to_memory, scope_clause};
 /// How many rungs the ladder has.
 pub const LADDER_RUNGS: u8 = 3;
 
+/// One candidate of one ladder rung: the row, the memory, and the score it ranked by.
+///
+/// The rowid is what the caller fuses and the id is what it reports; both travel because
+/// walking from one to the other costs a lookup and the query already has them.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RankedCandidate {
+    /// `memories.mem_id`, which is the full-text index's rowid.
+    pub rowid: i64,
+    /// The agent-facing id.
+    pub id: String,
+    /// `bm25(memory_fts, …)`: negative, and ascending is best-first.
+    pub score: f64,
+}
+
+/// Climb the ladder and return the first rung that matched, with its ranked candidates.
+///
+/// Zipped with an explicit 1-based counter rather than tracked by `enumerate`, because the
+/// number is reported to a caller and read by a human: "rung 2 of 3" is a thing a person can
+/// reason about, and "rung 1 of 0..=2" is not.
+///
+/// Free rather than a method for one caller: the auto-link pass runs inside a write's
+/// transaction, where it holds a `&Connection` and not the `&Database` the transaction
+/// belongs to. Everything below reads the connection and the query and nothing else, so
+/// taking the connection explicitly costs nothing and saves a second copy of the ranking.
+///
+/// `exclude` drops one memory from the ranking inside the query rather than after it: the
+/// auto-link pass excludes the memory being linked, which is the closest match to its own
+/// text by construction, and filtering it afterwards would spend a candidate slot on it.
+///
+/// # Errors
+///
+/// Returns [`Error::Database`] if a rung's query fails.
+pub(crate) fn climb(
+    conn: &rusqlite::Connection,
+    query: &SearchQuery,
+    ladder: &Ladder,
+    limit: u32,
+    exclude: Option<&str>,
+) -> Result<(SearchAttempt, Vec<RankedCandidate>)> {
+    let mut attempt = SearchAttempt::NothingAsked;
+    for (rung, expression) in (1..=LADDER_RUNGS).zip(ladder.rungs()) {
+        let ranked = ranked_window(conn, expression, query, limit, exclude)?;
+        if !ranked.is_empty() {
+            return Ok((
+                SearchAttempt::Matched {
+                    rung,
+                    query: expression.clone(),
+                },
+                ranked,
+            ));
+        }
+        if rung == LADDER_RUNGS {
+            attempt = SearchAttempt::Exhausted {
+                query: expression.clone(),
+            };
+        }
+    }
+    Ok((attempt, Vec::new()))
+}
+
+/// The ranked rows of one rung's expression, best first.
+///
+/// # Errors
+///
+/// Returns [`Error::Database`] if the query fails. A malformed expression cannot reach
+/// here — every rung is built by [`Ladder`], which quotes every term.
+fn ranked_window(
+    conn: &rusqlite::Connection,
+    expression: &str,
+    query: &SearchQuery,
+    limit: u32,
+    exclude: Option<&str>,
+) -> Result<Vec<RankedCandidate>> {
+    // `memories.` prefixes on the filter clauses, because the index has columns named
+    // `title`, `excerpt` and `body` too, and a future unqualified clause would resolve to
+    // whichever table SQLite happened to prefer.
+    let mut sql = String::from(
+        "SELECT memory_fts.rowid, memories.id, bm25(memory_fts, 10.0, 5.0, 1.0, 8.0) \
+           FROM memory_fts \
+           JOIN memories ON memories.mem_id = memory_fts.rowid \
+          WHERE memory_fts MATCH ? \
+            AND memories.status = 'active'",
+    );
+    // Binding order is the text order of the placeholders, so it is: the match expression,
+    // the scope, the kinds (which are literals), the excluded id, the limit.
+    let mut values: Vec<Sql> = vec![Sql::Text(expression.to_owned())];
+
+    let (scope, scope_values) = scope_clause(Some("memories."), &query.scope);
+    sql.push_str(&scope);
+    values.extend(scope_values);
+    sql.push_str(&kind_filter(Some("memories."), &query.kinds));
+    if let Some(excluded) = exclude {
+        sql.push_str(" AND memories.id <> ?");
+        values.push(Sql::Text(excluded.to_owned()));
+    }
+
+    // `bm25` returns negative values, so ascending is best-first. The weights are title 10 ·
+    // excerpt 5 · body 1 · tags 8, in the index's column order — a title match is worth more
+    // than a ten-body-word match, and a tag is worth nearly a title because a tag is a
+    // person's own index term.
+    sql.push_str(" ORDER BY bm25(memory_fts, 10.0, 5.0, 1.0, 8.0) LIMIT ?");
+    values.push(Sql::Integer(i64::from(limit)));
+
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+        Ok(RankedCandidate {
+            rowid: row.get(0)?,
+            id: row.get(1)?,
+            score: row.get(2)?,
+        })
+    })?;
+
+    let mut ranked = Vec::new();
+    for row in rows {
+        ranked.push(row?);
+    }
+    Ok(ranked)
+}
+
 /// The column index `snippet()` reads from: `body`.
 ///
 /// Not `-1`, which picks the best-matching column: that would put the title in the
@@ -206,6 +325,14 @@ impl Database {
         if query.legs == Legs::Graph {
             return Err(Error::Deferred {
                 command: "search --legs graph",
+                // The graph itself works — `relate` walks it and the packet reads its
+                // `contradicts`/`supersedes` edges. What is not in this release is the
+                // *walk as a ranking leg*: a PageRank over the neighbourhood of the top
+                // seeds, fused as a third RRF list. §4.3 of the plan gives that to v1.1,
+                // and it is a different thing from a one-hop read.
+                reason: "the graph exists and `relate` walks it, but a graph *leg* of a \
+                         search — a walk fused into the ranking — is v1.1 (plan §4.3). \
+                         `--legs auto` is the full-text leg plus the vector one",
             });
         }
         if query.legs == Legs::Vector && self.embedder().is_none() {
@@ -317,11 +444,7 @@ impl Database {
         })
     }
 
-    /// Climb the ladder and return the first rung that matched.
-    ///
-    /// Zipped with an explicit 1-based counter rather than tracked by `enumerate`, because
-    /// the number is reported to a caller and read by a human: "rung 2 of 3" is a thing a
-    /// person can reason about, and "rung 1 of 0..=2" is not.
+    /// Climb the ladder and return the first rung that matched, as rowids.
     ///
     /// # Errors
     ///
@@ -332,25 +455,16 @@ impl Database {
         ladder: &Ladder,
         window: u32,
     ) -> Result<(SearchAttempt, Option<Vec<i64>>)> {
-        let mut attempt = SearchAttempt::NothingAsked;
-        for (rung, expression) in (1..=LADDER_RUNGS).zip(ladder.rungs()) {
-            let ranked = self.lexical_window(expression, query, window)?;
-            if !ranked.is_empty() {
-                return Ok((
-                    SearchAttempt::Matched {
-                        rung,
-                        query: expression.clone(),
-                    },
-                    Some(ranked),
-                ));
-            }
-            if rung == LADDER_RUNGS {
-                attempt = SearchAttempt::Exhausted {
-                    query: expression.clone(),
-                };
-            }
+        let (attempt, ranked) = climb(self.conn(), query, ladder, window, None)?;
+        let rowids: Vec<i64> = ranked
+            .into_iter()
+            .map(|candidate| candidate.rowid)
+            .collect();
+        if rowids.is_empty() {
+            Ok((attempt, None))
+        } else {
+            Ok((attempt, Some(rowids)))
         }
-        Ok((attempt, None))
     }
 
     /// Fuse the legs, hydrate the window, cut the page, and fill the snippets.
@@ -499,56 +613,6 @@ impl Database {
             }
         }
         Ok(state)
-    }
-
-    /// One leg's ranked window: the rowids of the best `limit` rows for one FTS5
-    /// expression, best first.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Database`] if the query fails. A malformed expression cannot
-    /// reach here — every rung is built by [`Ladder`], which quotes every term.
-    fn lexical_window(
-        &self,
-        expression: &str,
-        query: &SearchQuery,
-        limit: u32,
-    ) -> Result<Vec<i64>> {
-        // `memories.` prefixes on the filter clauses, because the index has columns named
-        // `title`, `excerpt` and `body` too, and a future unqualified clause would resolve
-        // to whichever table SQLite happened to prefer.
-        let mut sql = String::from(
-            "SELECT memory_fts.rowid \
-               FROM memory_fts \
-               JOIN memories ON memories.mem_id = memory_fts.rowid \
-              WHERE memory_fts MATCH ? \
-                AND memories.status = 'active'",
-        );
-        // Binding order is the text order of the placeholders, so it is: the match
-        // expression, the scope, the kinds (which are literals), the limit.
-        let mut values: Vec<Sql> = vec![Sql::Text(expression.to_owned())];
-
-        let (scope, scope_values) = scope_clause(Some("memories."), &query.scope);
-        sql.push_str(&scope);
-        values.extend(scope_values);
-        sql.push_str(&kind_filter(Some("memories."), &query.kinds));
-
-        // `bm25` returns negative values, so ascending is best-first. The weights are
-        // title 10 · excerpt 5 · body 1 · tags 8, in the index's column order — a title
-        // match is worth more than a ten-body-word match, and a tag is worth nearly a
-        // title because a tag is a person's own index term.
-        sql.push_str(" ORDER BY bm25(memory_fts, 10.0, 5.0, 1.0, 8.0) LIMIT ?");
-        values.push(Sql::Integer(i64::from(limit)));
-
-        let mut statement = self.conn().prepare(&sql)?;
-        let rows =
-            statement.query_map(rusqlite::params_from_iter(values.iter()), |row| row.get(0))?;
-
-        let mut ranked = Vec::new();
-        for row in rows {
-            ranked.push(row?);
-        }
-        Ok(ranked)
     }
 
     /// The match in context for the page, keyed by memory id.

@@ -18,9 +18,9 @@
 use serde::Serialize;
 
 use kiomon_core::{
-    Assessment, ContextPacket, DecayOutcome, EmbedReport, Error, ExitCode, LegsRun, Memory,
-    MemorySummaryJson, OutcomeReport, PacketItem, RatingOutcome, Result, SearchAttempt,
-    SearchHitJson, SearchOutcome, Skipped,
+    Assessment, ContextPacket, DecayOutcome, EdgeDirection, EmbedReport, Error, ExitCode, LegsRun,
+    Memory, MemorySummaryJson, Neighbour, OutcomeReport, PacketItem, RatingOutcome, Result,
+    SearchAttempt, SearchHitJson, SearchOutcome, Skipped,
 };
 
 /// How wide a field may be on the human path before it is truncated.
@@ -662,6 +662,69 @@ pub fn render_memory(memory: &Memory, width: usize) -> String {
     }
     if !memory.body.is_empty() {
         let _ = writeln!(out, "\n{}", truncate(&memory.body, width));
+    }
+    out.trim_end().to_owned()
+}
+
+/// What `get --relations` answers with.
+///
+/// A wrapper only when the flag is given: `get <id>` answers with the memory object itself,
+/// because that is the shape a caller parses, and `get <id> --relations` answers with
+/// `{memory, relations}` rather than adding a key to the memory — a `relations` field on
+/// the memory object would be indistinguishable from a metadata field and would make every
+/// consumer of `get` parse the flag's shape whether or not it asked for it.
+#[derive(Debug, Serialize)]
+pub struct GetResponse<'a> {
+    /// The memory, as `get` always reports it.
+    pub memory: &'a Memory,
+    /// Its one-hop neighbourhood.
+    pub relations: &'a [Neighbour],
+}
+
+/// The neighbourhood, for a person.
+///
+/// One line per edge, with the relation first because that is the part a reader scans for:
+/// "which of these contradicts what I am about to do" is the question a graph is walked to
+/// answer, and the relation is the answer. The direction is shown only when it means
+/// something — `related_to` is symmetric, and a `->` on it would invent a fact.
+#[must_use]
+pub fn render_relations(neighbours: &[Neighbour], width: usize) -> String {
+    use std::fmt::Write as _;
+    if neighbours.is_empty() {
+        return "no graph neighbours.".to_owned();
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "{} neighbour(s)", neighbours.len());
+    for neighbour in neighbours {
+        let arrow = match neighbour.direction {
+            Some(EdgeDirection::Out) => "->",
+            Some(EdgeDirection::In) => "<-",
+            None => "--",
+        };
+        let mut facts: Vec<String> = Vec::new();
+        if let Some(score) = neighbour.score {
+            facts.push(format!("{score:.2}"));
+        }
+        facts.push(neighbour.origin.clone());
+        if neighbour.status.as_str() != "active" {
+            facts.push(neighbour.status.as_str().to_owned());
+        }
+        let _ = writeln!(
+            out,
+            "  {:<12} {arrow} {}  {:<8} {}  · {}",
+            neighbour.relation.as_str(),
+            neighbour.memory_id,
+            neighbour.kind.label(),
+            truncate(&neighbour.title, width),
+            facts.join(" ")
+        );
+        if !neighbour.excerpt.is_empty() {
+            let _ = writeln!(
+                out,
+                "               {}",
+                truncate(&neighbour.excerpt, width)
+            );
+        }
     }
     out.trim_end().to_owned()
 }

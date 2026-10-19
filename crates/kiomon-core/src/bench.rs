@@ -472,6 +472,41 @@ fn fill(db: &Database, spec: &CorpusSpec) -> Result<()> {
             spec.size, written
         )));
     }
+    plant_graph(db)
+}
+
+/// How many neighbours each generated memory links to.
+///
+/// Five, which is [`crate::links::AUTO_LINK_TOP_N`]: the corpus is at the cap of what the
+/// engine can write, so `relate`'s measurement is the read the product can actually be
+/// asked for rather than a cheaper one. A corpus that under-populated its graph would
+/// report a flattering number for exactly the command the graph exists to answer.
+const PLANTED_NEIGHBOURS: i64 = 5;
+
+/// Give the corpus a graph, in one statement.
+///
+/// **The generated corpus's edges are planted, not auto-linked.** Auto-linking each of ten
+/// thousand rows would run the ladder ten thousand times — the pass is bounded per write
+/// and unbounded per corpus — and the harness would spend minutes building a ruler. What
+/// the read path's cost depends on is the *fan-out*, and that is what this plants: each
+/// memory links to the five before it, in insertion order, `related_to` and stored
+/// canonically like any other symmetric edge. The links a real `add` writes are measured
+/// where they are produced, by the `add` row.
+fn plant_graph(db: &Database) -> Result<()> {
+    // `mem_id` is a rowid, so `a.mem_id + offset` is a nearby memory and the join is an
+    // index seek on the primary key. `min`/`max` apply the canonicalisation rule (smaller
+    // id first) so these rows are indistinguishable from written ones.
+    for offset in 1..=PLANTED_NEIGHBOURS {
+        db.conn().execute_batch(&format!(
+            "INSERT INTO memory_links
+                 (source_id, target_id, relation, directed, score, origin, created_at)
+             SELECT min(a.id, b.id), max(a.id, b.id), 'related_to', 0, 0.5, 'auto',
+                    strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+               FROM memories a
+               JOIN memories b ON b.mem_id = a.mem_id + {offset}
+             ON CONFLICT DO NOTHING"
+        ))?;
+    }
     Ok(())
 }
 

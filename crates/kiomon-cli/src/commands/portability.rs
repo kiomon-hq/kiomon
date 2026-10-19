@@ -122,6 +122,7 @@ fn export_jsonl(
             .map(|path| path.display().to_string()),
         exported,
         vectors_included: false,
+        edges_included: false,
     };
     // The records are the answer on the human path when they went to stdout, so a summary
     // there would be a line in the middle of somebody's file. It goes to stderr instead.
@@ -129,8 +130,8 @@ fn export_jsonl(
         out::warn(
             cli.quiet || cli.json,
             &format!(
-                "exported {exported} memories to stdout; vectors are not in the file — \
-                 `kiomon reindex --embed` regenerates them after an import"
+                "exported {exported} memories to stdout; vectors and edges are not in the \
+                 file — `kiomon reindex --embed` and `kiomon link` are how they come back"
             ),
         );
         return Ok(ExitCode::Success);
@@ -198,6 +199,7 @@ fn export_markdown(
         path: Some(directory.display().to_string()),
         exported,
         vectors_included: false,
+        edges_included: false,
     };
     out::emit(cli.json, report, |report| {
         println!(
@@ -270,6 +272,11 @@ pub struct ExportReport {
     /// a backup should learn otherwise from the response and not from a search that cannot
     /// find anything without a model.
     pub vectors_included: bool,
+    /// Always `false`, and for a different reason than the vectors: a vector is derived
+    /// data that can be rebuilt, while an edge is a fact somebody recorded. The format does
+    /// not carry edges yet, `import` does not auto-link what it restores, and this field is
+    /// here so a caller restoring a brain learns that its graph did not come with it.
+    pub edges_included: bool,
 }
 
 /// `kiomon import`

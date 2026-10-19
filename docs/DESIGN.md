@@ -102,9 +102,8 @@ One table per idea, and the interesting ones are the indexes.
   in the index by design, and an external-content table declares that a missing row is
   corruption — `integrity-check` would flag the intended state as damage.
 - **`memory_links`** — the edge table, with `valid_to` so a resolved relation can be
-  superseded rather than deleted. Nothing writes a `related_to` or `contradicts` edge yet
-  (the graph is deferred, plan §9-D9); `add --ref` writes `derived_from`, and `forget`
-  cascades.
+  retired rather than deleted. `link` writes one edge by hand, `add --ref` writes
+  `derived_from`, the auto-link pass writes `related_to`, and `forget` cascades.
 - **`memory_embeddings`** — one vector per (memory, model), keyed by model name so switching
   models cannot serve a query from a space the vectors were not built in.
 - **`workspaces`**, **`memory_outcomes`**, **`meta`** — the scope, the outcome log, and the
@@ -210,6 +209,45 @@ candidates (same pool search would rank)
 - **Expired memories are demoted, never dropped.** A caller that cannot see the expired
   memory cannot see why it was wrong.
 
+## The graph
+
+A link is a row: source, target, relation, `origin`, `score`, `created_at`. Three rules make
+it a graph rather than a table of pairs.
+
+**A symmetric relation is stored once.** `related_to` has no direction, and the table's
+`UNIQUE (source_id, target_id, relation)` cannot tell that `(A, B)` and `(B, A)` are the same
+statement. So a symmetric edge is canonicalised before it is written — the smaller id is the
+source, which for ULIDs means the older memory — and `relate` reads both columns. Two
+memories written from either end is one row, and a replay is a no-op.
+
+**A draft has no edges, in either direction.** The inbox's promise is that a memory waiting
+for approval cannot be reached by *any* read path, and a graph edge is one: `relate` on the
+parent would print the draft's title. So `link` refuses an id that is `pending_approval`, the
+auto-link pass only ever sees active rows through the ladder's own status filter, and `relate`
+filters a pending neighbour out as well. The write-side refusal is the rule; the read-side
+filter is what makes it hold if a future writer forgets.
+
+**Auto-linking is bounded, relative, and local.** Activation — `add` or `review approve` —
+runs one ladder climb over the memory's title and the first kilobyte of its body, and writes
+at most five `related_to` edges to neighbours scoring at least half the best match's `bm25`.
+The floor is relative because `bm25` is not comparable across corpora; the terms are capped
+at twelve because rung 3 of the ladder is an `OR` and a kilobyte of text is ~150 terms whose
+ranking cost is the whole corpus (measured: 60 ms per write, and the fix is in the plan's WP5
+record); the workspace is fixed because an edge is a read path and a workspace is a boundary.
+The pass runs inside the write's transaction, and a failure is a warning rather than a failed
+save — the alternative would make a *ranking* query a way to lose memories.
+
+`unlink` removes by pair or by pair-and-relation, and reports zero rather than raising: exit
+`2` is "already the way you wanted it", which is the same rule `pin` and `restore` follow.
+Nothing writes `valid_to` yet, and the read paths already honour it — a resolution has to be
+expressible before it can be recorded, and `unlink` is what a caller uses today.
+
+The packet is the graph's main consumer: `contradicts` and `supersedes` edges among the
+candidates become a conflict note and a demotion. That read was ported from the hosted
+product in WP5.5, when nothing could write the edge it looks for; the last thing that made it
+reachable was `supersedes` in the relation vocabulary, which is what migration `0004`
+rebuilt the table's `CHECK` constraint for.
+
 ## The lifecycle
 
 Nothing about a memory changes by itself, and what does change is a formula with one owner:
@@ -291,10 +329,15 @@ second run of anything look fast; and an export's peak *working set* says more a
 
 ## What is deliberately absent
 
-- **The graph** (`link`, `unlink`, `relate`, `get --relations`). Deferred to the next sprint
-  (§9-D9), with the schema, the cascade, and the staging column already in place. The verbs
-  exit `1` with a message, because "no relations" and "relations are not implemented" are
-  different facts and an agent cannot tell them apart from a success.
+- **A graph leg inside a search.** The graph is here and `relate` walks it, but a walk
+  *fused into a search's ranking* is a different operation: the hosted implementation is a
+  PageRank over the seed set, fused as a third RRF list, and §4.3 of the plan gives it to
+  v1.1. `--legs graph` is in the vocabulary and refuses, rather than being silently answered
+  by another leg.
+- **Edges in an export.** The portability format carries memories, not relationships: a
+  restore comes back with the graph missing, and the export says so. A vector can be
+  rebuilt from text; an edge cannot, so this is the one absence in the format that is a real
+  loss rather than a saving, and it is recorded as the next thing the format should grow.
 - **A server.** `serve` (loopback HTTP, hosted-compatible routes) and `mcp` (stdio) are v1.1;
   the daemon trigger is v1.2 and is recorded in §9 of the plan, and any sockets surface must
   match the hosted `/api/*` contract so the existing SDKs and their conformance tests apply.

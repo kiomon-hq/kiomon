@@ -609,7 +609,7 @@ fn export_to_stdout_keeps_the_records_and_the_summary_apart() {
         serde_json::from_str::<serde_json::Value>(line).expect("each line is a record");
     }
     assert!(
-        stderr(&out).contains("vectors are not in the file"),
+        stderr(&out).contains("vectors and edges are not in the file"),
         "{}",
         stderr(&out)
     );
@@ -946,14 +946,45 @@ fn an_import_with_a_broken_embedder_still_imports_and_says_what_to_run() {
 }
 
 #[test]
-fn an_export_says_that_vectors_are_not_in_it() {
-    // The one thing a user would otherwise assume wrongly: a JSONL export is not a backup
-    // of semantic search, and the summary says so instead of leaving it to be discovered
-    // after a restore.
+fn an_export_says_that_vectors_and_edges_are_not_in_it() {
+    // The two things a user would otherwise assume wrongly: a JSONL export is not a backup
+    // of semantic search, and since WP5 it is not a backup of the graph either. Both are
+    // stated in the summary instead of being discovered after a restore.
     let sandbox = Sandbox::new();
     seed(&sandbox);
     let report = export_to(&sandbox, &[]);
     assert_eq!(report["data"]["vectors_included"], serde_json::json!(false));
+    assert_eq!(report["data"]["edges_included"], serde_json::json!(false));
+}
+
+#[test]
+fn a_restore_brings_back_memories_and_not_the_graph() {
+    // The gap the summary above names, asserted rather than described: a brain with a
+    // hand-made edge exports, imports into a fresh database, and comes back with the
+    // memories and no edges. When the format grows an edges section this test is what
+    // changes.
+    let sandbox = Sandbox::new();
+    let (first, second) = seed(&sandbox);
+    json(&["link", "--db", &sandbox.db_arg(), &first, &second, "--json"]);
+
+    let report = export_to(&sandbox, &["--status", "any"]);
+    assert_eq!(report["data"]["exported"], serde_json::json!(2));
+
+    let out = run(&[
+        "--db",
+        &sandbox.other_db_arg(),
+        "import",
+        "--json",
+        &sandbox.path_arg("out.jsonl"),
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    let related = json(&["relate", "--db", &sandbox.other_db_arg(), &first, "--json"]);
+    assert_eq!(
+        related["data"],
+        serde_json::json!([]),
+        "the file carries no edges, so the restore has none"
+    );
 }
 
 // ---------------------------------------------------------------------------

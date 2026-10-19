@@ -529,7 +529,12 @@ fn the_graph_leg_names_the_deferral_rather_than_answering_hybrid() {
             ..SearchQuery::default()
         })
         .expect_err("there is no graph leg");
-    assert!(error.to_string().contains("next sprint"), "{error}");
+    // The graph itself works since WP5, so the message has to be about the *leg* and not
+    // about the graph: a caller told "the graph is not in this release" would conclude that
+    // `relate` does not work either, and it does.
+    assert!(error.to_string().contains("graph"), "{error}");
+    assert!(error.to_string().contains("leg"), "{error}");
+    assert!(error.to_string().contains("v1.1"), "{error}");
     assert_eq!(error.exit_code(), ExitCode::Internal);
 }
 

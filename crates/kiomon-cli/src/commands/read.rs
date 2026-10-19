@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Reading: `search`, `retrieve`, `get`, `list`.
+//! Reading: `search`, `retrieve`, `get`, `list`, `relate`.
 //!
 //! `list` is deliberately not a search: it is unranked, it does not touch the retrieval
 //! counters, and its ordering is a fact about the rows rather than an opinion about the
 //! query. `search` is the ranked path, and the one the whole performance budget exists
 //! for. `retrieve` is `search` plus a decision: it asks the same index, then re-ranks and
-//! buckets the answer by what the caller said it was about to do.
+//! buckets the answer by what the caller said it was about to do. `relate` does not search
+//! at all — it walks stored edges, so it returns what somebody wrote down and not what a
+//! ranker guessed.
 
 use kiomon_core::{
-    ExitCode, ListQuery, ListSort, MemoryKind, MemorySummaryJson, Result, RetrieveQuery,
+    ExitCode, ListQuery, ListSort, MemoryKind, MemorySummaryJson, Relation, Result, RetrieveQuery,
     SearchAttempt, SearchHitJson, SearchQuery, Status,
 };
 
-use super::{deferred, open, read_scope};
-use crate::cli::{Cli, GetArgs, ListArgs, RetrieveArgs, SearchArgs};
+use super::{open, read_scope};
+use crate::cli::{Cli, GetArgs, ListArgs, RelateArgs, RetrieveArgs, SearchArgs};
 use crate::out;
 
 /// `kiomon search`
@@ -147,25 +149,69 @@ pub fn retrieve(cli: &Cli, args: &RetrieveArgs) -> Result<ExitCode> {
 pub fn get(cli: &Cli, args: &GetArgs) -> Result<ExitCode> {
     let db = open(cli)?;
 
-    // Refused before the row is looked up, so that a flag this build cannot honour behaves
-    // the same way whatever the id is. Checking the id first would answer "no such memory"
-    // for a typo and "not implemented" for a real one, and a caller that learns different
-    // things about the same flag depending on its data cannot write correct error handling.
-    // It is also the cheaper order, and the answer is a lie either way: an empty relation
-    // list would claim a memory has no neighbours when nobody can ask (plan §9-D9).
+    let width = if cli.full {
+        usize::MAX
+    } else {
+        out::DEFAULT_WIDTH
+    };
+
+    // The row first, so a missing id is exit `2` with the message about the id and not
+    // about the flag: `get missing --relations` should say the memory is gone, which is
+    // the fact that tells a caller what to do next.
+    let memory = db.get(&args.id)?;
+
     if args.relations {
-        return deferred("get --relations");
+        let relations = db.relations(&args.id, &[], 1)?;
+        let response = out::GetResponse {
+            memory: &memory,
+            relations: &relations,
+        };
+        out::emit(cli.json, response, |response| {
+            println!("{}", out::render_memory(response.memory, width));
+            println!("{}", out::render_relations(response.relations, width));
+        })?;
+        return Ok(ExitCode::Success);
     }
 
-    let memory = db.get(&args.id)?;
+    out::emit(cli.json, memory, |memory| {
+        println!("{}", out::render_memory(memory, width));
+    })?;
+    Ok(ExitCode::Success)
+}
+
+/// `kiomon relate`
+///
+/// One hop, in both directions, over stored edges. The output is the *neighbours* — id,
+/// relation, and enough of the row to decide what to do next — because a graph a caller has
+/// to dereference one node at a time is a graph nobody walks.
+///
+/// # Errors
+///
+/// [`kiomon_core::Error::NotFound`] for an unknown id or no such workspace,
+/// [`kiomon_core::Error::Invalid`] for a `--depth` this release cannot walk.
+pub fn relate(cli: &Cli, args: &RelateArgs) -> Result<ExitCode> {
+    let db = open(cli)?;
+    let relations: Vec<Relation> = args.relation.iter().copied().map(Relation::from).collect();
+    let neighbours = db.relations(&args.id, &relations, args.depth)?;
 
     let width = if cli.full {
         usize::MAX
     } else {
         out::DEFAULT_WIDTH
     };
-    out::emit(cli.json, memory, |memory| {
-        println!("{}", out::render_memory(memory, width));
+
+    if cli.json {
+        out::emit(true, neighbours, |_| {})?;
+        return Ok(ExitCode::Success);
+    }
+    if neighbours.is_empty() {
+        // On stderr, like every other "nothing matched": stdout is the answer, and a
+        // caller parsing it must not receive a sentence instead of a list.
+        out::warn(cli.quiet, &format!("{} has no graph neighbours.", args.id));
+        return Ok(ExitCode::Success);
+    }
+    out::emit(false, neighbours, |neighbours| {
+        println!("{}", out::render_relations(neighbours, width));
     })?;
     Ok(ExitCode::Success)
 }

@@ -393,11 +393,12 @@ pub struct ImportArgs {
 /// `kiomon link`
 #[derive(Debug, Args)]
 pub struct LinkArgs {
-    /// The memory the edge starts at.
+    /// The memory the edge starts at. For `related_to`, which is symmetric, the two ids
+    /// are stored in a canonical order and either one first is the same edge.
     pub source: String,
     /// The memory the edge points to.
     pub target: String,
-    /// The kind of edge.
+    /// The kind of edge. Defaults to `related_to`, the association auto-linking writes.
     #[arg(long, value_enum)]
     pub relation: Option<RelationArg>,
     /// Similarity, 0.0–1.0, when the edge came from a measurement.
@@ -426,7 +427,9 @@ pub struct RelateArgs {
     /// Only follow these relations. Omit for all of them.
     #[arg(long, value_enum, value_delimiter = ',')]
     pub relation: Vec<RelationArg>,
-    /// How many hops to walk. `1` is the memory's direct neighbours.
+    /// How many hops to walk. `1` is the memory's direct neighbours; nothing else is
+    /// accepted in this release, rather than quietly returning a one-hop answer to a
+    /// three-hop question.
     #[arg(long, default_value_t = 1, value_name = "N")]
     pub depth: u8,
 }
@@ -518,7 +521,8 @@ pub struct GetArgs {
     /// The memory id, as returned by `search` or `list`.
     pub id: String,
 
-    /// Also show the memory's graph neighbours. Costs one extra query.
+    /// Also show the memory's graph neighbours: the one-hop read `relate` performs,
+    /// returned beside the memory instead of instead of it.
     #[arg(long)]
     pub relations: bool,
 }
@@ -752,21 +756,36 @@ impl From<StatusArg> for Option<Status> {
 }
 
 /// A graph relation, as a command-line value.
+///
+/// The names are the wire's — `derived_from`, not clap's default `derived-from` — because a
+/// caller that read a relation off a JSON response asks for it back by the name it saw. The
+/// kebab spellings are accepted as aliases so that neither habit is a usage error; that is
+/// the same argument the `--legs` aliases make below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum RelationArg {
     /// Derived from.
+    #[value(name = "derived_from", alias = "derived-from")]
     DerivedFrom,
     /// Supports.
+    #[value(name = "supports")]
     Supports,
     /// Contradicts.
+    #[value(name = "contradicts")]
     Contradicts,
+    /// Replaces; the target is the older claim.
+    #[value(name = "supersedes")]
+    Supersedes,
     /// Related to. Undirected.
+    #[value(name = "related_to", alias = "related-to")]
     RelatedTo,
     /// Happened before.
+    #[value(name = "precedes")]
     Precedes,
     /// Happened after.
+    #[value(name = "follows")]
     Follows,
     /// Is a component of.
+    #[value(name = "part_of", alias = "part-of")]
     PartOf,
 }
 
@@ -776,6 +795,7 @@ impl From<RelationArg> for Relation {
             RelationArg::DerivedFrom => Self::DerivedFrom,
             RelationArg::Supports => Self::Supports,
             RelationArg::Contradicts => Self::Contradicts,
+            RelationArg::Supersedes => Self::Supersedes,
             RelationArg::RelatedTo => Self::RelatedTo,
             RelationArg::Precedes => Self::Precedes,
             RelationArg::Follows => Self::Follows,
@@ -803,7 +823,8 @@ pub enum LegsArg {
     /// answers from the lexical leg.
     #[value(alias = "semantic")]
     Vector,
-    /// The graph leg, which this release does not have (§9-D9).
+    /// The graph leg: a walk fused into a search's ranking, which is v1.1. `relate`
+    /// walks the graph one hop, which is a different operation.
     Graph,
 }
 

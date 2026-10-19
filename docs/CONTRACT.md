@@ -30,7 +30,7 @@ sequences cannot appear even on a terminal.
 |---|---|---|
 | `0` | Success. | Continue. Includes a search that matched nothing, and an `add` that found an identical memory — neither is a failure. |
 | `1` | Internal failure: I/O, a corrupt database, a bug. | Report it. Retrying the same command is unlikely to help. |
-| `2` | Not found, or nothing to do: the memory, workspace, or relation does not exist — or a lifecycle verb named ids that are not in a state where it means anything (`pin` on a pinned memory, `restore` on an active one). | The thing is gone, or already the way you wanted it. Either way, retrying changes nothing. |
+| `2` | Not found, or nothing to do: the memory, workspace or link does not exist — or a verb named ids that are not in a state where it means anything (`pin` on a pinned memory, `restore` on an active one, `unlink` on an edge that was never there). | The thing is gone, or already the way you wanted it. Either way, retrying changes nothing. |
 | `3` | Invalid arguments: unknown flag, conflicting options, a bad value, a missing required one. | Fix the command line. Retrying is pointless. |
 | `4` | The request was valid and the environment cannot serve it: no embedder configured for `--legs vector`, an unwritable database directory, an unparseable config file. | Fix the environment or the configuration. |
 
@@ -39,6 +39,11 @@ succeeded and the answer is no.
 
 `2` and `1` are deliberately distinct. An agent that receives `2` can conclude a
 memory no longer exists; an agent that receives `1` should try again later.
+
+`3` is also what a request this release cannot honour looks like when the *shape* of the
+request is wrong for it: `relate --depth 2` is a malformed request here and not a missing
+capability, so it fails the way a bad flag fails. A capability that is missing and asked for
+by name — `search --legs graph` — is `1` with a message that says what is missing.
 
 `4` is for a request whose *shape* was valid and whose environment cannot serve it:
 today that is `--legs vector` with no embedder configured, and `reindex --embed` for the
@@ -158,15 +163,18 @@ display labels and are never accepted as input.
 
 **Statuses** — `active` · `pending_approval` · `archived`.
 
-**Relations** — `derived_from` · `supports` · `contradicts` · `related_to` ·
-`precedes` · `follows` · `part_of`. All are directed except `related_to`, which is
-symmetric and therefore stored once.
+**Relations** — `derived_from` · `supports` · `contradicts` · `supersedes` ·
+`related_to` · `precedes` · `follows` · `part_of`. All are directed except `related_to`,
+which is symmetric and therefore stored once. `supersedes` and `contradicts` are the two a
+packet reads: they become a warning and a demotion in `retrieve` (see
+[the graph](#the-graph)).
 
 **Legs** (for `--legs`) — `auto` · `fts` · `vector` · `graph`. The hosted product's
 spellings are accepted as aliases: `hybrid` and `both` mean `auto`, `lexical` and `fulltext`
-mean `fts`, `semantic` means `vector`. `graph` is in the vocabulary and has no leg behind it
-(§9-D9): asking for it is an error that says so, which is the only answer that does not
-describe work that did not happen.
+mean `fts`, `semantic` means `vector`. `graph` is in the vocabulary and has no leg behind it:
+the graph itself works — `relate` walks it and the packet reads its typed edges — but a walk
+*fused into a search's ranking* is v1.1 (plan §4.3). Asking for it is an error that says so,
+which is the only answer that does not describe work that did not happen.
 
 **Intents** (for `retrieve`) — `execute` · `plan` · `answer` · `verify` · `debug`.
 They are the hosted route's vocabulary, the MCP tool's, and the Python SDK's
@@ -202,8 +210,9 @@ Every command is listed in `kiomon --help`. This section records what each one
 | `add` | One transaction. Either the memory exists and is indexed, or it was a duplicate and the existing id is returned with `duplicate: true` and exit `0`, or nothing was written. An identical memory is never stored twice unless `--force`. |
 | `update` | Re-indexes when a field retrieval can see — title, excerpt, body, tags — changed. A no-op update is not an error. |
 | `import` | Restores a JSONL export, a markdown file, a directory of either, or stdin. **Ids, status and timestamps are the file's** — this is a restore, not a re-typing — and a line whose id already exists changes nothing. Streams, and reports a malformed line on stderr with its number and the fragment it could not read, then keeps going. Exit `0` if anything landed, `3` if *nothing* could be read (see [portability](#portability)). |
-| `link` / `unlink` | Idempotent. Linking twice is not an error. |
-| `relate` | **Not in this release** — the graph is deferred to the next sprint (plan §9-D9). Exits `1` and says so; it never returns an empty list, because "no relations" and "relations are not implemented" are different facts and an agent cannot tell them apart from a success. |
+| `link` | Writes one typed edge. **Idempotent and exit `0` either way**: linking twice is not an error, and `created` says which happened, so a batch can be replayed. A symmetric edge (`related_to`) is canonically ordered, so `link A B` and `link B A` are the same row. Refuses a self-edge (exit `3`) and an edge to a memory that does not exist or is waiting in the review inbox (exit `2`). |
+| `unlink` | Removes the edge between two memories, in either direction, or only edges of one `--relation`. **Exit `2` when there was nothing to remove** — "already unlinked" and "successfully unlinked" are the same state and different facts. |
+| `relate` | The one-hop neighbourhood: for each edge, the relation, which way it points, the score and origin, and the neighbour's id, kind, title, excerpt and status. `--relation` filters; `--depth 2` is refused rather than answered with one hop. A missing id is exit `2`, never an empty list. |
 
 **The write gate.** An `add` is activated immediately when the source is
 high-authority (`user_saved`, `import`) or when `--confidence` is at least `0.75`.
@@ -222,7 +231,7 @@ shared by every door — title 300 characters, excerpt 600, body 1 MiB — so `a
 | Command | Promise |
 |---|---|
 | `search` | Ranked. Reports which rung of the ladder answered, which legs ran, and how many rows were counted as retrievals. Never answers a vector-only request from the lexical leg: `--legs vector` with no embedder is exit `4`, not a lexical answer. |
-| `get` | One memory with its body and metadata. A missing id is exit `2`, never an empty success. `--relations` adds one query. |
+| `get` | One memory with its body and metadata. A missing id is exit `2`, never an empty success. `--relations` adds one query and wraps the answer as `{memory, relations}` — the neighbourhood `relate` returns, beside the memory instead of instead of it. |
 | `list` | **Unranked.** Ordered by strength by default, or by recency with `--recent`. `list` is not a search, and the two do not compete. An absent `--status` means `active`, so a bare `list` never mixes the review inbox into a library; `--status any` is how you ask for both. |
 
 **Pinning and ordering.** A pinned memory sorts first under the default (strength)
@@ -352,9 +361,10 @@ this path, and there is nothing to configure.
 
 **An expired memory is demoted, never dropped.** It is evidence about what was believed,
 and the conflict it may be part of is exactly what a caller needs to see. `conflicts` is
-empty until the graph exists — nothing can write a contradiction yet — and if the
-conflict check itself cannot run, that fact is reported in `warnings` rather than left to
-look like an absence.
+empty when nothing contradicts anything — `link --relation contradicts` is what makes it
+non-empty — and if the conflict check itself cannot run, that fact is reported in
+`warnings` rather than left to look like an absence. The two are different facts, which is
+why the second one is written down where a caller will read it.
 
 ### Lifecycle
 
@@ -444,6 +454,59 @@ you see what a full pass would do.
    rows as it goes. Switching models therefore costs a full re-embed, which is the honest
    price of a corpus that only ever contains one space.
 
+### The graph
+
+A **link** is a row in `memory_links`: a source, a target, a relation, who wrote it
+(`origin`), how sure they were (`score`), and when. `relate` and `get --relations` read
+them; `link` and `unlink` write them; `forget` removes every edge that touches a memory,
+by foreign-key cascade. `add --ref` writes `derived_from`, and the auto-link pass writes
+`related_to` (below).
+
+**Symmetric relations are stored once.** `related_to` has no direction, so an edge is
+written with the smaller id — the older memory, since ids sort by creation time — as its
+source. `link A B` and `link B A` are the same row, and `relate` reads both columns, so the
+canonical order is invisible to a caller. A directed relation is stored exactly as given.
+
+**An edge is never written for a memory the inbox is holding.** A draft has no full-text
+row, no embedding, and no links, in either direction: `link` refuses it (exit `2`, naming
+the inbox), the auto-link pass only ever sees active memories, and `relate` filters a
+pending neighbour out even if a row exists for it. The rule is what makes "a draft cannot be
+found by any read path" a property of the engine rather than of every writer remembering.
+
+**Auto-linking happens at activation.** When a memory is activated — by `add` or by
+`review approve` — it is linked to at most **five** of its closest neighbours as
+`related_to`, in the same transaction, with a score. The pass reads the title and the first
+kilobyte of the body, takes their first twelve distinct terms, and ranks the corpus by
+`bm25` with the same field weights `search` uses; a neighbour must keep at least **half** the
+best match's score to be linked. The floor is relative because `bm25` is not comparable
+across corpora — an absolute one would link everything in a small brain and nothing in a
+large one. Three things follow from the rules rather than from taste: no self-edges, nothing
+outside the memory's own workspace (an edge is a read path, and a workspace is a boundary),
+and nothing at all for a memory whose words appear nowhere else.
+
+Auto-linking is **not** re-run by `update`, is **not** run by `import` (a restore writes the
+rows a file carries, and the file carries no edges), and is **not** run by the benchmark's
+bulk corpus load. A brain restored from an export therefore has memories and no graph.
+
+**A resume of `relate`'s fields**, because a caller cannot see them from `--help`:
+
+| Field | Meaning |
+|---|---|
+| `memory_id`, `title`, `excerpt`, `kind`, `status` | The neighbour. An archived neighbour is shown with `archived`; a pending one is not shown. |
+| `relation` | The edge's type. |
+| `direction` | `out` when the memory asked about is the edge's source, `in` when the neighbour is. **`null` for `related_to`**, where the stored direction is a canonicalisation and not a fact. |
+| `score` | The edge's similarity, when it has one. Auto-linked edges do. |
+| `origin` | `manual` (`link`), `auto` (the pass), `agent` (`add --ref`). |
+| `created_at` | When the edge was written. |
+
+**What the packet does with the graph.** `retrieve` reads `contradicts` and `supersedes`
+edges among its candidates: a contradiction becomes a `conflicts` entry naming both ids plus
+a warning, and a supersession demotes the replaced memory and warns
+`"…" is superseded by <id>; prefer the newer memory.` — demoted, never dropped, because a
+caller that cannot see the replaced memory cannot see why it was replaced. Edges with a
+`valid_to` are resolved and are not reported; nothing writes `valid_to` yet, so a
+contradiction a caller wants to retract is retracted with `unlink`.
+
 ### Portability
 
 | Command | Promise |
@@ -468,10 +531,13 @@ has to know all three:
   model that made it, and can be regenerated from the text. `import` embeds as it writes
   when an embedder is configured, and `kiomon reindex --embed` is what to run when it is
   not — a restored brain with no model finds nothing by meaning until then.
-- **Edges.** The graph is not in v1 (§9-D9 of the plan): nothing can write a
-  `related_to` or a `contradicts` edge, so exporting rows no verb can create would make
-  the file look richer than the tool. A *draft's* staged provenance is a column rather
-  than an edge, so it does travel, as `derived_from`.
+- **Edges.** A restore gives back every memory and none of their relationships, and
+  `import` does not auto-link what it writes — a bulk restore is not an activation. So a
+  brain that had a graph comes back without one, and the export says so (`edges_included:
+  false`). This is a real gap and not a design statement: the format grows an edges
+  section when the graph is worth carrying in a file, and the plan records it as a
+  follow-up. A *draft's* staged provenance is a column rather than an edge, so it does
+  travel, as `derived_from`.
 - **Workspaces.** A record names its workspace id; a restored brain whose workspaces did
   not exist gets them created, in the default (autonomous) review mode, because the
   review mode is a property of the workspace row and not of a memory.
@@ -756,13 +822,12 @@ how you get yours.
   work unchanged against a local brain — see `plans/001-local-v1-core.md` §9-D8 and
   Appendix C. Routes this engine cannot answer (`revert`, briefings) return a typed
   `unsupported_locally` error rather than an empty success.
-- **The knowledge graph** — `link`, `unlink`, `relate` and `get --relations` — and
-  therefore any edge a packet could report: `retrieve` returns `conflicts: []` today because
-  nothing can write a `contradicts` edge, not because the check is missing. Deferred to
-  the next sprint by the plan's §9-D9, after this contract and the lifecycle verbs were
-  done. They exit `1` with an `unimplemented` code and a message that says *deferred*, not
-  *work package 5*: it is not in this release, and a caller that waits for it waits for
-  nothing. The schema is in place, `add --ref` writes its `derived_from` edge today, and
-  the next sprint's first work package is unchanged (`plans/001-local-v1-core.md` §8).
+- **A graph leg inside a search.** The graph is here — see [the graph](#the-graph) — and
+  `search --legs graph` refuses with a message that says so. What is v1.1 is the walk as a
+  *ranking* leg: a PageRank over the seed set, fused as a third RRF list (§4.3 of the plan).
+  A one-hop read and a ranked walk are different operations, and this contract will not
+  answer the second with the first.
+- **Edges in an export.** `edges_included: false`, because a restored brain has no graph.
+  `link` is how one is put back, by hand, until the format carries edges.
 - URL fetching, PDF parsing, connectors, and every LLM-backed feature. See
   `plans/001-local-v1-core.md` §10 for the trigger that would change each one.

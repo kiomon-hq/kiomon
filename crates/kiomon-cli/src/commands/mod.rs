@@ -43,7 +43,7 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Import(args) => portability::import(cli, args),
         Command::Link(args) => write::link(cli, args),
         Command::Unlink(args) => write::unlink(cli, args),
-        Command::Relate(args) => write::relate(cli, args),
+        Command::Relate(args) => read::relate(cli, args),
 
         Command::Search(args) => read::search(cli, args),
         Command::Retrieve(args) => read::retrieve(cli, args),
@@ -65,19 +65,12 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
     }
 }
 
-// WP6 emptied this file of its last caller. `pending` lived here from WP0, when `export`
-// and `import` returned it; every verb in the plan's §6.1 now either works or says why it
-// does not (§9-D9). `Error::Unimplemented` stays for the package that next needs it —
-// WP9's `serve` routes, which are answered by that same envelope rather than by a new one.
-
-/// Refuse a command this release deliberately left out (§9-D9).
-///
-/// `link` and `relate` are not "coming in this release", and an agent that waits for them
-/// waits for nothing. Whoever needs the graph is told that it is the next sprint's work,
-/// not that it is on its way.
-pub(crate) fn deferred(command: &'static str) -> Result<ExitCode> {
-    Err(Error::Deferred { command })
-}
+// WP5 emptied this file of its last caller. `pending` lived here from WP0, when `export`
+// and `import` returned it, and `deferred` from WP4 for the three graph verbs; every verb
+// in the plan's §6.1 now works. `Error::Unimplemented` and `Error::Deferred` stay for the
+// callers that next need them — WP9's `serve` routes and `search --legs graph` — and both
+// are reached from the library rather than from here, because a CLI-level refusal that
+// lived in the dispatch was a refusal with no library behind it.
 
 /// Run the day's decay, if it is due, and report it on stderr.
 ///

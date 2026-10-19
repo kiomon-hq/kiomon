@@ -9,6 +9,36 @@ Every release that changes what a caller can rely on gets an entry here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **The graph.** Typed directed edges (`derived_from`, `supports`, `contradicts`,
+  `supersedes`, `related_to`, `precedes`, `follows`, `part_of`) with `link`, `unlink`,
+  `relate` (one hop, with each neighbour's relation, direction, score, title and excerpt)
+  and `get --relations`. A symmetric `related_to` edge is stored once, whichever end it is
+  written from, and a memory in the review inbox has no edges in either direction.
+- **Auto-linking at activation.** `add` and `review approve` connect a new memory to at
+  most five of its closest lexical neighbours, scored relative to the best match, inside
+  the write's transaction. Limited to the memory's own workspace, and never a self-edge.
+- **The packet reads the graph.** A `contradicts` edge among a packet's candidates becomes
+  a `conflicts` entry and a warning; a `supersedes` edge demotes the memory it replaced and
+  says `prefer the newer memory`. Both are reported rather than auto-resolved, and a
+  superseded memory is demoted, never dropped.
+- `export --json` reports `edges_included: false`, because a restored brain comes back with
+  every memory and no graph: the format does not carry edges, and `import` does not
+  auto-link what it writes.
+
+### Changed
+
+- `link`, `unlink`, `relate` and `get --relations` no longer refuse. The vocabulary grew by
+  `supersedes` — the packet had been reading a relation nothing could write — which needed
+  migration `0004`, and `link --relation` now takes the wire spellings
+  (`derived_from`, `related_to`, `part_of`) with the kebab-case ones as aliases.
+- An edge to a memory waiting in the review inbox is refused (exit `2`) rather than stored,
+  and `get --relations` answers `{memory, relations}` instead of refusing.
+- `search --legs graph` still refuses, but now says that the graph exists and the *leg* is
+  what is missing (plan §4.3 gives the walk to v1.1) rather than that the graph is not in
+  this release.
+
 ## [0.1.0] — 2026-10-18
 
 The first release. One binary, one SQLite file, no account, no network, no daemon.

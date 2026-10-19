@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Writing: `add`, `update`, `import`, `link`, `unlink`, `relate`.
+//! Writing: `add`, `update`, `import`, `link`, `unlink`.
 //!
-//! The CLI's whole job here is to turn flags into a [`NewMemory`] or a [`MemoryPatch`]
-//! and hand it to the store. The two decisions a write makes — whether it activates, and
-//! whether an identical memory already exists — belong to `kiomon_core::gate` and the
-//! store, so that the CLI, a future MCP server and the auto-linker cannot disagree about
-//! them.
+//! The CLI's whole job here is to turn flags into a [`NewMemory`], a [`MemoryPatch`] or a
+//! [`NewLink`] and hand it to the store. The decisions a write makes — whether it
+//! activates, whether an identical memory already exists, which end of a symmetric edge is
+//! the source — belong to `kiomon_core::gate`, the store and the graph, so that the CLI, a
+//! future MCP server and the auto-linker cannot disagree about them.
 
 use std::io::Read as _;
 use std::path::Path;
 
 use kiomon_core::metadata;
-use kiomon_core::{Error, ExitCode, MemoryPatch, NewMemory, Result, Scope};
+use kiomon_core::{Error, ExitCode, MemoryPatch, NewLink, NewMemory, Relation, Result, Scope};
 
-use super::{decay_if_due, deferred, open, write_workspace};
-use crate::cli::{AddArgs, Cli, LinkArgs, RelateArgs, UnlinkArgs, UpdateArgs};
+use super::{decay_if_due, open, write_workspace};
+use crate::cli::{AddArgs, Cli, LinkArgs, UnlinkArgs, UpdateArgs};
 use crate::out;
 
 /// `kiomon add`
@@ -159,31 +159,74 @@ pub fn update(cli: &Cli, args: &UpdateArgs) -> Result<ExitCode> {
 
 /// `kiomon link`
 ///
+/// Idempotent, and exit `0` either way: the contract says linking twice is not an error, so
+/// `created` is a field of the answer and not an exit code. A caller replaying a batch
+/// should not have to treat a replayed edge as a failure.
+///
 /// # Errors
 ///
-/// Always [`Error::Deferred`]: the graph left v1 (§9-D9) and is the next sprint's first
-/// work package. Writing the edge anyway — the table and its constraints exist — would
-/// create rows that no verb can read back, which is a worse answer than a refusal.
-pub fn link(_cli: &Cli, _args: &LinkArgs) -> Result<ExitCode> {
-    deferred("link")
+/// [`Error::Invalid`] for a self-edge or a bad `--score`, [`Error::NotFound`] when either
+/// id is missing or waiting in the review inbox.
+pub fn link(cli: &Cli, args: &LinkArgs) -> Result<ExitCode> {
+    let db = open(cli)?;
+    let outcome = db.link(&NewLink {
+        source_id: args.source.clone(),
+        target_id: args.target.clone(),
+        relation: args.relation.map_or(Relation::RelatedTo, Relation::from),
+        score: args.score,
+    })?;
+    out::emit(cli.json, outcome, |outcome| {
+        if outcome.created {
+            println!(
+                "linked {} -[{}]-> {}",
+                outcome.source_id, outcome.relation, outcome.target_id
+            );
+        } else {
+            println!(
+                "{} -[{}]-> {} was already there; nothing changed.",
+                outcome.source_id, outcome.relation, outcome.target_id
+            );
+        }
+    })?;
+    Ok(ExitCode::Success)
 }
 
 /// `kiomon unlink`
 ///
-/// # Errors
-///
-/// Always [`Error::Deferred`] — see [`link`].
-pub fn unlink(_cli: &Cli, _args: &UnlinkArgs) -> Result<ExitCode> {
-    deferred("unlink")
-}
-
-/// `kiomon relate`
+/// NotFound (`2`) when no edge was removed. "Already unlinked" and "successfully unlinked"
+/// are the same state and different facts: a script that asked for five edges to be gone
+/// wants to know that one of them was never there, and the lifecycle verbs' rule — nothing
+/// moved is exit `2` — is the same rule.
 ///
 /// # Errors
 ///
-/// Always [`Error::Deferred`] — see [`link`].
-pub fn relate(_cli: &Cli, _args: &RelateArgs) -> Result<ExitCode> {
-    deferred("relate")
+/// [`Error::Invalid`] for a blank id, whatever the delete raises.
+pub fn unlink(cli: &Cli, args: &UnlinkArgs) -> Result<ExitCode> {
+    let db = open(cli)?;
+    let relation = args.relation.map(Relation::from);
+    let outcome = db.unlink(&args.source, &args.target, relation)?;
+    // Read before the outcome is emitted, which consumes it: whether anything was removed
+    // is both the message and the exit code, and the lifecycle verbs' rule is that nothing
+    // moved is exit 2.
+    let removed = outcome.removed;
+    let asked = match relation {
+        Some(relation) => format!(
+            " between {} and {} by `{relation}`",
+            args.source, args.target
+        ),
+        None => format!(" between {} and {}", args.source, args.target),
+    };
+    out::emit(cli.json, outcome, |outcome| {
+        if outcome.removed == 0 {
+            println!("no edge{asked} to remove.");
+        } else {
+            println!("removed {} edge(s){asked}.", outcome.removed);
+        }
+    })?;
+    if removed == 0 {
+        return Ok(ExitCode::NotFound);
+    }
+    Ok(ExitCode::Success)
 }
 
 /// The content for a write, from whichever source was given.
