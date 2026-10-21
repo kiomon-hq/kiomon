@@ -389,13 +389,13 @@ impl ExportRecord {
             ("`last_retrieved_at`", &last_retrieved_at),
             ("`expires_at`", &expires_at),
         ] {
-            if let Some(raw) = value {
-                if !is_timestamp(raw) {
-                    return Err(format!(
-                        "{name} is `{raw}`; timestamps are \
+            if let Some(raw) = value
+                && !is_timestamp(raw)
+            {
+                return Err(format!(
+                    "{name} is `{raw}`; timestamps are \
                          `YYYY-MM-DDTHH:MM:SSZ` (RFC 3339, UTC, seconds)"
-                    ));
-                }
+                ));
             }
         }
 
@@ -896,10 +896,10 @@ fn text_value(raw: &str) -> std::result::Result<String, String> {
         return serde_json::from_str::<String>(raw)
             .map_err(|_| format!("`{raw}` is not a quoted string"));
     }
-    if let Some(stripped) = raw.strip_prefix('\'') {
-        if let Some(inner) = stripped.strip_suffix('\'') {
-            return Ok(inner.to_owned());
-        }
+    if let Some(stripped) = raw.strip_prefix('\'')
+        && let Some(inner) = stripped.strip_suffix('\'')
+    {
+        return Ok(inner.to_owned());
     }
     Ok(raw.to_owned())
 }

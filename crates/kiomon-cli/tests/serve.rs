@@ -14,7 +14,7 @@
 //! argument at a time.
 
 use std::fmt::Write as _;
-use std::io::{BufRead, BufReader, Read as _, Write as _};
+use std::io::{BufRead, BufReader, ErrorKind, Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -392,7 +392,7 @@ fn a_port_already_in_use_is_an_error_that_names_it() {
     );
     // And nothing was printed to stdout, so a supervisor that reads the handshake sees an
     // error rather than a url that does not answer.
-    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
 
     // On the JSON path the failure is one envelope on stdout, which is the contract every
     // command keeps — and it still names the port.
@@ -806,12 +806,21 @@ fn an_absurd_header_block_is_refused_instead_of_allocating() {
     // The server answers and closes before reading all of it, so the write may fail with a
     // broken pipe — that is the refusal working, not the test failing.
     stream.write_all(head.as_bytes()).ok();
+    // macOS answers the pending bytes with a reset rather than a close, so the read itself
+    // reports `ECONNRESET`. A reset *is* the refusal: what this test is about is that the
+    // server answered and hung up instead of buffering 128 KiB, not the polite way it did it.
     let mut raw = String::new();
-    stream.read_to_string(&mut raw).expect("readable");
-    assert!(
-        raw.starts_with("HTTP/1.1 431") || raw.starts_with("HTTP/1.1 400"),
-        "{raw}"
-    );
+    match stream.read_to_string(&mut raw) {
+        Ok(_) => assert!(
+            raw.starts_with("HTTP/1.1 431") || raw.starts_with("HTTP/1.1 400"),
+            "{raw}"
+        ),
+        Err(error) => assert_eq!(
+            error.kind(),
+            ErrorKind::ConnectionReset,
+            "the only failure a refusal can cause on the read side is a reset: {error}"
+        ),
+    }
 }
 
 #[test]

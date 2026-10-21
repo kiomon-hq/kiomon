@@ -1,0 +1,12 @@
+# Blank issues are disabled: the two templates ask for the detail that makes a report
+# actionable (a version with its commit, doctor output, the exact command), and an issue
+# that arrives without them costs a round trip to resolve. The two links below are the
+# things that genuinely do not fit a template.
+blank_issues_enabled: false
+contact_links:
+  - name: How do I …? (questions, not bugs)
+    url: https://github.com/kiomon-hq/kiomon/discussions
+    about: Usage questions and "is this the right tool for me" belong in Discussions, where an answer helps the next person too.
+  - name: Report a security vulnerability
+    url: https://github.com/kiomon-hq/kiomon/security/advisories/new
+    about: Privately, please. Do not open a public issue for anything that affects data, isolation or the serve/mcp doors.

@@ -102,7 +102,7 @@ fn the_index_stays_consistent_after_a_thousand_writes_and_a_thousand_purges() {
     let purge: Vec<String> = ids.iter().step_by(3).cloned().collect();
     let outcome = db.forget(&purge).unwrap();
     assert_eq!(outcome.deleted.len(), purge.len());
-    assert!(outcome.missing.is_empty());
+    assert_eq!(outcome.missing, [] as [std::string::String; 0]);
 
     let remaining = 1_000 - purge.len();
     let expected = i64::try_from(remaining).unwrap();

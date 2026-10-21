@@ -61,14 +61,14 @@ pub fn encode(vector: &[f32]) -> Vec<u8> {
 /// Returns [`Error::Database`] when the blob's length is not a multiple of four, which
 /// means the column holds something that was not written by [`encode`].
 pub fn decode(bytes: &[u8]) -> Result<Vec<f32>> {
-    if bytes.len() % F32_BYTES != 0 {
+    if !bytes.len().is_multiple_of(F32_BYTES) {
         return Err(Error::Database(format!(
             "a stored embedding is {} bytes, which is not a whole number of f32 values",
             bytes.len()
         )));
     }
     let mut vector = Vec::with_capacity(bytes.len() / F32_BYTES);
-    for chunk in bytes.chunks_exact(F32_BYTES) {
+    for chunk in bytes.as_chunks::<F32_BYTES>().0 {
         let mut word = [0u8; F32_BYTES];
         word.copy_from_slice(chunk);
         vector.push(f32::from_le_bytes(word));
@@ -88,10 +88,12 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     let mut sum = 0.0f32;
     // Zipped chunks of four, which is what the autovectoriser on every target this
     // ships to turns into the same loop as the scalar one but without the bounds checks.
-    let (a_chunks, b_chunks) = (a.chunks_exact(4), b.chunks_exact(4));
-    let a_rest = a_chunks.remainder();
-    let b_rest = b_chunks.remainder();
-    for (left, right) in a_chunks.zip(b_chunks) {
+    // `as_chunks` rather than `chunks_exact`: it yields `&[f32; 4]`, so the four indexes
+    // below are compile-time constants and neither the loop nor the multiplies carry a
+    // length check. The remainder is the same slice `chunks_exact` would have left.
+    let (a_chunks, a_rest) = a.as_chunks::<4>();
+    let (b_chunks, b_rest) = b.as_chunks::<4>();
+    for (left, right) in a_chunks.iter().zip(b_chunks) {
         sum += left[0] * right[0] + left[1] * right[1] + left[2] * right[2] + left[3] * right[3];
     }
     for (left, right) in a_rest.iter().zip(b_rest) {
@@ -116,7 +118,7 @@ pub fn dot_blob(bytes: &[u8], query: &[f32]) -> Option<f32> {
         return None;
     }
     let mut sum = 0.0f32;
-    for (word, value) in bytes.chunks_exact(F32_BYTES).zip(query) {
+    for (word, value) in bytes.as_chunks::<F32_BYTES>().0.iter().zip(query) {
         let mut chunk = [0u8; F32_BYTES];
         chunk.copy_from_slice(word);
         sum += f32::from_le_bytes(chunk) * value;

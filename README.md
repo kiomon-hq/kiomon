@@ -1,5 +1,10 @@
 # Kiomon Local
 
+[![CI](https://github.com/kiomon-hq/kiomon/actions/workflows/ci.yml/badge.svg)](https://github.com/kiomon-hq/kiomon/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/kiomon-hq/kiomon?sort=semver)](https://github.com/kiomon-hq/kiomon/releases/latest)
+[![licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
+[![rustc 1.88+](https://img.shields.io/badge/rustc-1.88%2B-blue.svg)](Cargo.toml)
+
 **A persistent memory for your coding agent, in one binary and one SQLite file.**
 
 `kiomon` gives an agent somewhere to put what it learns and a way to get it back in
@@ -159,6 +164,20 @@ compare. `kiomon bench --repeat 3` prints each pass's median beside the verdict.
   pipeline with queues, a vector database, connectors, and a model provider. Almost
   none of that is needed for the part users feel.
 
+## Privacy
+
+**There is no telemetry, no analytics, no crash reporting and no account** — there is
+nothing to opt out of, because nothing is sent. No default path opens a socket; the one
+optional exception is an embedder you configure yourself, pointed at your own host, and
+`--legs fts` never touches it. The database is a file, in a directory `kiomon doctor
+--paths-only` prints, and `export` writes the whole of it out in a format you can read.
+
+The two local doors are on `127.0.0.1` and refuse every request that is not addressed to a
+loopback name or that carries a browser `Origin`, which is what keeps a web page from
+reading the brain; `kiomon serve` asks for no API key by default because a local brain has
+no accounts. [`SECURITY.md`](SECURITY.md) states that model, and what it does not cover,
+in full.
+
 ## Design
 
 ```text
@@ -289,5 +308,16 @@ the [Code of Conduct](CODE_OF_CONDUCT.md). Report security issues privately per
 
 ## Licence
 
-[Apache-2.0](LICENSE). The hosted Kiomon product is separate and is not covered by
-this licence.
+[**Apache-2.0**](LICENSE) — use it, modify it, ship it, sell it. [`NOTICE`](NOTICE) carries
+the attribution Apache-2.0 §4(d) asks a distributor to keep, and every source file starts
+with its SPDX identifier.
+
+Two things the licence does not cover, stated rather than implied:
+
+- **The name and logo.** Apache-2.0 §6 grants no trademark rights, and a memory engine's
+  name is how people find the real one. [`TRADEMARK.md`](TRADEMARK.md) is short and
+  permissive: forks and integrations are welcome to say what they are.
+- **The hosted Kiomon product**, which is a separate service with its own terms.
+
+Contributions are licensed under the same terms and need no CLA — see
+[`CONTRIBUTING.md`](CONTRIBUTING.md#licensing).

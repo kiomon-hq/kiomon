@@ -105,15 +105,16 @@ impl Database {
     /// SQLite refuses the file, and [`Error::Config`] if it is not writable.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(|err| {
-                    Error::Config(format!(
-                        "could not create the directory {}: {err}",
-                        parent.display()
-                    ))
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                Error::Config(format!(
+                    "could not create the directory {}: {err}",
+                    parent.display()
+                ))
+            })?;
         }
 
         let mut conn = Connection::open_with_flags(
@@ -568,7 +569,7 @@ mod tests {
             db.schema_version().unwrap(),
             Database::target_schema_version()
         );
-        assert!(!Database::migrations().is_empty());
+        assert_ne!(Database::migrations().len(), 0);
     }
 
     #[test]

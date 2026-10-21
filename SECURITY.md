@@ -54,12 +54,36 @@ surprising:
 - memory-unsafety, a panic on untrusted input (a malformed database or JSONL
   import), or resource exhaustion from a hostile file;
 - anything that lets a process other than the user read the database, or that
-  makes the file world-readable or world-writable.
+  makes the file world-readable or world-writable;
+- a hole in the two checks that keep browsers out of `kiomon serve`: a request whose
+  `Host` is not a loopback name, or whose `Origin` is not, reaching the router;
+- a token bypass under `serve --require-token`, or the token being written where another
+  user can read it, or appearing in the handshake, a log line, or an error body;
+- a `kiomon mcp` session that acts on anything wider than the workspace it was opened
+  with, since stdio is the permission boundary there.
 
 Out of scope: vulnerabilities in the hosted Kiomon service — report those to
 **security@kiomon.com** instead — and issues that require a compromised developer
 machine, a malicious dependency you install yourself, or a browser or runtime that
 is already unsupported.
+
+## What the software assumes
+
+Worth reading before deciding a report is in scope. `kiomon` is a single-user, single-file
+tool: it trusts the person who runs it and the filesystem permissions on the directory the
+database lives in. It trusts nothing it reads — a database and an import file are treated as
+untrusted input, because a brain you were handed is a brain you should be able to open.
+
+`kiomon serve` binds loopback only, refuses a non-loopback `Host` (DNS rebinding) and a
+non-loopback `Origin` (a web page reading the brain), and asks for no API key by default
+because a local brain has no accounts. That last part means **another process running as you
+can talk to it**. `--require-token` closes it, and it is the flag to use on a shared machine
+or a forwarded port. A report about that trade-off is a design discussion, not a
+vulnerability; a report about the two loopback checks *not* being enough is a vulnerability.
+
+What is out of scope by construction: anything that requires the attacker to already be able
+to read your home directory, and any claim that depends on the hosted product's multi-tenant
+guarantees, which this engine does not claim to have.
 
 ## Safe harbour
 

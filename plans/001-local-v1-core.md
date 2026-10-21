@@ -1764,6 +1764,34 @@ What the handshake says now: `{"listening":true,"url":…,"port":…,"db":…,"a
 `"auth":"token"` plus `token_file` and `token_created` under `--require-token`. `auth` is present
 either way, because a field that appears only sometimes is a field a client forgets to check.
 
+### Derived: the repository is public, and the real MSRV is 1.88
+
+**Open source, Apache-2.0, at `github.com/kiomon-hq/kiomon` (2026-10-21).** The licence was
+already decided (§9-D1); what a public repository adds is the apparatus a stranger needs in
+order to trust and use the thing without asking anyone: issue templates that ask for the
+version-with-commit and `doctor` output, a pull-request checklist mirroring `CONTRIBUTING`,
+`CODEOWNERS`, `SECURITY.md` with a stated threat model and private reporting, `NOTICE`,
+`TRADEMARK.md`, and a README that says what the licence does *not* cover. The repository is
+public and the hosted product is separate; that separation is what the trademark section and
+the "not a cloud client" paragraph exist to keep legible.
+
+**The claimed MSRV was wrong, and CI is what found it.** `rust-version` said 1.85; the code
+uses `if a && let Some(b) = c` twice, stabilised in 1.88. Nothing local could notice — the
+toolchain here is newer — which is exactly what the `msrv` job is for. Two consequences worth
+recording: the floor is now 1.88, and collapsing nested `if` bodies into let-chains is now a
+clippy requirement (`collapsible_if`) rather than a preference, so ten sites were collapsed
+in the same change rather than fought later.
+
+Also from the first CI run: clippy 1.99 added `assert_is_empty`, which objects to
+`assert!(hits.is_empty())`. All twenty-three sites became `assert_eq!(hits.len(), 0)` /
+`assert_ne!(hits.len(), 0)`, which says the same thing without naming a container type at
+every call site; clippy's own suggestion (`assert_eq!(hits, Vec::new())`) is prettier for a
+`Vec` and impossible for a slice. And `dot` now uses `as_chunks::<4>()`, which the same
+toolchain asks for and which is the same arithmetic with the four indexes as compile-time
+constants. The general lesson, if there is one: a linter newer than the developer's toolchain
+is a second opinion, and it is worth running before a repository becomes public rather than
+after.
+
 ### Where WP9 contradicted the plan
 
 1. **Appendix C spelled the graph's centre `id`; the wire says `center_id`.** The hosted

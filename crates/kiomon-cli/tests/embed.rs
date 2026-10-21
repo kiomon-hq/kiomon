@@ -410,7 +410,7 @@ fn the_graph_leg_says_it_is_not_this_release_rather_than_searching_hybrid() {
     // assertion is on the word that matters.
     assert!(stderr(&out).contains("leg"), "{}", stderr(&out));
     assert!(stderr(&out).contains("v1.1"), "{}", stderr(&out));
-    assert!(stdout(&out).is_empty());
+    assert_eq!(stdout(&out), "");
 }
 
 // ---------------------------------------------------------------------------

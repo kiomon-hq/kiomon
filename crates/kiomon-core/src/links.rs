@@ -794,7 +794,7 @@ mod tests {
             "zqxwv kfmpb vrytlc",
             "gpfn ydwq zmbx ktlv nsch",
         );
-        assert!(related(&db, &lonely).is_empty());
+        assert_eq!(related(&db, &lonely).len(), 0);
         assert_eq!(edge_count(&db), 0);
     }
 
@@ -908,7 +908,7 @@ mod tests {
         assert_eq!(neighbours[0].status, Status::Active);
         assert_eq!(neighbours[0].relation, Relation::Precedes);
         assert_eq!(neighbours[0].origin, "manual");
-        assert!(!neighbours[0].created_at.is_empty());
+        assert_ne!(neighbours[0].created_at.len(), 0);
     }
 
     #[test]
@@ -1012,7 +1012,7 @@ mod tests {
                 [],
             )
             .expect("the fixture must close the edge");
-        assert!(related(&db, &a).is_empty());
+        assert_eq!(related(&db, &a).len(), 0);
     }
 
     #[test]
@@ -1044,7 +1044,7 @@ mod tests {
         db.forget(std::slice::from_ref(&b))
             .expect("the purge must run");
         assert_eq!(edge_count(&db), 0, "the cascade is the database's job");
-        assert!(related(&db, &a).is_empty());
+        assert_eq!(related(&db, &a).len(), 0);
     }
 
     #[test]

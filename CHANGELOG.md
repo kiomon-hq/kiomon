@@ -52,6 +52,10 @@ Every release that changes what a caller can rely on gets an entry here. The for
 
 ### Changed
 
+- **The minimum supported Rust version is 1.88, not 1.85.** The code uses `if a && let
+  Some(b) = c` in two places, which was stabilised in 1.88; the first CI run of the
+  repository caught the claim rather than a user's build. Both crates now say so, and the
+  MSRV job builds them on 1.88.
 - **`kiomon serve` needs no API key.** A local brain has no accounts, no organisations and no
   roles: a workspace is the only thing that separates one body of memory from another, and it is
   a read boundary rather than a permission. The server asks for no credential by default, so the

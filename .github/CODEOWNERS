@@ -1,0 +1,4 @@
+# Branch protection requires a review on `main`; this is who the review request goes to
+# automatically. One owner is honest at this size — a second name here would be a claim
+# that somebody else is on the hook, and nobody else is yet.
+* @d1pankarmedhi

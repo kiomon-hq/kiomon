@@ -176,7 +176,7 @@ fn help_is_printed_on_stdout_and_exits_zero() {
     assert_eq!(code(&out), 0);
     let text = stdout(&out);
     assert!(text.contains("Usage:"), "{text}");
-    assert!(!text.trim().is_empty());
+    assert_ne!(text.trim().len(), 0);
 }
 
 #[test]
@@ -210,7 +210,7 @@ fn a_missing_subcommand_is_a_usage_error_on_stderr_with_code_three() {
         "a usage error must not write to stdout: {}",
         stdout(&out)
     );
-    assert!(!stderr(&out).is_empty());
+    assert_ne!(stderr(&out).len(), 0);
 }
 
 #[test]
@@ -1298,7 +1298,7 @@ fn an_empty_result_says_so_on_stderr_not_stdout() {
     // And `--quiet` silences the note without changing the code or the empty stdout.
     let quiet = run(&["list", "--db", &sandbox.db_arg(), "--quiet"]);
     assert_eq!(code(&quiet), 0);
-    assert!(stdout(&quiet).is_empty());
+    assert_eq!(stdout(&quiet).len(), 0);
     assert!(stderr(&quiet).is_empty(), "{}", stderr(&quiet));
 }
 
@@ -2019,7 +2019,7 @@ fn bench_gate_is_the_plan_s_limits_and_a_missed_gate_is_an_exit_code() {
     let gates = value["data"]["reports"][0]["gates"]
         .as_array()
         .expect("the gates");
-    assert!(!gates.is_empty());
+    assert_ne!(gates.len(), 0);
     assert_eq!(
         passed,
         gates

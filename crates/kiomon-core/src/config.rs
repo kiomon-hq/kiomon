@@ -57,10 +57,10 @@ pub fn resolve_db_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
     }
-    if let Some(value) = std::env::var_os(ENV_DB) {
-        if !value.is_empty() {
-            return Ok(PathBuf::from(value));
-        }
+    if let Some(value) = std::env::var_os(ENV_DB)
+        && !value.is_empty()
+    {
+        return Ok(PathBuf::from(value));
     }
     if let Some(dir) = platform_data_dir() {
         return Ok(dir.join(DB_FILE));

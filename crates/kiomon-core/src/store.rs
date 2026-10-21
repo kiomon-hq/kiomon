@@ -387,10 +387,11 @@ impl Database {
         // can only find by the words it used to have — worse than a row with no vector,
         // because nothing reports it and the stale one still wins.
         let text_moved = patch.title.is_some() || patch.body.is_some() || patch.excerpt.is_some();
-        if text_moved && changed > 0 {
-            if let Err(error) = self.reembed_ids(std::slice::from_ref(&existing.id)) {
-                warnings.push(format!("updated, but not re-embedded: {error}"));
-            }
+        if text_moved
+            && changed > 0
+            && let Err(error) = self.reembed_ids(std::slice::from_ref(&existing.id))
+        {
+            warnings.push(format!("updated, but not re-embedded: {error}"));
         }
 
         Ok(UpdateOutcome {
@@ -1201,16 +1202,16 @@ fn insert_one(
 
     let content_hash = hash::content_hash(new.kind, title, &new.body);
 
-    if !new.force {
-        if let Some(existing) = find_duplicate_near(transaction, workspace_id, &content_hash, new) {
-            return Ok(AddOutcome {
-                id: existing.id,
-                workspace_id: existing.workspace_id,
-                status: existing.status,
-                duplicate: true,
-                warnings,
-            });
-        }
+    if !new.force
+        && let Some(existing) = find_duplicate_near(transaction, workspace_id, &content_hash, new)
+    {
+        return Ok(AddOutcome {
+            id: existing.id,
+            workspace_id: existing.workspace_id,
+            status: existing.status,
+            duplicate: true,
+            warnings,
+        });
     }
 
     let status = gate::decide(&new.source, new.confidence, review_mode).status();
@@ -1372,12 +1373,12 @@ fn changed_fields(patch: &MemoryPatch) -> usize {
 /// constraint failed", which tells them nothing about which argument was wrong. `NaN`
 /// fails the range test, which is the behaviour we want.
 fn check_unit_range(flag: &str, value: Option<f64>) -> Result<()> {
-    if let Some(value) = value {
-        if !(0.0..=1.0).contains(&value) {
-            return Err(Error::Invalid(format!(
-                "{flag} must be between 0.0 and 1.0, got {value}"
-            )));
-        }
+    if let Some(value) = value
+        && !(0.0..=1.0).contains(&value)
+    {
+        return Err(Error::Invalid(format!(
+            "{flag} must be between 0.0 and 1.0, got {value}"
+        )));
     }
     Ok(())
 }
@@ -1485,7 +1486,7 @@ mod tests {
             stored.memory_metadata["priority"],
             serde_json::json!("high")
         );
-        assert!(!stored.created_at.is_empty());
+        assert_ne!(stored.created_at.len(), 0);
         assert_eq!(stored.created_at, stored.updated_at);
         assert_eq!(stored.kind_label(), "Routines");
         assert_eq!(stored.source_label(), "reflection");
@@ -1496,7 +1497,7 @@ mod tests {
         let db = testing::db();
         let memory = testing::add_and_get(&db, MemoryKind::Reference, "A file", "content");
         assert_eq!(memory.excerpt, "");
-        assert!(memory.tags.is_empty());
+        assert_eq!(memory.tags.len(), 0);
         assert_eq!(memory.memory_metadata, serde_json::json!({}));
         assert_eq!(memory.source, "user_saved");
         assert_eq!(memory.source_label(), "saved");
@@ -2045,7 +2046,7 @@ mod tests {
 
         let outcome = db.forget(&[source.clone(), derived.id.clone()]).unwrap();
         assert_eq!(outcome.deleted.len(), 2);
-        assert!(outcome.missing.is_empty());
+        assert_eq!(outcome.missing.len(), 0);
 
         assert_eq!(db.count("SELECT count(*) FROM memories", &[]).unwrap(), 0);
         assert_eq!(db.count("SELECT count(*) FROM memory_fts", &[]).unwrap(), 0);

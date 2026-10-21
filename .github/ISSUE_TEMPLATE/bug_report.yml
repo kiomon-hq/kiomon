@@ -1,0 +1,95 @@
+name: Bug report
+description: Something in `kiomon` does not do what the documentation says it does.
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Three of the fields below are what turn "it does not work"
+        into something reproducible — the version (which includes the commit), `kiomon
+        doctor` (which checks the file itself), and the exact command.
+
+        **Do not report a security vulnerability here.** Follow
+        [SECURITY.md](https://github.com/kiomon-hq/kiomon/blob/main/SECURITY.md) instead;
+        a public issue is visible to everyone, and a memory engine's bugs can be about
+        what it discloses.
+
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched the existing issues, including closed ones.
+          required: true
+        - label: This is not a security vulnerability (those go through SECURITY.md).
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: `kiomon --version`
+      description: The version **and** the git commit, because a bug report needs both.
+      placeholder: 0.1.0 (git 1a2b3c4)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How it was installed
+      options:
+        - install.sh (Linux or macOS)
+        - install.ps1 (Windows)
+        - cargo install
+        - cargo build from source
+        - a package manager (Homebrew, npm, … — say which below)
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      placeholder: macOS 15.4 arm64 · Ubuntu 24.04 x86_64 · Windows 11 x86_64
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: `kiomon doctor` output
+      description: >
+        Redact anything private first — it prints the database path and the config path.
+        If `doctor` itself cannot run, say so and skip this field; that is the bug.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: What you did
+      description: The smallest sequence of commands that shows the problem, starting from a fresh database if you can.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+      description: >
+        Paste the actual output if it is short. If you used `--json`, the whole document is
+        more useful than the part that looked wrong.
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: >
+        Related issues, a guess at the cause, whether it reproduces on a second machine, or
+        the output of `kiomon bench` if the problem is speed.
+    validations:
+      required: false

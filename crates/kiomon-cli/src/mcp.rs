@@ -702,10 +702,10 @@ fn render_search(reply: &Value) -> String {
             "{}. {title}  [{kind}] {id}  ({score:.2})",
             index + 1
         ));
-        if let Some(snippet) = row.get("snippet").and_then(Value::as_str) {
-            if !snippet.is_empty() {
-                lines.push(format!("   {snippet}"));
-            }
+        if let Some(snippet) = row.get("snippet").and_then(Value::as_str)
+            && !snippet.is_empty()
+        {
+            lines.push(format!("   {snippet}"));
         }
     }
     if let Some(warning) = reply.get("warning").and_then(Value::as_str) {

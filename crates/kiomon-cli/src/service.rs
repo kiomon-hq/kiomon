@@ -1629,7 +1629,10 @@ mod tests {
 
     #[test]
     fn a_kind_list_parses_commas_and_the_hosted_vocabulary() {
-        assert!(parse_kinds(None).expect("none").is_empty());
+        assert_eq!(
+            parse_kinds(None).expect("none"),
+            [] as [kiomon_core::MemoryKind; 0]
+        );
         assert_eq!(
             parse_kinds(Some("semantic, procedural")).expect("two"),
             vec![MemoryKind::Semantic, MemoryKind::Procedural]

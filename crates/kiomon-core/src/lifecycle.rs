@@ -876,11 +876,11 @@ impl Database {
                 skipped.push(Skipped::new(id, SkipReason::NotFound));
                 continue;
             };
-            if let Some(only) = scope.one() {
-                if credit.workspace_id != only {
-                    skipped.push(Skipped::new(id, SkipReason::OutOfScope));
-                    continue;
-                }
+            if let Some(only) = scope.one()
+                && credit.workspace_id != only
+            {
+                skipped.push(Skipped::new(id, SkipReason::OutOfScope));
+                continue;
             }
 
             let base = base_confidence(credit.claimed);
@@ -1044,7 +1044,7 @@ mod tests {
 
         let outcome = db.approve(std::slice::from_ref(&id)).unwrap();
         assert_eq!(outcome.moved, vec![id.clone()]);
-        assert!(outcome.skipped.is_empty());
+        assert_eq!(outcome.skipped.len(), 0);
         assert_eq!(testing::fts_rows(&db).unwrap(), 2);
         assert_eq!(db.get(&id).unwrap().status, Status::Active);
     }
@@ -1054,7 +1054,7 @@ mod tests {
         let db = testing::db();
         let id = testing::add(&db, MemoryKind::Semantic, "Already active", "body");
         let outcome = db.approve(&[id.clone(), "k_missing".to_owned()]).unwrap();
-        assert!(outcome.moved.is_empty());
+        assert_eq!(outcome.moved.len(), 0);
         assert_eq!(outcome.skipped.len(), 2);
         assert_eq!(outcome.skipped[0].reason, SkipReason::WrongStatus);
         assert_eq!(outcome.skipped[0].status, Some(Status::Active));
@@ -1226,7 +1226,7 @@ mod tests {
         let first = db.set_pinned(std::slice::from_ref(&id), true).unwrap();
         assert_eq!(first.moved, vec![id.clone()]);
         let again = db.set_pinned(std::slice::from_ref(&id), true).unwrap();
-        assert!(again.moved.is_empty());
+        assert_eq!(again.moved.len(), 0);
         assert_eq!(again.skipped[0].reason, SkipReason::AlreadyThere);
         let off = db.set_pinned(std::slice::from_ref(&id), false).unwrap();
         assert_eq!(off.moved, vec![id.clone()]);
@@ -1517,7 +1517,7 @@ mod tests {
                 &Scope::One("default".to_owned()),
             )
             .unwrap();
-        assert!(report.applied.is_empty());
+        assert_eq!(report.applied.len(), 0);
         assert_eq!(report.skipped[0].reason, SkipReason::OutOfScope);
         assert_eq!(report.skipped[1].reason, SkipReason::NotFound);
         assert_eq!(db.get(&elsewhere).unwrap().feedback_count, 0);

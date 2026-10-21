@@ -1754,7 +1754,7 @@ mod tests {
             packet.summary, "No memories matched intent \"plan\".",
             "the empty summary names the intent, so a caller can tell whose packet it is"
         );
-        assert!(packet.retrieved_ids.is_empty());
+        assert_eq!(packet.retrieved_ids.len(), 0);
         let json = serde_json::to_value(&packet).expect("the packet must serialize");
         assert!(
             json.get("procedure").is_none(),
@@ -1937,7 +1937,7 @@ mod tests {
                 ..query(Intent::Answer, "deploy staging")
             })
             .expect("a packet");
-        assert!(packet.retrieved_ids.is_empty());
+        assert_eq!(packet.retrieved_ids.len(), 0);
         assert_eq!(
             packet.summary, "No memories matched intent \"answer\".",
             "the empty summary a caller sees for an empty workspace, too"

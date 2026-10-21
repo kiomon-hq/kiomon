@@ -1128,7 +1128,7 @@ mod tests {
     #[test]
     fn every_sample_id_is_a_real_memory_in_the_default_workspace() {
         let (db, report) = built(20);
-        assert!(!report.sample_ids.is_empty());
+        assert_ne!(report.sample_ids.len(), 0);
         for id in &report.sample_ids {
             assert_eq!(
                 db.get(id).expect("the sampled id must exist").workspace_id,

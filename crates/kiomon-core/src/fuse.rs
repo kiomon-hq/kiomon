@@ -152,9 +152,9 @@ mod tests {
 
     #[test]
     fn no_lists_and_empty_lists_fuse_to_nothing() {
-        assert!(fuse(&[], 10).is_empty());
-        assert!(fuse(&[vec![], vec![]], 10).is_empty());
-        assert!(fuse(&[vec![1, 2]], 0).is_empty());
+        assert_eq!(fuse(&[], 10).len(), 0);
+        assert_eq!(fuse(&[vec![], vec![]], 10).len(), 0);
+        assert_eq!(fuse(&[vec![1, 2]], 0).len(), 0);
     }
 
     #[test]

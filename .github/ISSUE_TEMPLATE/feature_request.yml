@@ -1,0 +1,65 @@
+name: Feature request
+description: Propose a capability, or argue that one of the cuts was wrong.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repository is small on purpose: the size *is* the feature. Almost every
+        capability the hosted product has was cut, and the cut is written down in
+        [`plans/001-local-v1-core.md`](https://github.com/kiomon-hq/kiomon/blob/main/plans/001-local-v1-core.md)
+        §1 and §10 with the argument that removed it. A request that engages with those
+        arguments is far more likely to land than one that does not.
+
+        The budget a proposal is measured against: **fewer than 60 crates, a 6 MiB binary,
+        no async runtime, and no network call on a default path.**
+
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched the existing issues and the plan's "what was rejected" section.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What you were trying to do, and where `kiomon` made it harder. A concrete session
+        ("I wanted X, so I typed Y, and got Z") is worth more than a category.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+      description: The shape of the answer, not the implementation — a command line, a field, a flag.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do instead today
+      description: >
+        The workaround matters: if `kiomon export | jq` already solves it, the feature may
+        be a shell function rather than a verb.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: budget
+    attributes:
+      label: What does this cost the budget?
+      description: Be honest — an argued cost is easier to accept than an unmentioned one.
+      options:
+        - Nothing measurable (a flag, a field, a CLI verb over existing data)
+        - A new dependency (say which, and its transitive count)
+        - A schema migration
+        - Network or async (this one needs the strongest argument)
+        - Not sure
+    validations:
+      required: true

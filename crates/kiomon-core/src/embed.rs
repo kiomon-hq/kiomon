@@ -261,12 +261,12 @@ impl Embedder {
             (None, _) => String::new(),
         };
 
-        if let Some(dim) = config.dim {
-            if dim == 0 {
-                return Err(Error::Config(
-                    "the [embedder] block sets `dim = 0`, which no model returns".to_owned(),
-                ));
-            }
+        if let Some(dim) = config.dim
+            && dim == 0
+        {
+            return Err(Error::Config(
+                "the [embedder] block sets `dim = 0`, which no model returns".to_owned(),
+            ));
         }
         let batch = config.batch.unwrap_or(DEFAULT_BATCH);
         if batch == 0 {
@@ -421,18 +421,18 @@ impl Embedder {
                 )));
             }
             for vector in vectors.drain(..) {
-                if let Some(expected) = self.dim {
-                    if vector.len() != expected {
-                        return Err(Error::Config(format!(
-                            "the embedder returned {} dimensions for model `{}`, and the \
+                if let Some(expected) = self.dim
+                    && vector.len() != expected
+                {
+                    return Err(Error::Config(format!(
+                        "the embedder returned {} dimensions for model `{}`, and the \
                              config says `dim = {expected}`. Either the model name is not \
                              the one that was meant, or `dim` is left over from another \
                              model; vectors from two models are not comparable and would \
                              be mixed silently.",
-                            vector.len(),
-                            self.model
-                        )));
-                    }
+                        vector.len(),
+                        self.model
+                    )));
                 }
                 out.push(normalize(vector));
             }

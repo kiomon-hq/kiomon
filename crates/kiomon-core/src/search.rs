@@ -970,7 +970,7 @@ mod tests {
         for text in ["", "   ", "\n"] {
             let outcome = search(&db, text);
             assert_eq!(outcome.attempt, SearchAttempt::NothingAsked);
-            assert!(outcome.hits.is_empty());
+            assert_eq!(outcome.hits.len(), 0);
             assert_eq!(outcome.recorded, 0);
         }
     }
@@ -1006,7 +1006,7 @@ mod tests {
         // bug: `plans/001-local-v1-core.md` §10 records the trigram tokenizer as the fix
         // if this ever costs somebody a memory.
         let db = corpus();
-        assert!(search(&db, "のメモ").hits.is_empty());
+        assert_eq!(search(&db, "のメモ").hits.len(), 0);
     }
 
     #[test]

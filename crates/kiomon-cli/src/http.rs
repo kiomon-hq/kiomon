@@ -275,16 +275,16 @@ fn handle(stream: TcpStream, service: &Service, token: Option<&str>, quiet: bool
     };
 
     let status = reply.fault_status();
-    if let Some(peer) = peer {
-        if !quiet {
-            out::warn(
-                false,
-                &format!(
-                    "serve: {summary} -> {status} in {:.1} ms ({peer})",
-                    started.elapsed().as_secs_f64() * 1000.0
-                ),
-            );
-        }
+    if let Some(peer) = peer
+        && !quiet
+    {
+        out::warn(
+            false,
+            &format!(
+                "serve: {summary} -> {status} in {:.1} ms ({peer})",
+                started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
     }
     write_response(stream, status, &reply.body(), head_only);
 }
@@ -315,17 +315,17 @@ fn route(service: &Service, request: &Request, token: Option<&str>) -> Response 
         )
         .into();
     }
-    if let Some(token) = token {
-        if !request.has_token(token) {
-            return Fault::new(
-                401,
-                "unauthorized",
-                "this server was started with `--require-token`. Send the token from the file \
+    if let Some(token) = token
+        && !request.has_token(token)
+    {
+        return Fault::new(
+            401,
+            "unauthorized",
+            "this server was started with `--require-token`. Send the token from the file \
                  beside the database as `X-API-Key` (or `Authorization: Bearer <token>`); \
                  `kiomon serve` printed its path at startup.",
-            )
-            .into();
-        }
+        )
+        .into();
     }
 
     // The pattern and the method are both part of a match. Filtering on the pattern and then
@@ -1149,10 +1149,10 @@ fn load_or_create_token(path: &Path) -> Result<(String, bool)> {
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let token = new_token()?;
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
-                }
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
             }
             write_private(path, &token)?;
             Ok((token, true))
