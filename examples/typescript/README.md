@@ -10,8 +10,8 @@ and falls back to the sibling SDK checkout at `../../SDK/kiomon-ts/sdk/dist`, so
 nothing installed. Set `KIOMON_TS_SDK` to an explicit `dist/index.js` if your layout differs.
 
 Like the Python example, it starts `kiomon serve` itself on an ephemeral port with a throwaway
-database and stops it on exit. Set `KIOMON_URL` and `KIOMON_TOKEN` to use a server that is
-already running.
+database and stops it on exit. Set `KIOMON_URL` to use a server that is already running. There is
+no key to fetch: the SDK requires `apiKey`, the local server ignores its value.
 
 ## The two lines that matter
 
@@ -19,7 +19,7 @@ already running.
 import { Kiomon } from "@kiomon/kiomon";
 
 const kiomon = new Kiomon({
-	apiKey: token,                       // the token from the file `serve` printed
+	apiKey: "local",                     // required by the SDK, ignored by the local server
 	baseUrl: "http://127.0.0.1:53412",
 	workspaceId: "default",
 });

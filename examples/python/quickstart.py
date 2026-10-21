@@ -5,8 +5,13 @@
     python examples/python/quickstart.py
 
 Run it with nothing else running. It starts `kiomon serve` on an ephemeral port with a
-throwaway database, drives the real SDK against it, and stops it on exit. Set KIOMON_URL and
-KIOMON_TOKEN to use a server that is already running instead (see `local.py`).
+throwaway database, drives the real SDK against it, and stops it on exit. Set KIOMON_URL to use
+a server that is already running instead (see `local.py`).
+
+There is no API key. The SDK's `api_key` argument is required by its constructor, so it gets the
+placeholder `local`, which the server never looks at: a local brain has no accounts, no
+organisations and no roles. A workspace is the only thing separating one body of memory from
+another.
 """
 
 from __future__ import annotations
@@ -24,7 +29,8 @@ def main() -> None:
     with local.brain() as (client, url, database):
         section("1. The connection")
         # Every call below is an HTTP request to the URL printed above. The SDK's defaults --
-        # retries, timeouts, error mapping -- all still apply; only the host changed.
+        # retries, timeouts, error mapping -- all still apply; only the host changed. The key
+        # this client was built with is the string "local", which the server does not check.
         print(f"  base_url  {url}")
         workspaces = client.list_workspaces()["workspaces"]
         print(f"  workspace {workspaces[0]['id']} ({workspaces[0]['name']}), slug={workspaces[0]['slug']!r}")

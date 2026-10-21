@@ -74,7 +74,9 @@ const main = async () => {
 			}
 		});
 	});
-	const token = readFileSync(join(home, "serve.token"), "utf8").trim();
+	// The SDK demands a credential; a local server ignores its value. `local` is the
+	// documented placeholder rather than a secret.
+	const token = "local";
 
 	try {
 		const { Kiomon, KiomonError } = await import(pathToFileURL(clientPath).href);
@@ -162,10 +164,14 @@ const main = async () => {
 			}
 		}
 
-		// The door, from the SDK's own fetch path.
+		// The door, from the SDK's own fetch path. No credential is demanded by default --
+		// a local brain has no accounts to check a key against -- so the SDK's placeholder is
+		// ignored and a bare request is answered. What is still refused is the browser: a
+		// foreign Origin, before routing. (`--require-token` adds 401 for a shared machine.)
 		for (const [label, headers, expected] of [
-			["no token", {}, 401],
-			["foreign Origin", { "X-API-Key": token, Origin: "http://evil.example" }, 403],
+			["no credential at all", {}, 200],
+			["the SDK's placeholder", { "X-API-Key": "local" }, 200],
+			["foreign Origin", { Origin: "http://evil.example" }, 403],
 		]) {
 			const response = await fetch(`${url}/api/workspaces`, { headers });
 			check(response.status === expected, `${label} should be ${expected}, got ${response.status}`);

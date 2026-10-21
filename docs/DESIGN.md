@@ -368,27 +368,37 @@ empty *and* disagree with `relate`, which reads the same rows. `origin` travels 
 edge, so a client that wants the hosted view can filter — and the divergence is written down
 where a reader of the route will find it.
 
-### The local token, and the three refusals
+### The two refusals (and the token you never see)
 
 A loopback socket is not private. Any process on the machine can connect to it; so can a
 page in a browser, which is the one that matters, because a browser can reach `127.0.0.1`
-from a page served by anyone.
+from a page served by anyone. Two checks run before routing sees the path, and they are the
+two that a browser cannot get around:
 
-Three checks, in order, before routing sees the path:
-
-1. **`Host` must be a loopback name.** DNS rebinding is the attack the token does not stop:
-   `evil.example` resolves to `127.0.0.1`, the browser sends `Host: evil.example`, and the
-   page is now same-origin with this server. The header is the one thing it cannot forge.
+1. **`Host` must be a loopback name.** DNS rebinding is the attack nothing else stops:
+   `evil.example` resolves to `127.0.0.1`, the browser sends `Host: evil.example`, and the page
+   is now same-origin with this server. The header is the one thing it cannot forge.
 2. **`Origin`, if present, must be loopback.** A cross-origin page's `Origin` is unforgeable;
    absent means "not a browser", which is what every SDK is.
-3. **The token must match.** `X-API-Key` (what the SDKs send) or `Authorization: Bearer`.
-   This is the check that turns "loopback" into "mine", and it runs before routing so an
-   unauthenticated client cannot map the surface by comparing `401` with `404`.
 
 There is no CORS header, so even a same-origin-in-appearance fetch gets an opaque response.
-The token lives in `<data dir>/serve.token` — beside the database, so two brains are two
-credentials — is created on first run with mode `0600`, and is printed once, because a
-credential nobody can find is a credential nobody uses.
+
+**There is no API key.** The first version of this had one — a token beside the database, sent
+as `X-API-Key` — and it was the one piece of hosted ceremony that bought a local user nothing: a
+local brain has no accounts, no organisations and no roles, and a key the SDK forces into its
+constructor would have been a constant anyway, since the SDK throws without one. What it added
+was a file to read and a value to keep in sync on every restart. It is now `--require-token`,
+off by default, for the two cases that want it: a shared machine, or a port forwarded somewhere
+it should not be. Then `serve.token` is created beside the database with mode `0600`, printed
+once, and required in `X-API-Key` or `Authorization: Bearer`.
+
+**What removing it costs, stated plainly.** A local process can now talk to the server without
+identifying itself. That was always true of every process running as the same user — the token
+never stopped a program, only a *browser* — and the `Host` and `Origin` checks are what keep the
+browser out. The residual exposure is a no-`Origin` GET from a page (an `<img>` load): it cannot
+read the reply (no CORS), but `GET /api/search` records retrievals, so it could skew what decay
+keeps. `--require-token` closes it; the default accepts it as the price of not making a user
+manage a key for their own file.
 
 ### What a request costs
 

@@ -2,17 +2,19 @@
 """Start (or find) a local brain and point the Python SDK at it.
 
 This is the whole trick of running a published SDK against a local engine: the SDK defaults
-to ``https://api.kiomon.com``, so you give it a ``base_url`` of ``127.0.0.1`` and an
-``api_key`` that is the local token. Everything else - paths, bodies, error codes - is the
-hosted contract, because the local server answers the hosted routes.
+to ``https://api.kiomon.com``, so you point its ``base_url`` at ``127.0.0.1``. The SDK also
+demands an ``api_key`` because it was written for the hosted product; locally the value is the
+placeholder ``local`` and the server ignores it, because a local brain has no accounts and no
+API keys. Everything else - paths, bodies, error codes - is the hosted contract, because the
+local server answers the hosted routes.
 
 Two modes:
 
 * **Nothing running** (the default here): start ``kiomon serve --port 0`` with a throwaway
-  database, read the announcement line it prints, and load the token from the file beside
-  that database. Both examples do this so they work from a clean checkout.
-* **Something running**: set ``KIOMON_URL`` and ``KIOMON_TOKEN`` and the helper uses that
-  instead. This is what you do against your real brain in another terminal.
+  database and read the announcement line it prints. Both examples do this so they work from
+  a clean checkout.
+* **Something running**: set ``KIOMON_URL`` and the helper uses that instead. This is what you
+  do against your real brain in another terminal.
 
 Environment:
 
@@ -51,6 +53,10 @@ except ImportError:  # pragma: no cover - the fallback is for this workspace onl
 
 __all__ = ["Kiomon", "KiomonError", "brain", "binary", "server_announcement"]
 
+#: The credential the SDK requires and the local server ignores. One constant, so a reader can
+#: see at a glance that there is no secret in this file.
+LOCAL_KEY = "local"
+
 
 def binary() -> str:
     """The ``kiomon`` this example will drive: explicit, local build, then ``PATH``."""
@@ -82,9 +88,8 @@ def server_announcement(process: subprocess.Popen[str]) -> dict[str, object]:
 def brain() -> Iterator[tuple[Kiomon, str, Path]]:
     """Yield ``(client, url, database)`` - a running server and a client pointed at it."""
     url = os.environ.get("KIOMON_URL")
-    token = os.environ.get("KIOMON_TOKEN")
-    if url and token:
-        yield Kiomon(api_key=token, base_url=url, workspace_id="default"), url, Path("<remote>")
+    if url:
+        yield Kiomon(api_key=LOCAL_KEY, base_url=url, workspace_id="default"), url, Path("<remote>")
         return
 
     keep = os.environ.get("KIOMON_EXAMPLE_DB")
@@ -103,12 +108,12 @@ def brain() -> Iterator[tuple[Kiomon, str, Path]]:
     try:
         announcement = server_announcement(process)
         url = str(announcement["url"])
-        # The token file is created on first run and never rotated behind your back. Reading
-        # it is the local equivalent of "copy your API key" - there is no key to issue.
-        token = Path(str(announcement["token_file"])).read_text(encoding="utf-8").strip()
         print(f"  brain     {database}")
         print(f"  serve     {url}")
-        yield Kiomon(api_key=token, base_url=url, workspace_id="default"), url, database
+        # `api_key` is the SDK's required argument, not a secret: the server accepts any value
+        # and checks none. "local" is the documented placeholder, so nothing is read off disk
+        # and nothing has to be kept in sync when the server restarts.
+        yield Kiomon(api_key=LOCAL_KEY, base_url=url, workspace_id="default"), url, database
     finally:
         process.terminate()
         with contextlib.suppress(subprocess.TimeoutExpired):

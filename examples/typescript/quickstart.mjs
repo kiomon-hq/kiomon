@@ -9,12 +9,15 @@
 // ../../SDK/kiomon-ts/sdk/dist when the published package is not installed. Run
 // `npm install` in this directory to use `@kiomon/kiomon` from the registry instead.
 //
-// Set KIOMON_URL and KIOMON_TOKEN to use a server that is already running; with neither set,
-// the script starts `kiomon serve --port 0` itself with a throwaway database and stops it on
-// exit.
+// Set KIOMON_URL to use a server that is already running; with nothing set, the script starts
+// `kiomon serve --port 0` itself with a throwaway database and stops it on exit.
+//
+// There is no API key to manage. The SDK requires `apiKey` because it is written for the hosted
+// product, so it gets the placeholder "local"; the local server ignores the value, because a
+// local brain has no accounts and no keys.
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,17 +49,16 @@ async function loadSdk() {
 
 const { Kiomon, KiomonError } = await loadSdk();
 
+// The SDK's constructor requires a credential; a local server does not check it. One documented
+// placeholder, in one place, so a reader can see at a glance that there is no secret involved.
+const LOCAL_KEY = "local";
+
 // -- The binary ----------------------------------------------------------------
 function binary() {
 	if (process.env.KIOMON_BIN) return process.env.KIOMON_BIN;
 	for (const name of ["kiomon.exe", "kiomon"]) {
-		try {
-			const path = join(repository, "target", "release", name);
-			readFileSync(path).subarray(0, 1); // exists and readable
-			return path;
-		} catch {
-			// try the next one
-		}
+		const path = join(repository, "target", "release", name);
+		if (existsSync(path)) return path;
 	}
 	return "kiomon"; // resolved on PATH
 }
@@ -65,10 +67,9 @@ function binary() {
 // Returns a client and a `close()` that also stops a server this script started.
 async function brain() {
 	const explicitUrl = process.env.KIOMON_URL;
-	const explicitToken = process.env.KIOMON_TOKEN;
-	if (explicitUrl && explicitToken) {
+	if (explicitUrl) {
 		return {
-			client: new Kiomon({ apiKey: explicitToken, baseUrl: explicitUrl, workspaceId: "default" }),
+			client: new Kiomon({ apiKey: LOCAL_KEY, baseUrl: explicitUrl, workspaceId: "default" }),
 			url: explicitUrl,
 			close: () => {},
 		};
@@ -99,12 +100,11 @@ async function brain() {
 		});
 	});
 
-	const token = readFileSync(announcement.token_file, "utf8").trim();
 	console.log(`  brain     ${database}`);
 	console.log(`  serve     ${announcement.url}`);
 
 	return {
-		client: new Kiomon({ apiKey: token, baseUrl: announcement.url, workspaceId: "default" }),
+		client: new Kiomon({ apiKey: LOCAL_KEY, baseUrl: announcement.url, workspaceId: "default" }),
 		url: announcement.url,
 		close: () => {
 			child.kill();

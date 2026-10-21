@@ -17,8 +17,9 @@ use crate::{mcp, out};
 ///
 /// # Errors
 ///
-/// [`kiomon_core::Error::Config`] when no database path can be resolved or the token file
-/// cannot be written, and [`kiomon_core::Error::Io`] when the port cannot be bound.
+/// [`kiomon_core::Error::Config`] when no database path can be resolved or, with
+/// `--require-token`, the token file cannot be written; and [`kiomon_core::Error::Io`] when the
+/// port cannot be bound.
 pub fn serve(cli: &Cli, args: &ServeArgs) -> kiomon_core::Result<kiomon_core::ExitCode> {
     let service = Service::new(cli.db.clone(), cli.config.clone());
     // One line on stderr, before the handshake, because "which brain am I serving" is the
@@ -32,7 +33,7 @@ pub fn serve(cli: &Cli, args: &ServeArgs) -> kiomon_core::Result<kiomon_core::Ex
         &service,
         &ServeOptions {
             port: args.port,
-            token_file: args.token_file.clone(),
+            require_token: args.require_token,
             once: args.once,
         },
         cli.json,

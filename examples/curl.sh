@@ -6,8 +6,9 @@
 #   bash examples/curl.sh
 #
 # This is the door the published SDKs call. Reading it once is how you debug them: every
-# SDK method is a method, a path and a JSON body, and the three refusals (Host, Origin,
-# token) happen before the router looks at the path at all.
+# SDK method is a method, a path and a JSON body. There is no API key to invent - a local brain
+# has no accounts - so the only headers are `Host`, `Origin`, and (with `--require-token`) the
+# token. The refusals happen before the router looks at the path at all.
 #
 # The script starts its own `serve` on an ephemeral port with a throwaway brain, reads the
 # token out of the file `serve` created, and kills the server on exit.
@@ -40,7 +41,8 @@ step() { printf '\n\033[36m-- %s ---------------------------------------------\0
 # -- Start the server --------------------------------------------------------
 # `--port 0` asks the OS for a free port; the first line of stdout is one JSON object
 # describing what is listening. That line is the interface a supervisor parses, and it is
-# printed before the first request can arrive, so this read cannot race.
+# printed before the first request can arrive, so this read cannot race. It says `"auth":"none"`,
+# which is the default: loopback is the boundary.
 step "Starting serve on an ephemeral port"
 "$KIOMON_BIN" init >/dev/null
 "$KIOMON_BIN" add --quiet --kind semantic \
@@ -59,13 +61,11 @@ done
 # that bash translates and a Windows Python does not, so a `json.load(open(...))` here
 # would fail on the one platform this repository is developed on.
 URL=$(python3 -c "import json,sys;print(json.load(sys.stdin)['url'])" < "$WORK/serve.json")
-TOKEN_FILE=$(python3 -c "import json,sys;print(json.load(sys.stdin)['token_file'])" < "$WORK/serve.json")
-TOKEN=$(cat "$TOKEN_FILE")
-printf 'listening: %s\ntoken file: %s\n' "$URL" "$TOKEN_FILE"
+printf 'listening: %s\n' "$URL"
 
-# Bearer and X-API-Key are the same credential. The SDKs send X-API-Key; a shell script
-# reads better with a header it can name.
-API=(-H "X-API-Key: $TOKEN")
+# Nothing goes in this array by default. The published SDKs send `X-API-Key: local` because their
+# constructor demands a credential; this server ignores the value, so no header is needed at all.
+API=()
 
 # `call` prints the request line, the response body, and the status  -  the three things you
 # need when a call that "should work" does not. It also leaves the body in `$LAST` (the
@@ -133,17 +133,20 @@ call PATCH "/api/documents/$ID" '{"pinned":1}'
 call POST "/api/documents/$ID/rate" '{"rating":1}'
 
 # -- The refusals ------------------------------------------------------------
-# These are not decorations. Without the Host check an attacker's domain pointed at
-# 127.0.0.1 arrives with its own Host and reads your brain (DNS rebinding); without the
-# token check any local process can. Both refusals happen before routing, so an
-# unauthorised client cannot map the surface by comparing 401 with 404.
-step "The three refusals"
-printf '\n\033[1mno token\033[0m\n'
-curl -sS "$URL/api/workspaces" -w '\n[%{http_code}]\n'
+# These are not decorations, and they are why a local server needs no key: a request with no
+# headers at all is answered, but a browser cannot reach it. Without the Host check an
+# attacker's domain pointed at 127.0.0.1 arrives with its own Host and reads your brain (DNS
+# rebinding); without the Origin check a page could fetch it. Both are refused before routing.
+step "What the door does, and does not, refuse"
+printf '\n\033[1mno headers at all (a local process)\033[0m\n'
+curl -sS "$URL/api/workspaces" -o /dev/null -w '[%{http_code}]\n'
+printf '\n\033[1mthe SDK placeholder is ignored, not checked\033[0m\n'
+curl -sS -H 'X-API-Key: local' "$URL/api/workspaces" -o /dev/null -w '[%{http_code}]\n'
 printf '\n\033[1mforeign Host\033[0m\n'
 curl -sS "${API[@]}" -H 'Host: attacker.example' "$URL/api/workspaces" -w '\n[%{http_code}]\n'
 printf '\n\033[1mforeign Origin\033[0m\n'
 curl -sS "${API[@]}" -H 'Origin: https://attacker.example' "$URL/api/workspaces" -w '\n[%{http_code}]\n'
+printf '\n\033[2m`kiomon serve --require-token` adds a 401 for a shared machine (see docs/CONTRACT.md).\033[0m\n'
 
 # -- Honest gaps -------------------------------------------------------------
 # A route this engine cannot answer says so with a code, never an empty 200: a client

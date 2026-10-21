@@ -75,28 +75,33 @@ socket answers, the command answers, and the tests assert it.
 
 ## 3. Connecting an SDK to a local brain
 
-The published SDKs default to `https://api.kiomon.com`. Pointing one at `127.0.0.1` is two
-lines — `baseUrl`, and the token that `serve` printed:
+The published SDKs default to `https://api.kiomon.com`. Pointing one at `127.0.0.1` is one
+line — `baseUrl` — plus the credential their constructor insists on:
 
 ```bash
-kiomon serve --port 0 --json      # prints {"url": "...", "token_file": "..."} on one line
+kiomon serve --port 0 --json      # prints {"url": "...", "auth": "none"} on one line
 ```
 
 ```python
 from kiomon import Kiomon
-from pathlib import Path
 
 client = Kiomon(
-    api_key=Path(token_file).read_text().strip(),   # the local token, sent as X-API-Key
+    api_key="local",                  # required by the SDK, ignored by the local server
     base_url="http://127.0.0.1:53412",
     workspace_id="default",
 )
 ```
 
-The Python and TypeScript examples do exactly this, including starting `serve` themselves on
-an ephemeral port with a throwaway brain, so `python examples/python/quickstart.py` works from
-a clean checkout with nothing running. Set `KIOMON_URL` and `KIOMON_TOKEN` to use a server you
-already have instead.
+**There is no API key to manage.** A local brain has no accounts, no organisations and no roles
+— a workspace is the only thing that separates one body of memory from another, and it is a read
+boundary rather than a permission. The SDKs demand *a* credential because they are written for
+the hosted product; `"local"` is the placeholder, and the server does not look at it. If you do
+want a check — a shared machine, or a forwarded port — `kiomon serve --require-token` creates a
+token beside the database and requires it in `X-API-Key`.
+
+The Python and TypeScript examples do exactly this, including starting `serve` themselves on an
+ephemeral port with a throwaway brain, so `python examples/python/quickstart.py` works from a
+clean checkout with nothing running. Set `KIOMON_URL` to use a server you already have instead.
 
 ## 4. What to remember, and what to expect back
 

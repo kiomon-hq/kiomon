@@ -18,14 +18,23 @@
 //! header anywhere, so even a same-origin browser fetch gets an opaque response it cannot
 //! read.
 //!
-//! # The token
+//! # Auth
 //!
-//! Every request must carry the token from the file beside the database, in `X-API-Key` or
-//! `Authorization: Bearer`. The published SDKs send `X-API-Key` and refuse to construct
-//! without one, so the header is the SDK's own; the *value* is the local token rather than a
-//! hosted API key, because there is no account here to validate one against and inventing an
-//! account model to have something to check is the tenancy §9-D6 refused. The token is
-//! created on first run and printed once, so "run this one command" still works.
+//! **There is none by default.** A local brain has no accounts, no organisations and no roles —
+//! a workspace is the only thing that separates one body of memory from another, and that is a
+//! read boundary rather than a permission. Asking a user to manage a key for a file they own was
+//! the one piece of hosted ceremony that bought them nothing, so the default is: the port is on
+//! `127.0.0.1`, the `Host` and `Origin` checks below keep browsers out, and that is it.
+//!
+//! The SDKs still demand *a* credential because they are written for the hosted product, so
+//! callers pass the placeholder `local` as the API key. The server ignores its value: there is
+//! nothing here to compare it against, and checking a constant would be a key by another name.
+//!
+//! `--require-token` restores the old behaviour for the two cases that want it — a shared
+//! machine, or a port forwarded somewhere it should not be. It creates `serve.token` beside the
+//! database (mode 0600 on Unix), prints it once, and then every request must carry it in
+//! `X-API-Key` or `Authorization: Bearer`. Off by default because a check every local process
+//! already passes is a chore, not a boundary.
 
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -80,10 +89,20 @@ const TOKEN_FILE: &str = "serve.token";
 pub struct ServeOptions {
     /// The port. Zero asks the operating system to choose, and the chosen one is printed.
     pub port: u16,
-    /// A token file somewhere other than beside the database.
-    pub token_file: Option<PathBuf>,
+    /// Demand a token on every request. Off by default; see this module's note on auth.
+    pub require_token: bool,
     /// Answer one request and exit.
     pub once: bool,
+}
+
+/// The credential a request must carry, when one is demanded.
+struct Auth {
+    /// The token, read from or written to `path`.
+    token: String,
+    /// Where it lives, so the greeting and the handshake can name it.
+    path: PathBuf,
+    /// Whether this run created it, which decides whether the value is printed.
+    created: bool,
 }
 
 /// Run the server until something kills it.
@@ -95,11 +114,19 @@ pub struct ServeOptions {
 /// bound.
 pub fn run(service: &Service, options: &ServeOptions, json: bool, quiet: bool) -> Result<ExitCode> {
     let db_path = config::resolve_db_path(service.db_path())?;
-    let token_path = match &options.token_file {
-        Some(path) => path.clone(),
-        None => db_path.with_file_name(TOKEN_FILE),
+    let auth = if options.require_token {
+        let path = db_path.with_file_name(TOKEN_FILE);
+        let (token, created) = load_or_create_token(&path)?;
+        Some(Auth {
+            token,
+            path,
+            created,
+        })
+    } else {
+        None
     };
-    let (token, created) = load_or_create_token(&token_path)?;
+
+    let token = auth.as_ref().map(|auth| auth.token.as_str());
 
     let listener = TcpListener::bind((LOOPBACK, options.port)).map_err(|err| {
         kiomon_core::Error::Io(std::io::Error::new(
@@ -113,27 +140,34 @@ pub fn run(service: &Service, options: &ServeOptions, json: bool, quiet: bool) -
     // The handshake goes to stdout because it is the answer to the command: with `--port 0`
     // nothing else knows which port was chosen, and a supervisor needs the line it can parse.
     // It is printed once, before the first request, and never repeated.
+    // `auth` is in the handshake either way: a client that parses this line needs to know
+    // whether to send a credential, and a field that appears only sometimes is a field a client
+    // forgets to check.
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "listening": true,
-                "url": url,
-                "port": address.port(),
-                "db": db_path.display().to_string(),
-                "token_file": token_path.display().to_string(),
-                "token_created": created,
-            })
-        );
+        let mut handshake = serde_json::json!({
+            "listening": true,
+            "url": url,
+            "port": address.port(),
+            "db": db_path.display().to_string(),
+            "auth": if auth.is_some() { "token" } else { "none" },
+        });
+        if let Some(auth) = &auth {
+            handshake["token_file"] = serde_json::json!(auth.path.display().to_string());
+            handshake["token_created"] = serde_json::json!(auth.created);
+        }
+        println!("{handshake}");
     } else {
         println!("kiomon is listening on {url}");
         println!("  brain   {}", db_path.display());
-        println!("  token   {}", token_path.display());
-        if created {
+        match &auth {
+            None => println!("  auth    none - loopback only (`--require-token` to demand one)"),
+            Some(auth) => println!("  token   {}", auth.path.display()),
+        }
+        if let Some(auth) = auth.as_ref().filter(|auth| auth.created) {
             println!();
             println!("A new token was written there. Send it as `X-API-Key` on every request:");
             println!();
-            println!("  {token}");
+            println!("  {}", auth.token);
         }
     }
     let _ = std::io::stdout().flush();
@@ -143,11 +177,11 @@ pub fn run(service: &Service, options: &ServeOptions, json: bool, quiet: bool) -
         // and collect an exit code without managing a process — which is how the release
         // workflow proves the shipped binary can bind, answer and exit.
         let (stream, _) = listener.accept()?;
-        handle(stream, service, &token, quiet);
+        handle(stream, service, token, quiet);
         return Ok(ExitCode::Success);
     }
 
-    serve_forever(&listener, service, &token, quiet)
+    serve_forever(&listener, service, token, quiet)
 }
 
 /// Accept connections forever, handing each to one of [`WORKERS`] threads.
@@ -158,7 +192,7 @@ pub fn run(service: &Service, options: &ServeOptions, json: bool, quiet: bool) -
 fn serve_forever(
     listener: &TcpListener,
     service: &Service,
-    token: &str,
+    token: Option<&str>,
     quiet: bool,
 ) -> Result<ExitCode> {
     // The receiver is behind a mutex because `mpsc::Receiver` is not `Sync`: a worker holds
@@ -170,7 +204,7 @@ fn serve_forever(
 
     for index in 0..WORKERS {
         let receiver = Arc::clone(&receiver);
-        let token = token.to_owned();
+        let token = token.map(str::to_owned);
         let live = Arc::clone(&live);
         // The service is cloned into each worker rather than shared behind a lock: it holds
         // two paths, and every request opens its own connection inside `Service`.
@@ -188,7 +222,7 @@ fn serve_forever(
                         return;
                     };
                     live.fetch_add(1, Ordering::Relaxed);
-                    handle(stream, &service, &token, quiet);
+                    handle(stream, &service, token.as_deref(), quiet);
                     live.fetch_sub(1, Ordering::Relaxed);
                 }
             })?;
@@ -221,7 +255,7 @@ fn serve_forever(
 /// Errors are handled inside and never returned: a connection that fails to parse gets a
 /// response if it can still be written to, and a closed socket gets nothing. There is
 /// nothing above this to report to — the process serves the next connection either way.
-fn handle(stream: TcpStream, service: &Service, token: &str, quiet: bool) {
+fn handle(stream: TcpStream, service: &Service, token: Option<&str>, quiet: bool) {
     let started = Instant::now();
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
@@ -256,9 +290,12 @@ fn handle(stream: TcpStream, service: &Service, token: &str, quiet: bool) {
 }
 
 /// Auth, then routing, then the handler.
-fn route(service: &Service, request: &Request, token: &str) -> Response {
-    // The three refusals come before routing so that an unauthenticated client cannot learn
-    // which routes exist by comparing `401` with `404`.
+fn route(service: &Service, request: &Request, token: Option<&str>) -> Response {
+    // The refusals come before routing so that a refused client cannot learn which routes exist
+    // by comparing `401` with `404`. `Host` and `Origin` are checked even when no token is
+    // demanded: they are what keeps a web page and a DNS-rebinding attempt out, and neither of
+    // those is a local process the user trusts. The token, when one is demanded, is checked
+    // last because it is the cheapest.
     if !request.host_is_loopback() {
         return Fault::new(
             403,
@@ -278,14 +315,17 @@ fn route(service: &Service, request: &Request, token: &str) -> Response {
         )
         .into();
     }
-    if !request.has_token(token) {
-        return Fault::new(
-            401,
-            "unauthorized",
-            "send the token from the serve token file as `X-API-Key` (or `Authorization: \
-             Bearer <token>`). `kiomon serve` prints its path at startup.",
-        )
-        .into();
+    if let Some(token) = token {
+        if !request.has_token(token) {
+            return Fault::new(
+                401,
+                "unauthorized",
+                "this server was started with `--require-token`. Send the token from the file \
+                 beside the database as `X-API-Key` (or `Authorization: Bearer <token>`); \
+                 `kiomon serve` printed its path at startup.",
+            )
+            .into();
+        }
     }
 
     // The pattern and the method are both part of a match. Filtering on the pattern and then

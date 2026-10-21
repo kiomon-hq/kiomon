@@ -13,9 +13,9 @@ Every release that changes what a caller can rely on gets an entry here. The for
 
 - **`kiomon serve`.** Loopback HTTP/1.1 answering the hosted product's `/api/*` routes, so
   the published Python and TypeScript SDKs work against a local brain by pointing their
-  `baseUrl` at it. `--port 0` prints the port it chose on one line of stdout, before the
-  first request. A token file beside the database (`X-API-Key` or `Authorization: Bearer`)
-  plus a loopback-only `Host` and `Origin` keep the port to this machine and its agents.
+  `baseUrl` at it — no key to issue, because there is no account to issue one for. `--port 0`
+  prints the port it chose on one line of stdout, before the first request. A loopback-only
+  `Host` and `Origin` keep the port to this machine and its agents.
   Routes this engine cannot answer — `revert`, briefings, a graph walk deeper than one hop —
   answer `501` with `code: "unsupported_locally"` rather than an empty success, and every
   route in the plan's Appendix C is asserted route by route.
@@ -52,6 +52,16 @@ Every release that changes what a caller can rely on gets an entry here. The for
 
 ### Changed
 
+- **`kiomon serve` needs no API key.** A local brain has no accounts, no organisations and no
+  roles: a workspace is the only thing that separates one body of memory from another, and it is
+  a read boundary rather than a permission. The server asks for no credential by default, so the
+  `api_key` the published SDKs require is the placeholder `local`, which the server accepts and
+  ignores. The handshake says `"auth":"none"`.
+- **`serve --require-token` replaces `--token-file`.** Opt-in, for a shared machine or a
+  forwarded port: a token beside the database (mode `0600`), printed once, required in
+  `X-API-Key` or `Authorization: Bearer`. `401` appears only in this mode. The `Host` and
+  `Origin` refusals stay on in both modes — they are the checks a browser cannot forge, and they
+  are what keeps a page from reading the brain.
 - A memory's `workspace_id` cannot be changed by `PATCH /api/documents/{id}`: a workspace is
   a read boundary and no verb crosses one, so the patch is refused (`501`) rather than
   half-applied. The hosted route accepts the field; this one says why it does not.

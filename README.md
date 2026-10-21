@@ -229,7 +229,7 @@ kiomon export --output brain.jsonl        # the brain as a file you own
 kiomon import --db other.db brain.jsonl   # and back, ids and statuses intact (no edges)
 
 # Both doors, for agents that expect one of the hosted surfaces:
-kiomon serve --port 0                     # /api/search, /api/retrieve, … on loopback
+kiomon serve --port 0                     # /api/search, /api/retrieve, … on loopback, no key
 kiomon mcp                                # the same verbs as MCP tools, over stdio
 
 kiomon doctor                             # integrity, schema version, index agreement

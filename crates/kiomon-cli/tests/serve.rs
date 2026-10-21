@@ -3,9 +3,10 @@
 //! End-to-end assertions on `kiomon serve`: the HTTP surface, through the binary.
 //!
 //! What is tested here is what only a process and a socket can show: the handshake line a
-//! supervisor parses, the three refusals that keep the port private, the status and code of
-//! every route in Appendix C, and the one promise the whole work package rests on — that the
-//! HTTP answer and the CLI answer come from the same read of the same file.
+//! supervisor parses, the two refusals that keep browsers out (and the third that `--require-token`
+//! adds on request), the status and code of every route in Appendix C, and the one promise the
+//! whole work package rests on — that the HTTP answer and the CLI answer come from the same read
+//! of the same file.
 //!
 //! The client is hand-written over `std::net::TcpStream` rather than pulled in as a dependency:
 //! a server whose tests need an HTTP client crate to check one response is a server that has
@@ -91,21 +92,36 @@ fn json(args: &[&str]) -> serde_json::Value {
 struct Server {
     child: Child,
     url: String,
-    token: String,
+    /// Present only when the server was started with `--require-token`.
+    token: Option<String>,
 }
 
 impl Server {
+    /// The default server: loopback only, no credential.
     fn start(sandbox: &Sandbox) -> Self {
-        let mut child = kiomon()
-            .args([
-                "--db",
-                &sandbox.db_arg(),
-                "serve",
-                "--port",
-                "0",
-                "--json",
-                "-q",
-            ])
+        Self::spawn(sandbox, false)
+    }
+
+    /// The opt-in server: `--require-token`, for a shared machine.
+    fn start_requiring_token(sandbox: &Sandbox) -> Self {
+        Self::spawn(sandbox, true)
+    }
+
+    fn spawn(sandbox: &Sandbox, require_token: bool) -> Self {
+        let mut command = kiomon();
+        command.args([
+            "--db",
+            &sandbox.db_arg(),
+            "serve",
+            "--port",
+            "0",
+            "--json",
+            "-q",
+        ]);
+        if require_token {
+            command.arg("--require-token");
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -118,7 +134,11 @@ impl Server {
             .unwrap_or_else(|err| panic!("the handshake was not JSON ({err}): {handshake:?}"));
         assert_eq!(value["listening"], serde_json::json!(true), "{value}");
         let url = value["url"].as_str().expect("a url").to_owned();
-        let token = sandbox.token();
+        // The handshake says whether a credential is expected; the test reads it rather than
+        // assuming, which is the same discipline a client should follow.
+        let expected = value["auth"].as_str().expect("an auth mode");
+        assert_eq!(expected == "token", require_token, "{value}");
+        let token = require_token.then(|| sandbox.token());
         Self { child, url, token }
     }
 
@@ -126,9 +146,12 @@ impl Server {
         self.url.trim_start_matches("http://").to_owned()
     }
 
-    /// One request, with the token, returning the status and the body.
+    /// One request with whatever credential this server expects, returning status and body.
     fn call(&self, method: &str, path: &str, body: Option<&str>) -> Reply {
-        self.request(method, path, body, &[("X-API-Key", self.token.as_str())])
+        match &self.token {
+            Some(token) => self.request(method, path, body, &[("X-API-Key", token.as_str())]),
+            None => self.request(method, path, body, &[]),
+        }
     }
 
     fn request(
@@ -253,10 +276,11 @@ fn path_of(url: &str) -> &str {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_handshake_is_one_line_on_stdout_and_names_the_port_and_the_token_file() {
+fn the_handshake_is_one_line_on_stdout_and_says_no_credential_is_expected() {
     // A supervisor learns the port from this line, and nothing else in the process writes to
     // stdout before it. Both facts are asserted because a stray `println!` on a startup path is
-    // how a parseable handshake stops being parseable.
+    // how a parseable handshake stops being parseable. `auth` is always present, so a client can
+    // branch on it rather than on whether `token_file` happens to exist.
     let sandbox = Sandbox::new("handshake");
     let mut child = kiomon()
         .args([
@@ -288,8 +312,54 @@ fn the_handshake_is_one_line_on_stdout_and_names_the_port_and_the_token_file() {
             .expect("a url")
             .starts_with("http://127.0.0.1:")
     );
+    assert_eq!(value["auth"], serde_json::json!("none"));
+    assert!(
+        value.get("token_file").is_none(),
+        "a server with no auth must not advertise a token file: {value}"
+    );
+    assert!(
+        !sandbox.db().with_file_name("serve.token").exists(),
+        "the default run must not create a token file at all"
+    );
+}
+
+#[test]
+fn the_handshake_names_the_token_file_when_a_token_is_demanded() {
+    // The opt-in mode, and the only mode where a token file exists. The value is printed for a
+    // human on the non-JSON path; the handshake carries the path, never the secret, because a
+    // handshake is the line that ends up in a supervisor's log.
+    let sandbox = Sandbox::new("handshake-token");
+    let mut child = kiomon()
+        .args([
+            "--db",
+            &sandbox.db_arg(),
+            "serve",
+            "--port",
+            "0",
+            "--json",
+            "-q",
+            "--require-token",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the server must start");
+    let mut line = String::new();
+    BufReader::new(child.stdout.as_mut().expect("stdout"))
+        .read_line(&mut line)
+        .expect("a handshake");
+    child.kill().ok();
+    child.wait().ok();
+
+    let value: serde_json::Value = serde_json::from_str(line.trim()).expect("one JSON line");
+    assert_eq!(value["auth"], serde_json::json!("token"));
     assert!(value["token_created"].as_bool().expect("a flag"));
-    assert!(Path::new(value["token_file"].as_str().expect("a path")).exists());
+    let path = value["token_file"].as_str().expect("a path");
+    assert!(Path::new(path).exists());
+    assert!(
+        !line.contains(&sandbox.token()),
+        "the handshake leaked the token"
+    );
 }
 
 #[test]
@@ -297,11 +367,11 @@ fn a_second_start_reuses_the_token_instead_of_writing_a_new_one() {
     // A token that changed on every restart would be a token every client has to be
     // reconfigured with, which is the opposite of what a credential is for.
     let sandbox = Sandbox::new("token-reuse");
-    let first = Server::start(&sandbox);
+    let first = Server::start_requiring_token(&sandbox);
     let token = first.token.clone();
     drop(first);
 
-    let second = Server::start(&sandbox);
+    let second = Server::start_requiring_token(&sandbox);
     assert_eq!(second.token, token, "the token must survive a restart");
 }
 
@@ -377,14 +447,9 @@ fn once_answers_one_request_and_exits_zero() {
         .expect("a url")
         .trim_start_matches("http://")
         .to_owned();
-    let token = sandbox.token();
-
     let mut stream = TcpStream::connect(&authority).expect("the port must accept");
     stream
-        .write_all(
-            format!("GET /health HTTP/1.1\r\nHost: {authority}\r\nX-API-Key: {token}\r\n\r\n")
-                .as_bytes(),
-        )
+        .write_all(format!("GET /health HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
         .expect("writable");
     let mut raw = String::new();
     stream.read_to_string(&mut raw).expect("readable");
@@ -403,7 +468,7 @@ fn a_request_without_the_token_is_refused_before_it_can_learn_which_routes_exist
     // A known path and an unknown one answer identically, which is what stops an unauthorised
     // client from mapping the surface by comparing `401` with `404`.
     let sandbox = Sandbox::new("no-token");
-    let server = Server::start(&sandbox);
+    let server = Server::start_requiring_token(&sandbox);
 
     let known = server.request("GET", "/api/workspaces", None, &[]);
     let unknown = server.request("GET", "/api/nothing", None, &[]);
@@ -419,17 +484,13 @@ fn a_request_without_the_token_is_refused_before_it_can_learn_which_routes_exist
 #[test]
 fn the_token_is_accepted_in_either_header() {
     let sandbox = Sandbox::new("two-headers");
-    let server = Server::start(&sandbox);
-    let bearer = format!("Bearer {}", server.token);
+    let server = Server::start_requiring_token(&sandbox);
+    let token = server.token.clone().expect("token mode has a token");
+    let bearer = format!("Bearer {token}");
 
     assert_eq!(
         server
-            .request(
-                "GET",
-                "/health",
-                None,
-                &[("X-API-Key", server.token.as_str())]
-            )
+            .request("GET", "/health", None, &[("X-API-Key", token.as_str())])
             .status,
         200
     );
@@ -456,10 +517,7 @@ fn a_foreign_origin_is_refused_and_a_loopback_one_is_not() {
         "GET",
         "/api/workspaces",
         None,
-        &[
-            ("X-API-Key", server.token.as_str()),
-            ("Origin", "https://evil.example"),
-        ],
+        &[("Origin", "https://evil.example")],
     );
     assert_eq!(foreign.status, 403, "{}", foreign.raw);
     assert_eq!(foreign.code(), "forbidden");
@@ -468,10 +526,7 @@ fn a_foreign_origin_is_refused_and_a_loopback_one_is_not() {
         "GET",
         "/api/workspaces",
         None,
-        &[
-            ("X-API-Key", server.token.as_str()),
-            ("Origin", "http://localhost:5173"),
-        ],
+        &[("Origin", "http://localhost:5173")],
     );
     assert_eq!(local.status, 200, "{}", local.raw);
 
@@ -490,10 +545,7 @@ fn a_host_header_that_is_not_a_loopback_name_is_refused() {
         "GET",
         "/api/workspaces",
         None,
-        &[
-            ("X-API-Key", server.token.as_str()),
-            ("Host", "brain.evil.example"),
-        ],
+        &[("Host", "brain.evil.example")],
     );
     assert_eq!(reply.status, 403, "{}", reply.raw);
     assert!(
@@ -728,10 +780,9 @@ fn a_chunked_body_is_refused_by_name_rather_than_mis_parsed() {
     let server = Server::start(&sandbox);
 
     let head = format!(
-        "POST /api/retrieve HTTP/1.1\r\nHost: {}\r\nX-API-Key: {}\r\nTransfer-Encoding: \
+        "POST /api/retrieve HTTP/1.1\r\nHost: {}\r\nTransfer-Encoding: \
          chunked\r\nContent-Type: application/json\r\n\r\n",
-        server.authority(),
-        server.token
+        server.authority()
     );
     let mut stream = TcpStream::connect(server.authority()).expect("connect");
     stream.write_all(head.as_bytes()).expect("writable");
@@ -745,11 +796,7 @@ fn a_chunked_body_is_refused_by_name_rather_than_mis_parsed() {
 fn an_absurd_header_block_is_refused_instead_of_allocating() {
     let sandbox = Sandbox::new("header-cap");
     let server = Server::start(&sandbox);
-    let mut head = format!(
-        "GET /health HTTP/1.1\r\nHost: {}\r\nX-API-Key: {}\r\n",
-        server.authority(),
-        server.token
-    );
+    let mut head = format!("GET /health HTTP/1.1\r\nHost: {}\r\n", server.authority());
     for index in 0..2000 {
         write!(head, "X-Filler-{index}: {}\r\n", "x".repeat(64))
             .expect("a String write cannot fail");

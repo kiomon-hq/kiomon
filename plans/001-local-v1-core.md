@@ -1578,13 +1578,13 @@ below as follow-ups rather than pretended away.
 ### WP9 — `serve` + `mcp`: two transports, one verb layer (2½ days) — **shipped**
 Loopback HTTP/1.1 — `std::net` and threads, no async runtime — answering the hosted
 `/api/*` routes in Appendix C from the same functions the CLI calls, plus stdio MCP over
-the same layer, plus a token file in the data directory and `--port 0` printing the port
+the same layer, plus `--port 0` printing the port
 it chose. Broad enough that the two published SDKs work unchanged; honest enough that the
 routes this engine cannot answer say so.
 **Accept:** `../../SDK/kiomon-py`'s and `../../SDK/kiomon-ts`'s own test suites pass against
 `127.0.0.1:<port>` in CI; every route in Appendix C either answers or returns
 `unsupported_locally`, asserted route by route, so a route cannot be forgotten into a
-404 that reads like an empty success; a request without the token and a request with a
+404 that reads like an empty success; a request with a foreign `Origin` and a request with a
 foreign `Origin` are both refused; an MCP session lists the same operations the CLI has;
 `serve` adds no dependency with an async runtime and the binary stays inside §7's budget.
 
@@ -1621,7 +1621,7 @@ shape last.
 | **WP6** | ✅ **DONE** 2026-10-18 | `import.rs` (the JSONL record, the line validator, the markdown view and its reader, the filename rule), `store::export_page` (keyset paging over the row's own columns) and `store::import_batch` (one transaction per page, `exists`/`duplicate`/`written` in that order, workspaces created from the file), `portability.rs` (the streaming writer, the directory walk, the per-line reporter, the 2 MiB line cap with its drain), `MAX_TITLE`/`MAX_EXCERPT`/`MAX_BODY_BYTES` enforced on every door, and the `--config`-aware text limits in `docs/CONTRACT.md`. **426 tests** (268 core + 70 CLI + 25 CLI-portability + 18 CLI-embed + 21 core-vector + others), clippy clean, no new dependencies. | |
 | **WP7** | ✅ **DONE** 2026-10-17 | `embed.rs` (the `Embedder` trait, the `ollama` and `openai` shapes over `ureq`, the deterministic `stub`, the memory-text rule, the 20 000-character cap, the prefixes), `vector.rs` (brute-force cosine, blob encoding, the zero floor), the config file (`config.toml` with `default_workspace` and `[embedder]`, the first real TOML dependency), the write path (`add`, `update`, `reindex --embed`), `--legs auto|fts|vector|graph` with the hosted spellings as aliases, `degraded`/`reason` reporting, `doctor`'s embedder and coverage report, a `similarity` per vector-leg row, a bench row and gate for the hybrid budget, and the `--config` global flag. **376 tests** (243 core + 70 CLI + 18 CLI-embed + 21 core-vector + 9 store + others), clippy clean, **3 971 KiB** binary, **49** transitive crates of 60. | |
 | **WP8** | ✅ **DONE** 2026-10-18 | `crates/kiomon-cli/build.rs` (the commit stamp: watched refs, `unknown` without a repository, `-dirty` for a modified tree), `crate::VERSION` in `--version`, `-V`, `meta.version` and the bench header; `install.sh` (POSIX, target detection, checksum verified by default, `--dry-run`, `--target`, `KIOMON_RELEASES_URL`) and `install.ps1` (Windows PowerShell 5.1, zip, user-PATH edit); `scripts/package.sh` (the archive layout both installers expect, five targets); `.github/workflows/release.yml` (verify on the tagged commit, five native builds, the tag's own sha asserted from the binary, one job's checksums, `--verify-tag` release, core-then-cli crates.io publish with an index wait); `CHANGELOG.md`; `docs/DESIGN.md` (the long-form argument this project has been writing into work-package records); README install section and CONTRIBUTING release checklist. **428 tests** (268 core + 72 CLI + 25 CLI-portability + 18 CLI-embed + 21 core-vector + others), clippy clean, no new dependencies. | |
-| **WP9** | ✅ **DONE** 2026-10-21 (v1.1) | `service.rs` (the verb layer: 18 routes and 16 MCP tools over one set of typed requests), `http.rs` (hand-written HTTP/1.1 on `std::net` and a fixed worker pool: bounded headers and bodies, per-socket timeouts, `HEAD`, `Expect: 100-continue`, chunked refused by name), `mcp.rs` (newline-delimited JSON-RPC, the hosted twelve tool names plus three local ones, `isError` results rather than protocol errors), `serve`/`mcp` commands, the token file with the three loopback-only refusals (`Host`, `Origin`, token), `501 unsupported_locally` for `revert`/briefings/`depth > 1`, no new crates (`getrandom` is already shared with `kiomon-core`), the release workflow's two-transport smoke test, and 35 new integration tests. **533 tests**, clippy clean, **4.4 MiB** binary, **49** crates. | |
+| **WP9** | ✅ **DONE** 2026-10-21 (v1.1) | `service.rs` (the verb layer: 19 routes and 16 MCP tools over one set of typed requests), `http.rs` (hand-written HTTP/1.1 on `std::net` and a fixed worker pool: bounded headers and bodies, per-socket timeouts, `HEAD`, `Expect: 100-continue`, chunked refused by name), `mcp.rs` (newline-delimited JSON-RPC, the hosted twelve tool names plus three local ones, `isError` results rather than protocol errors), `serve`/`mcp` commands, the loopback-only refusals (`Host`, `Origin`, and a token only under `--require-token`), `501 unsupported_locally` for `revert`/briefings/`depth > 1`, no new crates (`getrandom` is already shared with `kiomon-core`), the release workflow's two-transport smoke test, and 35 new integration tests. **533 tests**, clippy clean, **4.4 MiB** binary, **49** crates. | |
 
 ### WP9's numbers, and the seven things it found
 
@@ -1665,7 +1665,7 @@ packet alone), and the packet's own test of that difference is WP5.5's ~8 ms.
 |---|---|---|
 | 1 | The two SDKs work against `127.0.0.1` | **Met, after finding that the criterion as written could never be met.** The SDK directories are at `MEMORY-INFRASTRUCTURE/SDK`, one level above this project, and both suites drive a **`FakeTransport`** — `kiomon-py/tests/conftest.py` hands every client a double, `kiomon-ts` does the same with a `fetch` stub — so "their suites pass against `127.0.0.1`" is not a thing those suites do: they never open a socket. What replaced it: `scripts/sdk_conformance.py` and `scripts/sdk_conformance_ts.mjs` drive the **real clients with their real transports** against a live `serve` on an ephemeral port. The first run found **15 divergences** (below), all fixed; the second run is clean on both clients, and both scripts were re-run against the pre-fix binary to prove they bite. |
 | 2 | Every Appendix C route answers or says `unsupported_locally`, asserted route by route | `tests/serve.rs::every_appendix_c_route_answers_or_says_unsupported_locally` (18 routes: 12 answered, 3 refused by name, 3 verbs on one path) plus `http.rs`'s `every_route_in_appendix_c_resolves_to_an_answer`, which asserts the table itself so a route dropped from it fails at the source |
-| 3 | A request without the token, and one with a foreign `Origin`, are refused | `a_request_without_the_token_is_refused_before_it_can_learn_which_routes_exist` (known and unknown paths both `401`), `a_foreign_origin_is_refused_and_a_loopback_one_is_not`, `a_host_header_that_is_not_a_loopback_name_is_refused` — the last one is the DNS-rebinding case, which the plan's wording did not name and the threat model requires |
+| 3 | A request with a foreign `Origin`, and one with a non-loopback `Host`, are refused | `a_foreign_origin_is_refused_and_a_loopback_one_is_not`, `a_host_header_that_is_not_a_loopback_name_is_refused` — the last one is the DNS-rebinding case, which the plan's wording did not name and the threat model requires. A missing token is `401` **only** under `--require-token` (`a_request_without_the_token_is_refused_before_it_can_learn_which_routes_exist`); see the amendment below, which removed the token as a default |
 | 4 | An MCP session lists the same operations the CLI has | `tests/mcp.rs::the_tool_list_holds_the_hosted_names_and_describes_every_tool` (16 tools, every one with a description and an object schema), `a_search_over_mcp_returns_the_ids_the_cli_returns`, `a_draft_over_mcp_is_a_memory_the_cli_can_read` |
 | 5 | No async runtime, binary inside §7's budget | **49** transitive crates (unchanged: `getrandom` was already in the tree for ULIDs), **4.4 MiB** against the 6 MiB budget, and `std::net` + a fixed worker pool with no `tokio`, no `axum`, no `hyper` |
 
@@ -1727,6 +1727,42 @@ run before it had already forced the fields into existence. The one class of bug
 reading and died on execution was typing: `pinned: false` is an `int` in Python
 (`isinstance(True, int)`), so the Python checker had to be taught to refuse a `bool` explicitly,
 and it took the TypeScript client's strict comparison to make `got true` legible.
+
+### Derived: the local engine has no API keys, and no organisation
+
+**DECIDED with the owner on 2026-10-21, after the examples: a local brain has no credentials.**
+The first WP9 build made every request carry a token from `serve.token`, and the argument for it
+was `-- port is on 127.0.0.1, but every local process can reach it`. Writing the examples showed
+what that argument actually bought: the SDKs' constructors *require* an API key, so a user passes
+one either way; the only difference is whether the server compares it to a value the user must
+find in a file and re-find after every restart. That is a key by another name.
+
+The rule that replaced it, and the one to keep:
+
+- **A local brain has no accounts, no organisations and no roles.** The hosted product needs them
+  because one tenant's writes must not be read by another's; a file on one machine has one owner.
+  Nothing in this engine models an organisation, and nothing should: adding one would be inventing
+  tenancy to have something to authorise, which §9-D6 already refused.
+- **A workspace is the only axis that separates one body of memory from another**, and it is a
+  read boundary, not a permission. `--workspace '*'` is the explicit widening. It is not a
+  credential and must never be treated as one.
+- **The socket is private by `Host` and `Origin`**, which are the checks a browser cannot forge
+  and which a local process does not need to pass. Those stay on, always, before routing.
+- **The SDKs' `api_key` is a placeholder**: `"local"`, documented as such, accepted and ignored.
+  Both examples, both conformance harnesses and the docs use that one string.
+- **`--require-token` is the opt-in** for a shared machine or a forwarded port. It creates
+  `serve.token` beside the database (`0600`), prints it once, and requires it in `X-API-Key` or
+  `Authorization: Bearer`. `401` exists only in this mode.
+
+The residual exposure, stated rather than buried: without a token, a no-`Origin` GET from a page
+(an `<img>` load) reaches the router. It cannot read the reply — there is no CORS header — but
+`GET /api/search` records retrievals, so it could skew what decay keeps. `--require-token` closes
+that. The default accepts it, because the alternative was making every user manage a key for a
+file they own.
+
+What the handshake says now: `{"listening":true,"url":…,"port":…,"db":…,"auth":"none"}`, with
+`"auth":"token"` plus `token_file` and `token_created` under `--require-token`. `auth` is present
+either way, because a field that appears only sometimes is a field a client forgets to check.
 
 ### Where WP9 contradicted the plan
 

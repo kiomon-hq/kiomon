@@ -152,9 +152,12 @@ jobs:
             sleep 0.1
           done
           url=$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' "$tmp/handshake.json")
-          token=$(tr -d '[:space:]' < "$tmp/serve.token")
+          grep -q '"auth":"none"' "$tmp/handshake.json" \
+            || { echo "::error::the shipped binary demands a credential by default"; kill "$server" 2>/dev/null; exit 1; }
           [ -n "$url" ] || { echo "::error::serve printed no url"; kill "$server" 2>/dev/null; exit 1; }
-          code=$(curl -s -o /dev/null -w '%{http_code}' "$url/health" -H "X-API-Key: $token")
+          # No header: the default server has no credential to send, and a release that
+          # suddenly needed one before answering /health would be a broken install.
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$url/health")
           [ "$code" = "200" ] || { echo "::error::/health answered $code"; kill "$server" 2>/dev/null; exit 1; }
           wait "$server"
 

@@ -17,11 +17,14 @@ run from a clean checkout.
 from kiomon import Kiomon
 
 client = Kiomon(
-    api_key=token,                   # the token from the file `serve` printed
+    api_key="local",                 # required by the SDK, ignored by the local server
     base_url="http://127.0.0.1:53412",
     workspace_id="default",
 )
 ```
+
+There is no key to fetch and nothing to keep in sync: a local brain has no accounts, so the
+server accepts any value and checks none. `--require-token` opts back into a real check.
 
 Everything else is the published SDK: `retrieve_memory`, `search_memory`, `draft_memory`,
 `manage_memory`, `record_outcome`, `explore_memory_graph`. The local server answers the hosted
@@ -39,11 +42,10 @@ Everything else is the published SDK: `retrieve_memory`, `search_memory`, `draft
 
 ```bash
 # terminal 1
-kiomon serve --port 0 --json      # prints {"url": ..., "token_file": ...}
+kiomon serve --port 0 --json      # prints {"url": ..., "auth": "none"}
 
 # terminal 2
 export KIOMON_URL=http://127.0.0.1:53412
-export KIOMON_TOKEN=$(cat /path/to/serve.token)
 python examples/python/quickstart.py
 ```
 

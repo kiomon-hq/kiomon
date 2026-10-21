@@ -627,20 +627,32 @@ asks the operating system for a port and prints the one it got, on one line of s
 ```
 $ kiomon serve --port 0 --json
 {"listening":true,"url":"http://127.0.0.1:53412","port":53412,
- "db":"…/brain.db","token_file":"…/serve.token","token_created":true}
+ "db":"…/brain.db","auth":"none"}
 ```
 
-**Auth.** Every request carries the token from the file beside the database, in `X-API-Key`
-(SDKs send this) or `Authorization: Bearer <token>`. There is nothing to validate a hosted
-API key against locally, so the key's *value* is the local token and its presence is not
-enough. The file is created on first run, printed once, and never rotated behind your back;
-`--token-file` moves it, and two brains are two tokens.
+**Auth: there is none by default.** A local brain has no accounts, no organisations and no
+roles. A workspace is the only thing that separates one body of memory from another, and it is
+a read boundary rather than a permission. Asking a user to manage a key for a file they own was
+the one piece of hosted ceremony that bought them nothing, so the default is: the socket is on
+`127.0.0.1`, the two header checks below run, and that is the whole of it.
 
-**Three refusals, before routing.** A request whose `Host` is not a loopback name is `403`
-(DNS rebinding: an attacker's domain pointed at `127.0.0.1` arrives with its own `Host`). A
-request whose `Origin` is not loopback is `403` (a page must not read the brain). A request
-without the token is `401` — for every path, known or not, so an unauthorised client cannot
-map the surface by comparing `401` with `404`. There is no CORS header anywhere.
+The published SDKs *require* an API key in their constructors because they are written for the
+hosted product. Locally the value is the placeholder `local` and the server never looks at it —
+checking a constant would be a key by another name. `auth` is always in the handshake so a
+client can branch on it instead of on whether a `token_file` key happens to be there.
+
+**`--require-token`** adds the third check, for a shared machine or a forwarded port. It
+creates `serve.token` beside the database (mode `0600` on Unix), prints it once, and the
+handshake then carries `"auth":"token"` with `token_file` and `token_created`. With it, a
+request must send the token in `X-API-Key` (what the SDKs send) or `Authorization: Bearer
+<token>`; a mismatch is `401` for every path, known or not, so a refused client cannot map the
+surface by comparing `401` with `404`.
+
+**Two refusals always, and they are the ones that matter.** A request whose `Host` is not a
+loopback name is `403` — DNS rebinding: an attacker's domain pointed at `127.0.0.1` arrives with
+its own `Host`. A request whose `Origin` is not loopback is `403` — a page must not read the
+brain. Both run before routing and before any credential check, because neither of them is a
+local process the user trusts. There is no CORS header anywhere.
 
 **Routes.**
 
@@ -672,10 +684,11 @@ on the graph (a path search, not a neighbourhood). Never an empty `200` — a cl
 tell "nothing there" from "not implemented", and one of those makes it stop asking.
 
 **Errors** are `{error, code}` with a status: `400` for a bad request (`validation_failed`
-when a schema rejected it), `401`, `403`, `404`, `405` for a known path with the wrong verb,
-`409` for a verb that was valid and moved nothing, `411` for a chunked body, `413` for a
-body over 32 MiB, `431` for headers over 16 KiB, `503` when the environment cannot serve a
-valid request (no embedder), `501` as above.
+when a schema rejected it), `403` for a foreign `Host`/`Origin`, `404`, `405` for a known path
+with the wrong verb, `409` for a verb that was valid and moved nothing, `411` for a chunked
+body, `413` for a body over 32 MiB, `431` for headers over 16 KiB, `503` when the environment
+cannot serve a valid request (no embedder), `501` as above. `401` appears only under
+`--require-token`.
 
 ### The wire the SDKs declare
 

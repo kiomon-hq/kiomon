@@ -714,13 +714,16 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 7321, value_name = "PORT")]
     pub port: u16,
 
-    /// Where the token lives. Defaults to `serve.token` beside the database.
+    /// Demand the token from `serve.token` beside the database on every request.
     ///
-    /// Beside the database rather than in a global location because two brains are two
-    /// credentials: a token that unlocked every brain a user has would turn one leaked file
-    /// into two lost ones.
-    #[arg(long, value_name = "PATH")]
-    pub token_file: Option<PathBuf>,
+    /// Off by default, because the default is a loopback socket for agents on this machine and
+    /// a local brain has no accounts to check a key against. Turn it on for a shared machine, or
+    /// if the port is reachable through a tunnel. With it, the token is created beside the
+    /// database (mode 0600), printed once, and required in `X-API-Key` or `Authorization:
+    /// Bearer` — beside the database rather than in a global location because two brains are
+    /// two credentials.
+    #[arg(long)]
+    pub require_token: bool,
 
     /// Answer one request and exit, for a smoke test.
     #[arg(long)]

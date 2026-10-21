@@ -99,7 +99,10 @@ def start_server(binary: Path, home: Path, port: int = 0) -> tuple[str, str, sub
         proc.kill()
         raise SystemExit("serve printed no handshake")
     url = json.loads(line)["url"]
-    token = (home / "serve.token").read_text(encoding="utf-8").strip()
+    # The SDK demands a credential; a local server ignores its value. `local` is the
+    # documented placeholder rather than a secret, so there is nothing to read from disk and
+    # nothing to keep in sync when the server restarts.
+    token = "local"
     return url, token, proc
 
 
@@ -311,24 +314,30 @@ def run(binary: Path, sdk_src: Path) -> int:
                 else:
                     FAILED.append(f"{label} answered instead of refusing")
 
-            # ── the door: no token, and a foreign Origin ─────────────────────────
-            # `403` and not `401` for the two header checks: the request is understood and
-            # refused, where a missing token is "who are you". Both are before routing.
+            # ── the door ────────────────────────────────────────────────────────
+            # No credential is demanded by default: a local brain has no accounts to check a
+            # key against, so the placeholder the SDK sends is ignored and a bare request is
+            # answered. What is still refused is the browser, which is the check that does
+            # something: a foreign `Origin` and a non-loopback `Host` are both `403`, before
+            # routing. (`--require-token` adds `401` for a shared machine.)
             for label, headers, expected in (
-                ("no token", {}, 401),
-                ("foreign Origin", {"X-API-Key": token, "Origin": "http://evil.example"}, 403),
-                ("non-loopback Host", {"X-API-Key": token, "Host": "evil.example"}, 403),
+                ("no credential at all", {}, 200),
+                ("the SDK's placeholder", {"X-API-Key": "local"}, 200),
+                ("foreign Origin", {"Origin": "http://evil.example"}, 403),
+                ("non-loopback Host", {"Host": "evil.example"}, 403),
             ):
                 request = urllib.request.Request(url + "/api/workspaces", headers=headers)
                 try:
-                    urllib.request.urlopen(request, timeout=10)
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        check(
+                            response.status == expected,
+                            f"{label} should be {expected}, got {response.status}",
+                        )
                 except urllib.error.HTTPError as error:
                     check(
                         error.code == expected,
                         f"{label} should be {expected}, got {error.code}",
                     )
-                else:
-                    FAILED.append(f"{label} was answered")
         finally:
             proc.terminate()
             proc.wait(timeout=10)

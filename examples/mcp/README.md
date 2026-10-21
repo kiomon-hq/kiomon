@@ -45,8 +45,9 @@ Two things to change and one to know:
 ## Four things that surprise people
 
 1. **There is no token, and that is the design.** An MCP client starts the process itself, so
-   the process boundary is the permission boundary. `serve` needs a token because a socket is
-   reachable by anything on the machine; stdio is not.
+   the process boundary is the permission boundary. The HTTP door works the same way by default
+   — no key, loopback only — because a local brain has no accounts; `kiomon serve
+   --require-token` adds one for a shared machine.
 2. **stdout is protocol only.** Diagnostics go to stderr. If you ever see a non-frame line in a
    client's log, that is a server bug — and the reason `session.py` leaves stderr alone instead
    of folding it into stdout for tidiness.
