@@ -519,7 +519,7 @@ fn every_appendix_c_route_answers_or_says_unsupported_locally() {
     let (first, second) = seed(&sandbox);
     let server = Server::start(&sandbox);
 
-    let answered: [(&str, &str, Option<&str>); 12] = [
+    let answered: [(&str, &str, Option<&str>); 13] = [
         ("GET", "/api/search?q=deploy&limit=3", None),
         ("GET", "/api/search?q=deploy&legs=hybrid", None),
         ("GET", &format!("/api/documents/{first}"), None),
@@ -536,9 +536,10 @@ fn every_appendix_c_route_answers_or_says_unsupported_locally() {
         ("POST", "/api/documents/{id}/rate", Some(r#"{"rating":1}"#)),
         ("PATCH", "/api/documents/{id}", Some(r#"{"pinned":1}"#)),
         ("POST", "/api/documents/{id}/archive", None),
+        ("DELETE", "/api/documents/{id}/links/{other}", None),
     ];
     for (method, target, body) in answered {
-        let target = target.replace("{id}", &second);
+        let target = target.replace("{id}", &second).replace("{other}", &first);
         let target = target.as_str();
         let reply = server.call(method, target, body);
         assert!(
@@ -859,6 +860,270 @@ fn the_error_body_carries_a_code_a_client_can_branch_on() {
             reply.body
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The wire the published SDKs declare
+// ---------------------------------------------------------------------------
+
+/// The fields the two published SDKs declare *required* on a document.
+///
+/// Transcribed from `SDK/kiomon-py/src/kiomon/types.py` (`MemoryDocument`) and
+/// `SDK/kiomon-ts/sdk/src/types.ts`. Both files mark every one of these as non-optional, so a
+/// missing field is not a stylistic difference — it is a `KeyError` on the Python side and a
+/// `TypeError` in a `strict` TypeScript build.
+const DOCUMENT_REQUIRED: [&str; 24] = [
+    "id",
+    "source_url",
+    "title",
+    "author",
+    "excerpt",
+    "tags",
+    "user_notes",
+    "body",
+    "pinned",
+    "created_at",
+    "workspace_id",
+    "source",
+    "kind",
+    "confidence",
+    "corroboration_count",
+    "importance",
+    "strength",
+    "retrieval_count",
+    "last_retrieved_at",
+    "feedback_score",
+    "feedback_count",
+    "scope",
+    "status",
+    "expires_at",
+];
+
+/// The same for a search hit (`SearchHit` in both SDKs).
+const HIT_REQUIRED: [&str; 7] = [
+    "id",
+    "title",
+    "source_url",
+    "excerpt",
+    "snippet",
+    "tags",
+    "created_at",
+];
+
+#[test]
+fn a_document_carries_the_fields_the_sdks_declare_required() {
+    let sandbox = Sandbox::new("wire-document");
+    let (first, _) = seed(&sandbox);
+    let server = Server::start(&sandbox);
+
+    let reply = server.call("GET", &format!("/api/documents/{first}"), None);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let document = reply.json();
+    for field in DOCUMENT_REQUIRED {
+        assert!(
+            document.get(field).is_some(),
+            "the document is missing `{field}`, which both SDKs declare required: {document}"
+        );
+    }
+    // `tags` is a JSON-encoded *string* on the hosted wire — the TypeScript SDK says so in a
+    // comment on the interface, and the Python SDK types it `str | None`. Serving an array
+    // breaks `json.loads(doc["tags"])`, which is how the field is documented to be read.
+    let tags = document["tags"]
+        .as_str()
+        .unwrap_or_else(|| panic!("`tags` must be a JSON string, got {}", document["tags"]));
+    let decoded: serde_json::Value = serde_json::from_str(tags).expect("tags must decode");
+    assert_eq!(decoded, serde_json::json!([]), "no tags were given");
+    // `pinned` is the hosted row's integer, and the `PATCH {"pinned": 1}` the SDK sends follows
+    // from it; a boolean here would round-trip as `true` where a client compares against `1`.
+    assert_eq!(document["pinned"], serde_json::json!(0), "{document}");
+    assert_eq!(document["scope"], serde_json::json!("workspace"));
+    assert_eq!(document["source_url"], serde_json::json!(""));
+}
+
+#[test]
+fn a_search_hit_carries_the_fields_the_sdks_declare_required() {
+    let sandbox = Sandbox::new("wire-hit");
+    seed(&sandbox);
+    let server = Server::start(&sandbox);
+
+    // A tag, so the encoding is checked against something that is not the empty list.
+    let tagged = json(&[
+        "add",
+        "--db",
+        &sandbox.db_arg(),
+        "--json",
+        "--kind",
+        "semantic",
+        "--title",
+        "Tagged for the wire",
+        "--body",
+        "A body so the search finds it.",
+        "--tag",
+        "deploy",
+        "--tag",
+        "staging",
+    ]);
+    assert_eq!(tagged["ok"], serde_json::json!(true), "{tagged}");
+
+    let reply = server.call("GET", "/api/search?q=deploy&limit=10", None);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let body = reply.json();
+    assert_eq!(body["query"], serde_json::json!("deploy"));
+    let results = body["results"].as_array().expect("a results array");
+    assert!(!results.is_empty(), "the seeded rows must be found: {body}");
+    for hit in results {
+        for field in HIT_REQUIRED {
+            assert!(
+                hit.get(field).is_some(),
+                "the hit is missing `{field}`, which both SDKs declare required: {hit}"
+            );
+        }
+        assert!(
+            hit["tags"].is_string(),
+            "`tags` must be a JSON string on every hit: {hit}"
+        );
+        assert!(
+            hit["source_url"].is_string(),
+            "`source_url` is NOT NULL on the hosted wire: {hit}"
+        );
+        assert!(hit["rank"].is_number(), "`rank` is the fused score: {hit}");
+        assert!(hit["snippet"].is_string(), "`snippet` is required: {hit}");
+    }
+    // And one row's tags decode to what was written, not to something else.
+    let with_tags = results
+        .iter()
+        .find(|hit| hit["title"] == serde_json::json!("Tagged for the wire"))
+        .expect("the tagged row must be in the page");
+    let decoded: Vec<String> =
+        serde_json::from_str(with_tags["tags"].as_str().expect("a JSON string of tags"))
+            .expect("tags must decode to a list");
+    assert_eq!(decoded, vec!["deploy".to_owned(), "staging".to_owned()]);
+}
+
+#[test]
+fn a_workspace_carries_the_user_id_and_slug_the_sdks_require() {
+    let sandbox = Sandbox::new("wire-workspace");
+    seed(&sandbox);
+    let server = Server::start(&sandbox);
+
+    let reply = server.call("GET", "/api/workspaces", None);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let body = reply.json();
+    let workspaces = body["workspaces"].as_array().expect("a workspaces array");
+    assert_eq!(workspaces.len(), 1, "{body}");
+    let workspace = &workspaces[0];
+    // `user_id` and `slug` are required in both SDKs' `Workspace`, and a local brain has one
+    // owner: the constant is `"local"`, and the slug is the id (there is no separate naming
+    // step here). A missing field is a `KeyError` in the Python client's `pick_workspace`.
+    assert_eq!(
+        workspace["user_id"],
+        serde_json::json!("local"),
+        "{workspace}"
+    );
+    assert!(workspace["slug"].is_string(), "{workspace}");
+    assert_eq!(workspace["documents"], serde_json::json!(2), "{workspace}");
+    assert_eq!(workspace["members"], serde_json::json!(1), "{workspace}");
+}
+
+#[test]
+fn a_pin_written_as_the_integer_the_sdk_sends_reads_back_as_that_integer() {
+    // `manage_memory(action="pin")` sends `PATCH {"pinned": 1}` — an integer, because the hosted
+    // row's `pinned` is one. The route has to accept it, and the document it comes back on has
+    // to report it in the same type, or a client that compares `doc["pinned"] == 1` fails.
+    let sandbox = Sandbox::new("wire-pin");
+    let (first, _) = seed(&sandbox);
+    let server = Server::start(&sandbox);
+
+    let reply = server.call(
+        "PATCH",
+        &format!("/api/documents/{first}"),
+        Some(r#"{"pinned":1}"#),
+    );
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.json()["updated"], serde_json::json!(true));
+
+    let after = server.call("GET", &format!("/api/documents/{first}"), None);
+    assert_eq!(
+        after.json()["pinned"],
+        serde_json::json!(1),
+        "{}",
+        after.body
+    );
+
+    // And the refusal the SDK never sends, but a hand-written client might: 2 is not a pin.
+    let refused = server.call(
+        "PATCH",
+        &format!("/api/documents/{first}"),
+        Some(r#"{"pinned":2}"#),
+    );
+    assert_eq!(refused.status, 400, "{}", refused.body);
+}
+
+#[test]
+fn the_hosted_link_retraction_is_idempotent_rather_than_a_conflict() {
+    // `DELETE /api/documents/{id}/links/{targetId}` is in the hosted surface, so it is here:
+    // the SDK's own escape hatch reaches it, and a `501` would be a hole for no gain. Two
+    // differences from the local `unlink` verb, both asserted: it names no relation, and a
+    // delete that matched nothing is `200 {deleted: false}` — the state the caller asked for —
+    // rather than the `409` a POST that failed to move something earns.
+    let sandbox = Sandbox::new("wire-unlink");
+    let (first, second) = seed(&sandbox);
+    let server = Server::start(&sandbox);
+
+    let orphan = json(&[
+        "add",
+        "--db",
+        &sandbox.db_arg(),
+        "--json",
+        "--kind",
+        "semantic",
+        "--title",
+        "A memory with no edges",
+        "--body",
+        "Nothing points at this.",
+    ]);
+    let lonely = orphan["data"]["id"].as_str().expect("an id").to_owned();
+
+    let linked = server.call(
+        "POST",
+        &format!("/api/documents/{first}/link"),
+        Some(&format!(r#"{{"target_id":"{second}"}}"#)),
+    );
+    assert_eq!(linked.status, 200, "{}", linked.body);
+
+    let removed = server.call(
+        "DELETE",
+        &format!("/api/documents/{first}/links/{second}"),
+        None,
+    );
+    assert_eq!(removed.status, 200, "{}", removed.body);
+    assert_eq!(removed.json()["deleted"], serde_json::json!(true));
+
+    let again = server.call(
+        "DELETE",
+        &format!("/api/documents/{first}/links/{second}"),
+        None,
+    );
+    assert_eq!(again.status, 200, "{}", again.body);
+    assert_eq!(again.json()["deleted"], serde_json::json!(false));
+
+    let unrelated = server.call(
+        "DELETE",
+        &format!("/api/documents/{first}/links/{lonely}"),
+        None,
+    );
+    assert_eq!(unrelated.status, 200, "{}", unrelated.body);
+    assert_eq!(unrelated.json()["deleted"], serde_json::json!(false));
+
+    // The edge really is gone, not just reported gone.
+    let links = server.call("GET", &format!("/api/documents/{first}/links"), None);
+    let rows = links.json();
+    let rows = rows.as_array().expect("an array of edges");
+    assert!(
+        rows.iter()
+            .all(|row| row["target_id"] != serde_json::json!(second)),
+        "the edge survived the delete: {rows:?}"
+    );
 }
 
 #[test]

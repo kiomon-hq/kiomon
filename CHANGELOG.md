@@ -27,22 +27,13 @@ Every release that changes what a caller can rely on gets an entry here. The for
 - `GET /api/search` reports this engine's extras beside the hosted fields — which rung
   answered, which legs ran, and a `warning` when one did not — so a degraded answer cannot
   be read as "nothing matched".
-
-- **The graph.** Typed directed edges (`derived_from`, `supports`, `contradicts`,
-  `supersedes`, `related_to`, `precedes`, `follows`, `part_of`) with `link`, `unlink`,
-  `relate` (one hop, with each neighbour's relation, direction, score, title and excerpt)
-  and `get --relations`. A symmetric `related_to` edge is stored once, whichever end it is
-  written from, and a memory in the review inbox has no edges in either direction.
-- **Auto-linking at activation.** `add` and `review approve` connect a new memory to at
-  most five of its closest lexical neighbours, scored relative to the best match, inside
-  the write's transaction. Limited to the memory's own workspace, and never a self-edge.
-- **The packet reads the graph.** A `contradicts` edge among a packet's candidates becomes
-  a `conflicts` entry and a warning; a `supersedes` edge demotes the memory it replaced and
-  says `prefer the newer memory`. Both are reported rather than auto-resolved, and a
-  superseded memory is demoted, never dropped.
-- `export --json` reports `edges_included: false`, because a restored brain comes back with
-  every memory and no graph: the format does not carry edges, and `import` does not
-  auto-link what it writes.
+- **`DELETE /api/documents/{id}/links/{target}`.** The hosted retraction, engraved with the
+  rest of the surface: relation-less, and idempotent — a delete that matched nothing is
+  `200 {deleted: false}` rather than the `409` a POST that moved nothing earns.
+- **`scripts/sdk_conformance.py` and `scripts/sdk_conformance_ts.mjs`.** The two published
+  SDKs, their real transports, and a live `serve`: the check that "the SDKs work against
+  `127.0.0.1`" needed, because both suites hand their client a `FakeTransport` and never
+  open a socket.
 
 ### Changed
 
@@ -62,6 +53,30 @@ Every release that changes what a caller can rely on gets an entry here. The for
 - `search --legs graph` still refuses, but now says that the graph exists and the *leg* is
   what is missing (plan §4.3 gives the walk to v1.1) rather than that the graph is not in
   this release.
+- **The `/api/*` document and search rows are the hosted shapes, not the CLI's.** `tags` is
+  a JSON-encoded string and `pinned` is `0`/`1`, because that is what both SDKs declare and
+  what `json.loads(doc["tags"])` and `doc["pinned"] == 1` assume. A document now also carries
+  `author`, `user_notes` and `scope` (null and `"workspace"` respectively), a workspace
+  carries `user_id`, `slug`, `my_role`, `members` and `documents`, and a search hit carries
+  `rank`, `body`, `is_large` and `type`. `source_url` is `""` rather than `null`, matching
+  the hosted column's `NOT NULL DEFAULT ''`. The CLI's own `--json` is unchanged: an array of
+  tags is the native contract, and the two doors document their own shapes.
+
+- **The graph.** Typed directed edges (`derived_from`, `supports`, `contradicts`,
+  `supersedes`, `related_to`, `precedes`, `follows`, `part_of`) with `link`, `unlink`,
+  `relate` (one hop, with each neighbour's relation, direction, score, title and excerpt)
+  and `get --relations`. A symmetric `related_to` edge is stored once, whichever end it is
+  written from, and a memory in the review inbox has no edges in either direction.
+- **Auto-linking at activation.** `add` and `review approve` connect a new memory to at
+  most five of its closest lexical neighbours, scored relative to the best match, inside
+  the write's transaction. Limited to the memory's own workspace, and never a self-edge.
+- **The packet reads the graph.** A `contradicts` edge among a packet's candidates becomes
+  a `conflicts` entry and a warning; a `supersedes` edge demotes the memory it replaced and
+  says `prefer the newer memory`. Both are reported rather than auto-resolved, and a
+  superseded memory is demoted, never dropped.
+- `export --json` reports `edges_included: false`, because a restored brain comes back with
+  every memory and no graph: the format does not carry edges, and `import` does not
+  auto-link what it writes.
 
 ## [0.1.0] — 2026-10-18
 

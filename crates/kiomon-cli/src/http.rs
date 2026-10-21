@@ -422,6 +422,11 @@ static ROUTES: &[Route] = &[
         handler: unlink_document,
     },
     Route {
+        method: Method::Delete,
+        pattern: &["api", "documents", ":id", "links", ":target"],
+        handler: unlink_edge,
+    },
+    Route {
         method: Method::Post,
         pattern: &["api", "documents", ":id", "rate"],
         handler: rate_document,
@@ -546,6 +551,16 @@ fn unlink_document(service: &Service, request: &Request) -> Response {
     };
     service
         .unlink(request.param("id").unwrap_or_default(), &body)
+        .into()
+}
+
+fn unlink_edge(service: &Service, request: &Request) -> Response {
+    service
+        .unlink_edge(
+            request.param("id").unwrap_or_default(),
+            request.param("target").unwrap_or_default(),
+            request.query("relation").filter(|name| !name.is_empty()),
+        )
         .into()
 }
 
@@ -1244,6 +1259,8 @@ mod tests {
             ("POST", "/api/documents/k_01/reject"),
             ("GET", "/api/documents/k_01/links"),
             ("POST", "/api/documents/k_01/link"),
+            ("DELETE", "/api/documents/k_01/links/k_02"),
+            ("POST", "/api/documents/k_01/unlink"),
             ("GET", "/api/workspaces"),
             ("GET", "/api/workspaces/w/context?topic=x"),
             ("POST", "/api/memories/k_01/revert"),

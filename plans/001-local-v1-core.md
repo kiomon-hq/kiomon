@@ -1663,7 +1663,7 @@ packet alone), and the packet's own test of that difference is WP5.5's ~8 ms.
 
 | # | Criterion | Where it stands |
 |---|---|---|
-| 1 | The two SDKs' own suites pass against `127.0.0.1` | **Not run, because the SDKs are not in this repository** (`../../SDK/` does not exist here). What was done instead: the wire contract was transcribed from `platform/mcp/src/client.ts` and `platform/worker/src/routes/*.ts` — the two implementations that already agree with each other — and every route, body field and error code is asserted in `tests/serve.rs`. The residual risk is a field the SDK *requires* and this engine omits, and it is unmeasured until somebody runs those suites. Recorded as a follow-up, not as done. |
+| 1 | The two SDKs work against `127.0.0.1` | **Met, after finding that the criterion as written could never be met.** The SDK directories are at `MEMORY-INFRASTRUCTURE/SDK`, one level above this project, and both suites drive a **`FakeTransport`** — `kiomon-py/tests/conftest.py` hands every client a double, `kiomon-ts` does the same with a `fetch` stub — so "their suites pass against `127.0.0.1`" is not a thing those suites do: they never open a socket. What replaced it: `scripts/sdk_conformance.py` and `scripts/sdk_conformance_ts.mjs` drive the **real clients with their real transports** against a live `serve` on an ephemeral port. The first run found **15 divergences** (below), all fixed; the second run is clean on both clients, and both scripts were re-run against the pre-fix binary to prove they bite. |
 | 2 | Every Appendix C route answers or says `unsupported_locally`, asserted route by route | `tests/serve.rs::every_appendix_c_route_answers_or_says_unsupported_locally` (18 routes: 12 answered, 3 refused by name, 3 verbs on one path) plus `http.rs`'s `every_route_in_appendix_c_resolves_to_an_answer`, which asserts the table itself so a route dropped from it fails at the source |
 | 3 | A request without the token, and one with a foreign `Origin`, are refused | `a_request_without_the_token_is_refused_before_it_can_learn_which_routes_exist` (known and unknown paths both `401`), `a_foreign_origin_is_refused_and_a_loopback_one_is_not`, `a_host_header_that_is_not_a_loopback_name_is_refused` — the last one is the DNS-rebinding case, which the plan's wording did not name and the threat model requires |
 | 4 | An MCP session lists the same operations the CLI has | `tests/mcp.rs::the_tool_list_holds_the_hosted_names_and_describes_every_tool` (16 tools, every one with a description and an object schema), `a_search_over_mcp_returns_the_ids_the_cli_returns`, `a_draft_over_mcp_is_a_memory_the_cli_can_read` |
@@ -1677,6 +1677,43 @@ chosen port on one line before the first request, and a taken port is exit `1` o
 path and one `ok: false` envelope on the JSON one; the token survives a restart; `--once`
 answers one request and exits `0` (which the release workflow now runs on every target, next
 to one MCP frame).
+
+### The SDK conformance run, and the fifteen things it found
+
+Run 2026-10-21 against `500282a`'s binary, then against the fixed one. The Python run reported
+13 divergences and the TypeScript run 12, overlapping on most; the union is fifteen, and every
+one of them is a field a published client declares and this server did not answer:
+
+| # | Divergence | What it would have done to a user |
+|---|---|---|
+| 1 | `Workspace` had no `user_id` | `KeyError: 'user_id'` for anyone rendering a workspace, and the field is required in both SDKs |
+| 2 | `Workspace` had no `slug` | `pick_workspace` builds its error message from `w.get('slug')`; a picker shows `None (ws_…)` |
+| 3 | `tags` was an array on documents | `json.loads(doc["tags"])` raises `TypeError`; the TypeScript SDK's own comment says "tags arrive as JSON strings, not arrays" |
+| 4 | `tags` was an array on search hits | same, on the most-used route in the product |
+| 5 | `MemoryDocument` had no `author` | required in both SDKs; a strict TS build fails on the type, a Python user gets `KeyError` |
+| 6 | `MemoryDocument` had no `user_notes` | same |
+| 7 | `MemoryDocument` had no `scope` | same; also the field a caller branches on to know who can read it |
+| 8 | `pinned` was a boolean | `doc["pinned"] == 1` is false, and `PATCH {"pinned": 1}` is what the SDKs send back |
+| 9 | `source_url` was `null` on documents | the hosted column is `NOT NULL DEFAULT ''` and both SDKs type it `string` |
+| 10 | `source_url` was `null` on hits | same |
+| 11 | hits carried no `rank` | a caller merging two pages cannot re-sort without the fused score |
+| 12 | hits carried no `body` | the hosted row is the whole document; a caller that rendered a preview had to `get` every hit |
+| 13 | hits carried no `is_large` | the flag that says "fetch the body separately" |
+| 14 | hits carried no `type` | a document facet this engine has no column for, so `null` — but present |
+| 15 | `DELETE /api/documents/{id}/links/{target}` was `501` | the hosted retraction is reachable from an SDK's escape hatch, and a `501` there is a hole, not a decision |
+
+**Why the earlier transcription missed them.** Appendix C's tables were written from the
+hosted *routes* — method, path, status — and a route table does not carry a response body. The
+required-field lists live one level down, in `types.py` and `types.ts`, and reading the route
+handlers instead of the type declarations is exactly how a summary loses `author`. The fix in
+each case went into `service.rs`'s two renderers (`document_json`, `wire_hits`), so the wire
+shape is now written once and every route that returns a document or a hit uses it.
+
+**What the second run then found, which reading could not.** Nothing — but only because the
+run before it had already forced the fields into existence. The one class of bug that survived
+reading and died on execution was typing: `pinned: false` is an `int` in Python
+(`isinstance(True, int)`), so the Python checker had to be taught to refuse a `bool` explicitly,
+and it took the TypeScript client's strict comparison to make `got true` legible.
 
 ### Where WP9 contradicted the plan
 
@@ -1733,11 +1770,14 @@ to one MCP frame).
 
 ### What v1.2 inherits (and what it should not be talked into)
 
-1. **The SDK suites are the remaining unproven acceptance criterion.** They are the only
-   thing that can catch a required-field mismatch this engine's own tests cannot see. Whoever
-   has those repositories: point their `baseUrl` at `127.0.0.1`, run them, and record what
-   breaks. Until then the wire is asserted against *transcriptions* of the hosted code, which
-   is one step weaker.
+1. **The SDK suites are not a conformance gate and never were.** Both drive a transport
+   double, so what was unproven was never their suite — it was their *types*. Those are now
+   read by `tests/serve.rs` (transcribed required-field lists, so CI holds the line) and by
+   `scripts/sdk_conformance{,_ts}` (the real clients, real transports, live server). What no
+   script here can cover is a *new* SDK release adding a required field: the transcription is
+   manual, so a bump of either SDK should re-run both scripts, and a field they add that the
+   hosted engine also returns will show up as `KeyError` on the next run rather than in a
+   bug report.
 2. **A daemon has no latency argument left.** The transport costs ~1 ms and the SDKs hold no
    long-lived connection (this server closes after one request, so a client's keep-alive is not
    even exploitable). If a daemon appears in v1.2 it must be for *push* — a decay timer,
@@ -2499,14 +2539,19 @@ Binding consequences:
 over one verb layer; the acceptance criterion is the two published SDKs' test suites
 against `127.0.0.1`.**
 
-**D8 was executed on 2026-10-21.** Eighteen routes, sixteen MCP tools, one verb layer, 49
+**D8 was executed on 2026-10-21.** Nineteen routes, sixteen MCP tools, one verb layer, 49
 crates and 4.4 MiB — the "~250 KiB and ~2 crates" estimate held with nothing added at all,
 because a hand-written HTTP/1.1 server over `std::net` needs no crate and `serde_json` was
 already in the tree. The measured cost of the door is **~1 ms** against the 7.5–8.2 ms a
 process spawn costs, which is what makes "no daemon" a measurement rather than a preference.
-The one criterion not met is the SDK suites, for the reason in the WP9 record: `../../SDK/`
-is not in this repository, so the wire was asserted against the hosted implementations the
-SDKs talk to. What D8's consequences predicted and the work confirmed: `Host` and `Origin`
+The acceptance criterion about the SDKs was met by a route the plan had not imagined: their
+own suites cannot run against a server at all, because both hand their client a
+`FakeTransport` and never open a socket. Two scripts now drive the real clients with their
+real transports against a live `serve`, and the first run found fifteen fields the local wire
+was missing — `author`, `user_notes`, `scope`, `user_id`, `slug`, `rank`, `body`, `is_large`,
+`type`, two `source_url`s, and the two type divergences that matter most: `tags` served as an
+array where both SDKs document a JSON string, and `pinned` served as a boolean where both
+declare an integer. The WP9 record lists all fifteen. What D8's consequences predicted and the work confirmed: `Host` and `Origin`
 checking is load-bearing (the token alone does not stop DNS rebinding), the `501` for
 `revert`/briefings needed its own error path because the CLI's exit codes map it to a `500`,
 and `/api/*` stayed a translation layer — the CLI's envelope and exit codes did not move.

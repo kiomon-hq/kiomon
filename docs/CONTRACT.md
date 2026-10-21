@@ -648,19 +648,20 @@ map the surface by comparing `401` with `404`. There is no CORS header anywhere.
 |---|---|
 | `GET /api/search?q&limit&workspace_id&kind&legs` | `{results, query}` plus this engine's `attempt`, `legs`, `degraded`, `reason`, `recorded`, and a `warning` when a leg did not run |
 | `POST /api/retrieve` | The context packet, verbatim — the route does not reshape it, so a packet field cannot be in one place and not the other |
-| `GET /api/documents/{id}` | The memory, in the shape `get --json` returns: a list row plus `body` and `memory_metadata` |
+| `GET /api/documents/{id}` | The memory in the **hosted `Document` shape** — not `get --json`'s (see *The wire the SDKs declare* below) |
 | `PATCH /api/documents/{id}` | `{updated, changed, warnings}`; `{pinned: 0\|1}` and the triage fields |
 | `DELETE /api/documents/{id}` | `{deleted: true}` — the same hard delete as `forget` |
 | `GET /api/documents/{id}/links` | The neighbours, in `relate`'s shape: `target_id` is "the other end", and both directions are read |
 | `POST /api/documents/{id}/link` | `{linked, created, relation, source_id, target_id}` |
-| `POST /api/documents/{id}/unlink` | `{unlinked, removed}` — a body rather than the hosted `DELETE …/links/{target}`, because an edge needs its relation named |
+| `POST /api/documents/{id}/unlink` | `{unlinked, removed}` — a body rather than a path, because an edge needs its relation named; `409` when nothing matched |
+| `DELETE /api/documents/{id}/links/{target}` | `{deleted, removed}` — the hosted retraction, relation-less and idempotent: a delete that matched nothing is `200 {deleted: false}`, not a conflict |
 | `POST /api/documents/{id}/rate` | `{rated, rating, feedback_score, feedback_count}` |
 | `POST /api/documents/{id}/{archive,restore,forget,approve,reject}` | `{archived}`/`{restored}`/`{forgotten}`/`{approved}`/`{rejected}` with the id |
 | `GET /api/graph?center_id&relation&depth` | `{nodes, edges, entityLinks, totalNodes, hasMore, depth}`; `center_id` is the hosted spelling, `id` is accepted |
 | `GET /api/memories?status&workspace_id` | `{memories, status, count}` — the review inbox when the status is `pending_approval` |
 | `POST /api/memories/batch-draft` | `{drafted, promoted, pending, duplicates, memories, review_inbox_url}` |
 | `POST /api/memories/record-outcome` | `{updated, skipped, skipped_detail, outcome}`; `skipped` is the hosted array of ids, and the reasons travel beside it |
-| `GET /api/workspaces` | `{workspaces}` with `is_default` on the first row |
+| `GET /api/workspaces` | `{workspaces}` with `is_default` on the first row, plus `user_id`, `slug`, `my_role`, `members` and `documents` |
 | `GET /api/workspaces/{id}/context?topic` | `{workspace, pinned, procedural_rules, topic_semantic, summary, has_pending_review}` |
 | `GET /health` | `{ok, version, routes}` — the one route with no database behind it |
 
@@ -675,6 +676,35 @@ when a schema rejected it), `401`, `403`, `404`, `405` for a known path with the
 `409` for a verb that was valid and moved nothing, `411` for a chunked body, `413` for a
 body over 32 MiB, `431` for headers over 16 KiB, `503` when the environment cannot serve a
 valid request (no embedder), `501` as above.
+
+### The wire the SDKs declare
+
+Two fields differ from the CLI's own rows, because both published SDKs say so in their types
+and the hosted engine agrees with them:
+
+- **`tags` is a JSON-encoded string, not an array.** `MemoryDocument.tags` is `str | None` in
+  `kiomon-py` and `string | null` in `kiomon-ts`, whose `types.ts` carries the comment "tags
+  and headings arrive as JSON strings, not arrays". The hosted column is `TEXT` holding
+  `["deploy"]`; `json.loads(doc["tags"])` is the documented way to read it. Serving an array
+  would break that call, so the local engine encodes its `Vec<String>` on this door and keeps
+  the array on the CLI's, where `--json` documents an array.
+- **`pinned` is `0` or `1`, not a boolean.** It is the hosted row's integer, and the
+  `PATCH {"pinned": 1}` the SDKs send follows from it. `MemoryDocument.pinned` is `int` in
+  Python and `number` in TypeScript; a `true` here makes `doc["pinned"] == 1` false in any
+  language.
+
+The fields this engine has no writer for are present and `null` rather than absent —
+`author`, `user_notes`, `org_id` — because a missing required field is the one failure a typed
+client cannot paper over, and both SDKs declare those keys. `scope` is the hosted constant
+`"workspace"`; `source_url` is `""` when there is none, matching the hosted column's
+`NOT NULL DEFAULT ''`.
+
+**This is asserted three ways.** `crates/kiomon-cli/tests/serve.rs` checks the required-field
+lists against both `types.py` and `types.ts` (so CI holds the line without either SDK
+present); `scripts/sdk_conformance.py` drives the real Python client with its real `urllib`
+transport against a live server; `scripts/sdk_conformance_ts.mjs` does the same for the real
+TypeScript client with its real `fetch`. The two scripts are how a change to the wire is
+checked against something written by somebody else — see *Checking against the SDKs*.
 
 **Head.** `HEAD` answers on every `GET` route with the same status and headers and no body.
 
@@ -721,6 +751,29 @@ described: a search through `serve` returns the ids the CLI returns (`tests/serv
 packet over HTTP is the packet the CLI builds, and a draft over MCP is a memory the CLI can
 `list`. A divergence here would be a brain that answers differently depending on which door
 a caller used.
+
+### Checking against the SDKs
+
+The SDKs' own test suites cannot check this server, and that is the first thing worth knowing
+about them: `kiomon-py/tests/conftest.py` hands every client a `FakeTransport`, and the
+TypeScript suite does the same with a `fetch` double, so both prove the client's planning and
+never open a socket. Compatibility has to be checked a layer over, which is what two scripts in
+this repository do — they import the *real* client with its *real* transport and call it
+against a live `serve` on an ephemeral port with a temporary brain:
+
+```
+cargo build --release
+python3 scripts/sdk_conformance.py            # the Python SDK, urllib transport
+node    scripts/sdk_conformance_ts.mjs        # the TypeScript SDK, fetch transport
+```
+
+Both default to `../../SDK/kiomon-py/src` and `../../SDK/kiomon-ts/sdk/dist` (the SDK
+repositories live beside this one), take `--bin`, `--sdk`/`--client` to override, and exit
+non-zero with one line per divergence, each naming the field and the SDK that declares it.
+They are **not** in CI, because the SDK repositories are not checked out beside this one
+there; the durability CI does get is `tests/serve.rs`'s required-field lists, transcribed
+from `types.py` and `types.ts`. When the wire changes, run the scripts; when they disagree
+with the transcriptions, the SDK is right.
 
 ## Output shapes
 

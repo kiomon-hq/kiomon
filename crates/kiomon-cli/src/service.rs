@@ -209,6 +209,12 @@ impl Service {
             &request.q,
             legs.as_str(),
         ))?;
+        // `results` is rebuilt rather than reused: the CLI's row is shaped for a human
+        // reading a terminal, and the two differences that matter here are the ones a
+        // published SDK would crash on. See [`wire_hits`].
+        if let Some(object) = body.as_object_mut() {
+            object.insert("results".to_owned(), wire_hits(&outcome.hits));
+        }
         if outcome.degraded {
             // The warning the CLI writes to stderr is a field here. Over HTTP there is no
             // stderr belonging to this request, and a degraded answer delivered silently
@@ -262,7 +268,10 @@ impl Service {
     /// Returns a `404` [`Fault`] when the id is unknown.
     pub fn get_memory(&self, id: &str) -> Reply {
         let db = self.open()?;
-        to_value(&db.get(id)?)
+        // Not the CLI's own row: the wire's `Document` is the hosted one, and the two
+        // agreement points that matter are `tags` as a JSON string and `pinned` as an
+        // integer. See [`document_json`].
+        Ok(document_json(&db.get(id)?))
     }
 
     /// `GET /api/documents/{id}/links`
@@ -506,6 +515,33 @@ impl Service {
         Ok(serde_json::json!({ key: true, "id": id, "moved": outcome.moved }))
     }
 
+    /// `DELETE /api/documents/{id}/links/{targetId}` — the hosted retraction.
+    ///
+    /// This route exists because the hosted product has it and an SDK caller will reach for it,
+    /// so a `501` would be a hole in the surface for no gain. It differs from
+    /// [`Service::unlink`] in two ways, both deliberate: it cannot name a relation (the hosted
+    /// path has no place for one, which is why the local `unlink` takes a body), and a delete
+    /// that matched nothing is a `200 {deleted: false}` rather than a `409`. Deleting an edge
+    /// that is not there is not a conflict — it is the state the caller asked for — and the
+    /// hosted route answers `200` too, so nothing is lost by agreeing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `404` [`Fault`] when either id is unknown, and a `400` for a relation that does
+    /// not exist.
+    pub fn unlink_edge(&self, id: &str, target: &str, relation: Option<&str>) -> Reply {
+        let db = self.open()?;
+        let relation = match relation.map(|name| parse_relation(Some(name))) {
+            Some(parsed) => Some(parsed?),
+            None => None,
+        };
+        let outcome = db.unlink(id, target, relation)?;
+        Ok(serde_json::json!({
+            "deleted": outcome.removed > 0,
+            "removed": outcome.removed,
+        }))
+    }
+
     /// `POST /api/documents/{id}/rate`
     ///
     /// # Errors
@@ -635,9 +671,22 @@ impl Service {
             .iter()
             .enumerate()
             .map(|(index, workspace)| {
+                // A count beside each workspace is what the hosted picker shows; a local one
+                // that showed nothing would make "which brain is this" a `stats` call per row.
+                let memory_count = db
+                    .stats(&Scope::One(workspace.id.clone()), &[])
+                    .map(|stats| stats.total)
+                    .unwrap_or_default();
                 serde_json::json!({
                     "id": workspace.id,
                     "name": workspace.name,
+                    // Both SDKs declare `user_id` and `slug` as required on a workspace, and a
+                    // local brain has one implicit owner. Naming it `"local"` is the honest
+                    // constant for that, and it keeps a caller that reads the field working
+                    // instead of raising `KeyError`.
+                    "user_id": "local",
+                    "slug": workspace.id,
+                    "org_id": serde_json::Value::Null,
                     "review_mode": workspace.review_mode.as_str(),
                     "created_at": workspace.created_at,
                     // The hosted route marks the first row of a creation-ordered list as the
@@ -646,6 +695,12 @@ impl Service {
                     // so the same convention is used, which is what a workspace picker sorts
                     // on.
                     "is_default": index == 0,
+                    // Hosted returns membership and volume counts beside each workspace. There
+                    // is one member here by construction, and the document count is a read
+                    // this engine already has.
+                    "my_role": "owner",
+                    "members": 1,
+                    "documents": memory_count,
                 })
             })
             .collect();
@@ -908,6 +963,109 @@ fn skip_text(skipped: &[Skipped]) -> Vec<String> {
 /// `link_count` is the number of edges this read actually returned, not a stored counter: the
 /// hosted product maintains one on the row, and this engine has no such column — inventing a
 /// number from `corroboration_count` would be a different quantity under a familiar name.
+/// The `tags` column as the wire carries it: a JSON-encoded string, not an array.
+///
+/// Both published SDKs document this explicitly — the TypeScript one in a comment on
+/// `MemoryDocument` ("`tags` and `headings` arrive as JSON strings, not arrays"), the Python
+/// one in its `tags: str | None` annotation — because the hosted engine stores the column as
+/// `TEXT` holding JSON. Serving an array here would break every caller that does
+/// `json.loads(doc["tags"])`, which is the documented way to read it, so the local engine
+/// encodes its `Vec<String>` rather than being the one server that answers differently.
+fn tags_field(tags: &[String]) -> serde_json::Value {
+    serde_json::Value::String(serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_owned()))
+}
+
+/// One memory as the hosted `Document`.
+///
+/// Field-for-field with `platform/worker`'s `documents` row and with both SDKs'
+/// `MemoryDocument`. The fields this engine does not have are `null` rather than absent,
+/// because a required-but-missing field is the one failure mode a typed client cannot paper
+/// over: `author` and `user_notes` are hosted columns with no local writer, and `scope` is a
+/// hosted constant (`'workspace'`) here by construction.
+///
+/// Two fields disagree with the CLI's own `get --json` on purpose: `tags` is a string here
+/// (above) and `pinned` is an integer (`0`/`1`), which is what the hosted row carries and
+/// what a `PATCH {"pinned": 1}` will send back.
+fn document_json(memory: &Memory) -> serde_json::Value {
+    serde_json::json!({
+        "id": memory.id,
+        "workspace_id": memory.workspace_id,
+        "kind": memory.kind.as_str(),
+        "title": memory.title,
+        "excerpt": memory.excerpt,
+        "body": memory.body,
+        // Hosted's column is `NOT NULL DEFAULT ''`, so absent provenance is an empty string
+        // there and not a null; a client that renders `source_url` as a link reads both the
+        // same way, but a client that indexes it would not.
+        "source_url": memory.source_url.as_deref().unwrap_or(""),
+        "author": serde_json::Value::Null,
+        "user_notes": serde_json::Value::Null,
+        "tags": tags_field(&memory.tags),
+        "pinned": i64::from(memory.pinned),
+        "created_at": memory.created_at,
+        "updated_at": memory.updated_at,
+        "source": memory.source,
+        "confidence": memory.confidence,
+        "importance": memory.importance,
+        "strength": memory.strength,
+        "corroboration_count": memory.corroboration_count,
+        "retrieval_count": memory.retrieval_count,
+        "last_retrieved_at": memory.last_retrieved_at,
+        "feedback_score": memory.feedback_score,
+        "feedback_count": memory.feedback_count,
+        "status": memory.status.as_str(),
+        "expires_at": memory.expires_at,
+        // The hosted constant for a memory that belongs to exactly one workspace.
+        "scope": "workspace",
+        "org_id": serde_json::Value::Null,
+        "memory_metadata": memory.memory_metadata,
+        // Local additions, kept because the CLI's `--json` has them and a caller switching
+        // doors should not lose a label it was reading.
+        "kind_label": memory.kind.label(),
+        "source_label": memory.source_label(),
+    })
+}
+
+/// A search page as the hosted `SearchResult[]`.
+///
+/// The hosted row is the document shape plus `snippet`, `rank` and `is_large`. `rank` is the
+/// fused score: the hosted engine reports it, and a caller that re-sorts a merged page by it
+/// would otherwise have to trust the order alone.
+fn wire_hits(hits: &[kiomon_core::SearchHit]) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = hits
+        .iter()
+        .enumerate()
+        .map(|(rank, hit)| {
+            let memory = &hit.memory;
+            serde_json::json!({
+                "id": memory.id,
+                "workspace_id": memory.workspace_id,
+                "kind": memory.kind.as_str(),
+                "title": memory.title,
+                "excerpt": memory.excerpt,
+                "body": memory.body,
+                "tags": tags_field(&memory.tags),
+                "created_at": memory.created_at,
+                "snippet": hit.snippet,
+                "rank": hit.score,
+                // Hosted's `is_large` is "the body lives in R2"; nothing local does, and a
+                // caller branches on it to decide whether to fetch the body separately.
+                "is_large": 0,
+                "source": memory.source,
+                "source_url": memory.source_url.as_deref().unwrap_or(""),
+                // Hosted's `type` is a document facet this engine has no column for.
+                "type": serde_json::Value::Null,
+                "confidence": memory.confidence,
+                // Local additions: the retrieval order is not the score, and a vector-leg row
+                // carries a cosine similarity the CLI reports.
+                "position": rank,
+                "similarity": hit.similarity,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(rows)
+}
+
 fn node_of(memory: &Memory, link_count: usize) -> serde_json::Value {
     serde_json::json!({
         "id": memory.id,
