@@ -612,6 +612,116 @@ peak resident set where the platform reports one, then exits. It is the probe th
 times to measure opening on its own, and it is public because a reader who wants to know
 what opening their own brain costs should not have to read the harness to find out.
 
+## Two transports
+
+`serve` and `mcp` are the same verbs through two pipes. What follows is the wire each one
+speaks, and the two promises they share.
+
+### `kiomon serve`
+
+Loopback HTTP/1.1 on `127.0.0.1`, answering the hosted product's `/api/*` routes so the
+published SDKs work against a local brain by pointing their `baseUrl` at it. `--port 0`
+asks the operating system for a port and prints the one it got, on one line of stdout,
+**before** the first request — that line is the interface a supervisor parses:
+
+```
+$ kiomon serve --port 0 --json
+{"listening":true,"url":"http://127.0.0.1:53412","port":53412,
+ "db":"…/brain.db","token_file":"…/serve.token","token_created":true}
+```
+
+**Auth.** Every request carries the token from the file beside the database, in `X-API-Key`
+(SDKs send this) or `Authorization: Bearer <token>`. There is nothing to validate a hosted
+API key against locally, so the key's *value* is the local token and its presence is not
+enough. The file is created on first run, printed once, and never rotated behind your back;
+`--token-file` moves it, and two brains are two tokens.
+
+**Three refusals, before routing.** A request whose `Host` is not a loopback name is `403`
+(DNS rebinding: an attacker's domain pointed at `127.0.0.1` arrives with its own `Host`). A
+request whose `Origin` is not loopback is `403` (a page must not read the brain). A request
+without the token is `401` — for every path, known or not, so an unauthorised client cannot
+map the surface by comparing `401` with `404`. There is no CORS header anywhere.
+
+**Routes.**
+
+| Method + path | Answers |
+|---|---|
+| `GET /api/search?q&limit&workspace_id&kind&legs` | `{results, query}` plus this engine's `attempt`, `legs`, `degraded`, `reason`, `recorded`, and a `warning` when a leg did not run |
+| `POST /api/retrieve` | The context packet, verbatim — the route does not reshape it, so a packet field cannot be in one place and not the other |
+| `GET /api/documents/{id}` | The memory, in the shape `get --json` returns: a list row plus `body` and `memory_metadata` |
+| `PATCH /api/documents/{id}` | `{updated, changed, warnings}`; `{pinned: 0\|1}` and the triage fields |
+| `DELETE /api/documents/{id}` | `{deleted: true}` — the same hard delete as `forget` |
+| `GET /api/documents/{id}/links` | The neighbours, in `relate`'s shape: `target_id` is "the other end", and both directions are read |
+| `POST /api/documents/{id}/link` | `{linked, created, relation, source_id, target_id}` |
+| `POST /api/documents/{id}/unlink` | `{unlinked, removed}` — a body rather than the hosted `DELETE …/links/{target}`, because an edge needs its relation named |
+| `POST /api/documents/{id}/rate` | `{rated, rating, feedback_score, feedback_count}` |
+| `POST /api/documents/{id}/{archive,restore,forget,approve,reject}` | `{archived}`/`{restored}`/`{forgotten}`/`{approved}`/`{rejected}` with the id |
+| `GET /api/graph?center_id&relation&depth` | `{nodes, edges, entityLinks, totalNodes, hasMore, depth}`; `center_id` is the hosted spelling, `id` is accepted |
+| `GET /api/memories?status&workspace_id` | `{memories, status, count}` — the review inbox when the status is `pending_approval` |
+| `POST /api/memories/batch-draft` | `{drafted, promoted, pending, duplicates, memories, review_inbox_url}` |
+| `POST /api/memories/record-outcome` | `{updated, skipped, skipped_detail, outcome}`; `skipped` is the hosted array of ids, and the reasons travel beside it |
+| `GET /api/workspaces` | `{workspaces}` with `is_default` on the first row |
+| `GET /api/workspaces/{id}/context?topic` | `{workspace, pinned, procedural_rules, topic_semantic, summary, has_pending_review}` |
+| `GET /health` | `{ok, version, routes}` — the one route with no database behind it |
+
+Routes this engine cannot answer answer **`501`** with `code: "unsupported_locally"`:
+`POST /api/memories/{id}/revert` (no revision history), `GET
+/api/workspaces/{id}/briefings/latest` (a briefing is composed by a model), and `depth > 1`
+on the graph (a path search, not a neighbourhood). Never an empty `200` — a client cannot
+tell "nothing there" from "not implemented", and one of those makes it stop asking.
+
+**Errors** are `{error, code}` with a status: `400` for a bad request (`validation_failed`
+when a schema rejected it), `401`, `403`, `404`, `405` for a known path with the wrong verb,
+`409` for a verb that was valid and moved nothing, `411` for a chunked body, `413` for a
+body over 32 MiB, `431` for headers over 16 KiB, `503` when the environment cannot serve a
+valid request (no embedder), `501` as above.
+
+**Head.** `HEAD` answers on every `GET` route with the same status and headers and no body.
+
+**Framing.** One request per connection (`Connection: close`), `Content-Length` required
+(chunked is refused by name), `Expect: 100-continue` answered. There is no keep-alive, no
+HTTP/2 and no TLS: this is a loopback socket for agents on one machine.
+
+**Not a daemon.** `serve` answers requests for as long as it runs and does nothing else: no
+scheduler, no config watching, and the decay nudge is still attached to writes rather than
+to a timer. It opens the database per request — a connection per thread would need a mutex
+around the read path — which costs about 2 ms and buys a server with no shared mutable
+state at all.
+
+### `kiomon mcp`
+
+JSON-RPC 2.0 over stdin and stdout, newline-delimited, one frame per line. **stdout carries
+only protocol frames**; every diagnostic goes to stderr, because a stray line on stdout is a
+client that hangs rather than an error. `initialize` answers `protocolVersion`
+`2024-11-05`, the `tools` capability, and the agent instructions — the transport-level copy
+of the contract, so a client that does not load `AGENTS.md` still gets the lifecycle.
+
+Tools are the hosted product's twelve under the hosted names, because an agent's prompt is
+written against them, plus three this engine has verbs for and the hosted toolset does not:
+
+| Tool | Is |
+|---|---|
+| `retrieve_memory`, `search_memory`, `get_memory`, `get_workspace_context`, `explore_memory_graph` | The reads, by the names the hosted server uses |
+| `draft_memory`, `reflect_session`, `record_outcome`, `manage_memory` | The writes; `manage_memory` is eight verbs behind one action name |
+| `list_workspaces`, `select_workspace` | The workspace list, and the per-session default (`select_workspace` resolves the id before accepting it) |
+| `get_latest_briefing` | `501` with the same wording as the route |
+| `get_memory_relations`, `link_memories`, `unlink_memories` | **Local**: the graph verbs, which the hosted toolset reaches through `explore_memory_graph` and the dashboard |
+| `list_review_inbox` | **Local**: the queue a file-based brain has and a service-backed one pushes to a page |
+
+A tool that fails answers `isError: true` with the message in `content[0].text` and the code
+in `kiomon_error_code` — a *result*, not a JSON-RPC error, because a client that receives a
+protocol error may treat the tool as missing rather than as refused. An unknown tool is the
+same shape, naming `tools/list`. A malformed frame is `-32700` with a null id and the session
+continues.
+
+### The shared promise
+
+Both transports call the same functions over the same file, which is asserted rather than
+described: a search through `serve` returns the ids the CLI returns (`tests/serve.rs`), the
+packet over HTTP is the packet the CLI builds, and a draft over MCP is a memory the CLI can
+`list`. A divergence here would be a brain that answers differently depending on which door
+a caller used.
+
 ## Output shapes
 
 ### A search result
@@ -808,6 +918,7 @@ See [the envelope](#the-json-envelope). `error.message` is for a human; branch o
 | Removing or renaming a field | Breaking. Needs a version bump. |
 | Adding a command or a flag | Not breaking. |
 | Changing an exit code, or a `error.code` value | Breaking. |
+| Anything about `serve`'s bodies or `mcp`'s tool schemas | **Not this contract.** Those are the hosted product's wire, and they follow its version — this one's number moves only when a CLI envelope moves. |
 | Changing output on the *human* path | Not breaking, but say so in the pull request anyway — people grep it. |
 
 ## What is not in version 1
@@ -816,12 +927,11 @@ See [the envelope](#the-json-envelope). `error.message` is for a human; branch o
 numbers in the README are one laptop's, they are labelled as such, and `kiomon bench` is
 how you get yours.
 
-- `kiomon mcp` (stdio MCP server) and `kiomon serve` (loopback HTTP), together in v1.1.
-  `mcp` wraps *this* contract, and the tool names will be the command names. `serve`
-  answers the hosted `/api/*` routes instead, so the published Python and TypeScript SDKs
-  work unchanged against a local brain — see `plans/001-local-v1-core.md` §9-D8 and
-  Appendix C. Routes this engine cannot answer (`revert`, briefings) return a typed
-  `unsupported_locally` error rather than an empty success.
+- **The hosted routes this engine has no answer for.** `revert` needs revision history a
+  file-based brain does not keep, and a briefing is prose composed by a model. Both answer
+  `unsupported_locally` on both transports, and a whole-graph overview (a graph query with no
+  `center_id`) is a `400` because the most-connected-nodes seed is a ranking this engine does
+  not compute. See [two transports](#two-transports).
 - **A graph leg inside a search.** The graph is here — see [the graph](#the-graph) — and
   `search --legs graph` refuses with a message that says so. What is v1.1 is the walk as a
   *ranking* leg: a PageRank over the seed set, fused as a third RRF list (§4.3 of the plan).

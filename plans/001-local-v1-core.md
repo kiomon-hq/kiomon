@@ -79,10 +79,10 @@ protect them.
 | **Connectors** (Notion, Drive, Confluence, RSS, Scholar) | Network, OAuth, and sync state machines. `import` covers the migration case. |
 | **Browser extension, dashboard, landing page** | Not a CLI product's problem. |
 | **Auth, API keys, plans, quotas, billing, orgs, multi-tenancy** | The whole point of local. `workspace_id` is a filter; there is no `user_id`. |
-| **MCP server** | v1.1, and it ships *with* `serve` rather than before it: one verb layer, two transports, one milestone (§9-D8). v1 is CLI so the native contract can be proven first. |
-| **HTTP server / SDK backend** | v1.1 — `kiomon serve`, loopback only, speaking the hosted `/api/*` contract so the existing Python and TypeScript SDKs work unchanged. **Self-hosting the engine is a first-class product**, not a power-user path (§9-D8). |
+| **MCP server** | ✅ **Shipped in v1.1** (WP9), *with* `serve` rather than before it: one verb layer, two transports, one milestone (§9-D8). v1 was CLI first so the native contract could be proven before it was translated. |
+| **HTTP server / SDK backend** | ✅ **Shipped in v1.1** (WP9) — `kiomon serve`, loopback only, speaking the hosted `/api/*` contract so the existing Python and TypeScript SDKs work unchanged. **Self-hosting the engine is a first-class product**, not a power-user path (§9-D8). |
 | **PDF parsing, OCR, reader mode** | Local files + stdin + URL fetch only. |
-| **Contradiction engine / quarantine** | Needs claim comparison. v1.1, after `claims` are being stored. |
+| **Contradiction engine / quarantine** | Needs claim comparison. Not in v1.1 either — `link --relation contradicts` writes the edge a human or an agent asserts, and no pass infers one. |
 | **Cloud sync, hosted parity, telemetry** | Off the table by definition. |
 
 ### Deliberate fidelity choices
@@ -169,8 +169,8 @@ kiomon/
 ```
 
 **Two crates, not one.** A single crate would be "more minimal" for about a week,
-then `kiomon mcp` and `kiomon serve` (both v1.1, §9-D8) would either duplicate the
-library or force a split under load. `kiomon-core` has no `clap`, no `print!`, and
+then `kiomon mcp` and `kiomon serve` (both shipped in v1.1, §9-D8) would either
+duplicate the library or force a split under load. `kiomon-core` has no `clap`, no `print!`, and
 no `process::exit` — that rule is what makes those later binaries one `main.rs`
 each.
 
@@ -1575,7 +1575,7 @@ below as follow-ups rather than pretended away.
    --expires-at`/`--ttl` with the hosted write shape. Neither is urgent; both are recorded so
    that "not yet" is a decision and not an oversight.
 
-### WP9 — `serve` + `mcp`: two transports, one verb layer (2½ days) — **v1.1, per §9-D8**
+### WP9 — `serve` + `mcp`: two transports, one verb layer (2½ days) — **shipped**
 Loopback HTTP/1.1 — `std::net` and threads, no async runtime — answering the hosted
 `/api/*` routes in Appendix C from the same functions the CLI calls, plus stdio MCP over
 the same layer, plus a token file in the data directory and `--port 0` printing the port
@@ -1587,6 +1587,18 @@ routes this engine cannot answer say so.
 404 that reads like an empty success; a request without the token and a request with a
 foreign `Origin` are both refused; an MCP session lists the same operations the CLI has;
 `serve` adds no dependency with an async runtime and the binary stays inside §7's budget.
+
+Three of those five were met as written. The one that was not — the SDK suites, which are
+not in this repository — is recorded below with what was done instead and what it leaves
+unproven. **Corrections the work turned up:** Appendix C's `/api/graph` names its centre
+`center_id` on the wire, not `id`, and its response is a subgraph rather than a neighbour
+list; the hosted product has three routes Appendix C does not list (`documents/{id}/links`,
+`documents/{id}/link`, `memories` for the review inbox) and one endpoint Appendix C gives as a
+list is really an array of edges; a `501` needed `Error::Deferred` to stop mapping to a
+`500`, which is the one place the CLI's exit codes and HTTP's statuses disagree; the hosted
+graph query hides `origin = 'auto'` edges and this engine must not, because here those *are*
+the graph; and `depth > 1` is refused rather than approximated, which the plan's Appendix C
+row had already decided.
 
 **v1 = WP0–WP4 + WP5.5 + WP6–WP8 complete (WP5 deferred, §9-D9). Estimated 2–3 focused
 weeks.** WP3 precedes WP4 by
@@ -1609,9 +1621,139 @@ shape last.
 | **WP6** | ✅ **DONE** 2026-10-18 | `import.rs` (the JSONL record, the line validator, the markdown view and its reader, the filename rule), `store::export_page` (keyset paging over the row's own columns) and `store::import_batch` (one transaction per page, `exists`/`duplicate`/`written` in that order, workspaces created from the file), `portability.rs` (the streaming writer, the directory walk, the per-line reporter, the 2 MiB line cap with its drain), `MAX_TITLE`/`MAX_EXCERPT`/`MAX_BODY_BYTES` enforced on every door, and the `--config`-aware text limits in `docs/CONTRACT.md`. **426 tests** (268 core + 70 CLI + 25 CLI-portability + 18 CLI-embed + 21 core-vector + others), clippy clean, no new dependencies. | |
 | **WP7** | ✅ **DONE** 2026-10-17 | `embed.rs` (the `Embedder` trait, the `ollama` and `openai` shapes over `ureq`, the deterministic `stub`, the memory-text rule, the 20 000-character cap, the prefixes), `vector.rs` (brute-force cosine, blob encoding, the zero floor), the config file (`config.toml` with `default_workspace` and `[embedder]`, the first real TOML dependency), the write path (`add`, `update`, `reindex --embed`), `--legs auto|fts|vector|graph` with the hosted spellings as aliases, `degraded`/`reason` reporting, `doctor`'s embedder and coverage report, a `similarity` per vector-leg row, a bench row and gate for the hybrid budget, and the `--config` global flag. **376 tests** (243 core + 70 CLI + 18 CLI-embed + 21 core-vector + 9 store + others), clippy clean, **3 971 KiB** binary, **49** transitive crates of 60. | |
 | **WP8** | ✅ **DONE** 2026-10-18 | `crates/kiomon-cli/build.rs` (the commit stamp: watched refs, `unknown` without a repository, `-dirty` for a modified tree), `crate::VERSION` in `--version`, `-V`, `meta.version` and the bench header; `install.sh` (POSIX, target detection, checksum verified by default, `--dry-run`, `--target`, `KIOMON_RELEASES_URL`) and `install.ps1` (Windows PowerShell 5.1, zip, user-PATH edit); `scripts/package.sh` (the archive layout both installers expect, five targets); `.github/workflows/release.yml` (verify on the tagged commit, five native builds, the tag's own sha asserted from the binary, one job's checksums, `--verify-tag` release, core-then-cli crates.io publish with an index wait); `CHANGELOG.md`; `docs/DESIGN.md` (the long-form argument this project has been writing into work-package records); README install section and CONTRIBUTING release checklist. **428 tests** (268 core + 72 CLI + 25 CLI-portability + 18 CLI-embed + 21 core-vector + others), clippy clean, no new dependencies. | |
-| **WP9** | ⬜ TODO (v1.1) | |
+| **WP9** | ✅ **DONE** 2026-10-21 (v1.1) | `service.rs` (the verb layer: 18 routes and 16 MCP tools over one set of typed requests), `http.rs` (hand-written HTTP/1.1 on `std::net` and a fixed worker pool: bounded headers and bodies, per-socket timeouts, `HEAD`, `Expect: 100-continue`, chunked refused by name), `mcp.rs` (newline-delimited JSON-RPC, the hosted twelve tool names plus three local ones, `isError` results rather than protocol errors), `serve`/`mcp` commands, the token file with the three loopback-only refusals (`Host`, `Origin`, token), `501 unsupported_locally` for `revert`/briefings/`depth > 1`, no new crates (`getrandom` is already shared with `kiomon-core`), the release workflow's two-transport smoke test, and 35 new integration tests. **533 tests**, clippy clean, **4.4 MiB** binary, **49** crates. | |
 
-### The numbers so far, and what they cost
+### WP9's numbers, and the seven things it found
+
+Same machine, release build, 10 000-memory corpus, warm cache, `C:` drive. The client is
+`curl` — one process issuing sequential transfers — and that choice is the first finding:
+**Python's socket stack costs ~14 ms per connection on this host**, which is larger than most
+of the routes, so a Python client measures Python. With `curl` the same `/health` request
+takes 0.5 ms, and every number below is work the server actually did.
+
+| Route | p50 | p95 | The CLI's own work, for comparison |
+|---|---|---|---|
+| `GET /health` (no database opened) | **0.49 ms** | 13.0 ms | — |
+| `GET /api/documents/{id}` | 2.30 ms | 19.8 ms | `get`: 2.4 ms |
+| `GET /api/documents/{id}/links` | 2.55 ms | 12.2 ms | `relate`: 2.9 ms |
+| `GET /api/workspaces` | 2.21 ms | 15.1 ms | `stats`: 3.9 ms |
+| `GET /api/graph?center_id` | 2.66 ms | 13.1 ms | `relate`: 2.9 ms |
+| `POST /api/documents/{id}/rate` | 8.03 ms | 9.6 ms | a write, like `add`: 4.4 ms |
+| `GET /api/workspaces/{id}/context` | 18.19 ms | 41.0 ms | four reads and a search |
+| **`GET /api/search?q=deploy`** | **27.24 ms** | 44.7 ms | `search --legs fts`: 40.9 ms |
+| `POST /api/retrieve` | 31.36 ms | 36.0 ms | `retrieve (no record)`: 19.8 ms |
+
+The p95s are 40 samples on a host that interrupts a socket read now and then; they are
+reported because a p50 alone hides that, and the gate on this path is not a percentile — the
+transport is not in §7's budget.
+
+**The door costs about a millisecond.** `GET /api/search` at 27.2 ms is the same search as
+`search --legs fts` at 40.9 ms of `work` minus the recorded row's difference in legs
+(`fts` with `deferred` fusion vs the plain lexical leg), and `GET /health` — accept, parse,
+build one object, write, close — is 0.49 ms. So the transport is ~1 ms and a process spawn is
+7.5–8.2 ms, which is the argument §9-D8 needed: **there is nothing left for a daemon to win on
+latency.** What a daemon would still buy is push (a timer for decay, streaming), and that stays
+behind §10's trigger.
+
+`POST /api/retrieve` at 31.4 ms against the CLI's 19.8 ms `work` is not a regression: the
+route records the retrieval (`record: true`, which the bench row disables to measure the
+packet alone), and the packet's own test of that difference is WP5.5's ~8 ms.
+
+### WP9's acceptance criteria
+
+| # | Criterion | Where it stands |
+|---|---|---|
+| 1 | The two SDKs' own suites pass against `127.0.0.1` | **Not run, because the SDKs are not in this repository** (`../../SDK/` does not exist here). What was done instead: the wire contract was transcribed from `platform/mcp/src/client.ts` and `platform/worker/src/routes/*.ts` — the two implementations that already agree with each other — and every route, body field and error code is asserted in `tests/serve.rs`. The residual risk is a field the SDK *requires* and this engine omits, and it is unmeasured until somebody runs those suites. Recorded as a follow-up, not as done. |
+| 2 | Every Appendix C route answers or says `unsupported_locally`, asserted route by route | `tests/serve.rs::every_appendix_c_route_answers_or_says_unsupported_locally` (18 routes: 12 answered, 3 refused by name, 3 verbs on one path) plus `http.rs`'s `every_route_in_appendix_c_resolves_to_an_answer`, which asserts the table itself so a route dropped from it fails at the source |
+| 3 | A request without the token, and one with a foreign `Origin`, are refused | `a_request_without_the_token_is_refused_before_it_can_learn_which_routes_exist` (known and unknown paths both `401`), `a_foreign_origin_is_refused_and_a_loopback_one_is_not`, `a_host_header_that_is_not_a_loopback_name_is_refused` — the last one is the DNS-rebinding case, which the plan's wording did not name and the threat model requires |
+| 4 | An MCP session lists the same operations the CLI has | `tests/mcp.rs::the_tool_list_holds_the_hosted_names_and_describes_every_tool` (16 tools, every one with a description and an object schema), `a_search_over_mcp_returns_the_ids_the_cli_returns`, `a_draft_over_mcp_is_a_memory_the_cli_can_read` |
+| 5 | No async runtime, binary inside §7's budget | **49** transitive crates (unchanged: `getrandom` was already in the tree for ULIDs), **4.4 MiB** against the 6 MiB budget, and `std::net` + a fixed worker pool with no `tokio`, no `axum`, no `hyper` |
+
+Beyond the plan's five: `HEAD` answers like `GET` without a body; a chunked body is refused
+with `411`; a header block over 16 KiB is refused with `431` rather than allocated; a body over
+32 MiB is `413`; `Expect: 100-continue` is answered (curl's large-POST path, 3 ms round trip);
+a malformed JSON body is a `400` and the server answers the next request; `--port 0` prints the
+chosen port on one line before the first request, and a taken port is exit `1` on the human
+path and one `ok: false` envelope on the JSON one; the token survives a restart; `--once`
+answers one request and exits `0` (which the release workflow now runs on every target, next
+to one MCP frame).
+
+### Where WP9 contradicted the plan
+
+1. **Appendix C spelled the graph's centre `id`; the wire says `center_id`.** The hosted
+   route reads `c.req.query("center_id")` and the MCP client sends exactly that. The
+   transcription in Appendix C was a summary written from a route table, and the field name
+   is the part a summary loses. Fixed in the route *and* in Appendix C, because an SDK caller
+   that works online must work offline.
+2. **Appendix C's graph row promised "one hop per call", and the hosted answer is a
+   subgraph.** `{nodes, edges, entityLinks, totalNodes, hasMore, depth}` — the local route
+   builds that shape, including `depth` echoed back so a caller can see what it got, and
+   including `entityLinks: []` rather than omitting it, because a client reads that field
+   and `undefined` is not an empty array.
+3. **Three hosted routes Appendix C does not list, and one it misfiles.** `GET
+   /api/documents/{id}/links` is how the hosted MCP client reads relations (as an array of
+   edges, not a `{relations}` object), `POST /api/documents/{id}/link` is the write, and
+   `GET /api/memories?status=pending_approval` is the review inbox. All three are answered
+   locally; a fourth, `DELETE /api/documents/:id/links/:targetId`, is *not* — it cannot name a
+   relation, so the local retraction is `POST /api/documents/{id}/unlink` with a body.
+4. **`Error::Deferred` mapped to a `500`.** The CLI's exit-code mapping puts "not in this
+   release" on exit `1`, which is right for a process, and the HTTP layer derived its status
+   from that mapping — so `search --legs graph` (which the hosted product answers `501`) came
+   back as `500`, telling an SDK to retry forever. The `From<Error> for Fault` conversion now
+   checks for `Deferred`/`Unimplemented` *first*. This is the one place the two contracts must
+   disagree, and it is one `if`.
+5. **The hosted graph hides `origin = 'auto'`; this one must not.** The hosted query filters
+   auto-links because its auto-link pass is a background scan writing thousands of similarity
+   edges — they would drown a drawing. Locally the only edges most brains have are the ≤5 per
+   activation that `add` wrote, so the filter would make the graph view empty *and* disagree
+   with `relate`, which reads the same rows. `origin` travels on every edge, so the hosted view
+   is one `filter` call away, and the divergence is written in the route's own documentation.
+6. **Routing had to match method *and* pattern.** The first implementation found the first
+   route whose *pattern* matched and then checked the method, so `PATCH` and `DELETE` on
+   `/api/documents/{id}` answered `405` — the path had a `GET` row registered first. Three
+   verbs share that path, so the method is part of the search. Found by a test, not by
+   reading.
+7. **`PATCH workspace_id` is `501`, not applied.** The hosted patch can move a memory between
+   workspaces; locally a workspace is a read boundary and no verb crosses one. Refusing the
+   whole patch is better than applying the title and silently dropping the move.
+
+### Two things the work found that were already wrong
+
+8. **`Legs::parse` has no empty-string arm, and the wire's absence is empty.** `--legs`
+   always has a value because clap supplies one; a query string simply omits the parameter, so
+   `parse_legs(None)` hit the "unknown legs ``" branch and the most common search in the
+   product was a `400`. Caught by the first end-to-end run, fixed in `service::parse_legs`
+   (which is where the wire's vocabulary lives) rather than by teaching `Legs::parse` that
+   empty means something — the CLI's type has no state for absence.
+9. **A `HEAD` that falls through to the `GET` route still must not write a body.** The first
+   version answered `405` for `HEAD` (no route allows it) and wrote a body anyway, so a client
+   reading `Content-Length: 61` waited for bytes that never came. Now `GET` routes accept
+   `HEAD`, and the writer omits the body while keeping its length, which is what RFC 9110
+   says.
+
+### What v1.2 inherits (and what it should not be talked into)
+
+1. **The SDK suites are the remaining unproven acceptance criterion.** They are the only
+   thing that can catch a required-field mismatch this engine's own tests cannot see. Whoever
+   has those repositories: point their `baseUrl` at `127.0.0.1`, run them, and record what
+   breaks. Until then the wire is asserted against *transcriptions* of the hosted code, which
+   is one step weaker.
+2. **A daemon has no latency argument left.** The transport costs ~1 ms and the SDKs hold no
+   long-lived connection (this server closes after one request, so a client's keep-alive is not
+   even exploitable). If a daemon appears in v1.2 it must be for *push* — a decay timer,
+   streaming — and the plan should demand the same kind of measurement that killed the latency
+   argument.
+3. **One connection per request is the right shape until something measures otherwise.**
+   `Connection: close` plus a connection per thread is what makes a hand-written parser safe;
+   keep-alive would need a request loop, pipelining rules, and an idle timeout, for a saving of
+   ~0.4 ms on a socket.
+4. **`GET /api/graph` without a centre is `400`, not implemented.** The hosted overview seeds
+   the most-connected nodes; that ranking does not exist here. If a graph leg arrives (§4.3),
+   it brings the ranking with it and the route can answer.
+5. **The three local-only MCP tools are a gap in the hosted toolset, not in this one.**
+   `get_memory_relations`, `link_memories`, `unlink_memories` and `list_review_inbox` exist
+   because a local brain's graph and inbox have no page to live on. If the hosted product grows
+   them, the local spellings should be reconciled the way the twelve already are.
 
 Measured on one developer machine — Intel Core i5-9300H, Windows, `--release`, warm
 OS cache, **5 000 memories with 5 KB bodies (43.5 MiB)**. The command times include
@@ -1635,6 +1777,8 @@ Binary **3 231 KiB** against the 6 MB budget (WP3 added the corpus generator and
 harness, and the binary grew 257 KiB for them); **33** transitive crates against the 60-crate
 budget; ~8.7 KiB stored per 5 KB memory, which is the full-text index's second copy of the
 text plus overhead.
+
+### The numbers so far, and what they cost
 
 ### WP3's numbers, and the five things the ruler found
 
@@ -2355,6 +2499,18 @@ Binding consequences:
 over one verb layer; the acceptance criterion is the two published SDKs' test suites
 against `127.0.0.1`.**
 
+**D8 was executed on 2026-10-21.** Eighteen routes, sixteen MCP tools, one verb layer, 49
+crates and 4.4 MiB — the "~250 KiB and ~2 crates" estimate held with nothing added at all,
+because a hand-written HTTP/1.1 server over `std::net` needs no crate and `serde_json` was
+already in the tree. The measured cost of the door is **~1 ms** against the 7.5–8.2 ms a
+process spawn costs, which is what makes "no daemon" a measurement rather than a preference.
+The one criterion not met is the SDK suites, for the reason in the WP9 record: `../../SDK/`
+is not in this repository, so the wire was asserted against the hosted implementations the
+SDKs talk to. What D8's consequences predicted and the work confirmed: `Host` and `Origin`
+checking is load-bearing (the token alone does not stop DNS rebinding), the `501` for
+`revert`/briefings needed its own error path because the CLI's exit codes map it to a `500`,
+and `/api/*` stayed a translation layer — the CLI's envelope and exit codes did not move.
+
 **DECIDED: the graph is not v1.** Put to the owner on 2026-10-17, after WP4 landed and the
 remaining scope could be read as a list rather than a plan: the graph is the next sprint's
 first work package, and v1 ships the packet, portability, the vector leg and packaging
@@ -2448,6 +2604,16 @@ Transcribed from `../../SDK/kiomon-py/src/kiomon/_specs.py` and `_client.py`, wh
 the wire contract actually lives: those two SDKs already agree with each other, and a third
 opinion invented here would be a fourth implementation of a format nobody owns.
 
+**WP9 corrected this table against the implementations that exist in this tree** — neither SDK
+directory is here, so the transcriptions were checked against `platform/mcp/src/client.ts` and
+`platform/worker/src/routes/*.ts`, the two things those SDKs talk to. Three rows changed: the
+graph's centre is `center_id` on the wire (not `id`), its response is a subgraph
+(`{nodes, edges, entityLinks, totalNodes, hasMore, depth}`) rather than a neighbour list, and
+three routes the table did not list are answered by both sides (`GET
+/api/documents/{id}/links`, `POST /api/documents/{id}/link`, `GET /api/memories?status=`).
+Everything the `serve` column says is asserted route by route in
+`crates/kiomon-cli/tests/serve.rs`.
+
 | Method + path | SDK verb | Local |
 |---|---|---|
 | `GET /api/search?q&limit&workspace_id&kind` | `searchMemory` | `search` (WP2) |
@@ -2455,7 +2621,7 @@ opinion invented here would be a fourth implementation of a format nobody owns.
 | `GET /api/documents/{id}` | `getMemory` | `get` (WP1) |
 | `POST /api/memories/batch-draft` | `draftMemory` | `add`, batched (`insert_many`, WP3) |
 | `POST /api/memories/record-outcome` | `recordOutcome` | `outcome` (WP4) |
-| `GET /api/graph?id&relation&depth` | `exploreMemoryGraph` | ✅ since WP5 — `Database::relations` is the read, one hop per call. `depth > 1` is `unsupported_locally` (a path search, not a neighbourhood), and the route must not answer a one-hop list to a three-hop question |
+| `GET /api/graph?center_id&relation&depth` | `exploreMemoryGraph` | ✅ answered — `Database::relations` is the read, one hop per call, in the hosted subgraph shape. `depth > 1` is `unsupported_locally` (a path search, not a neighbourhood), and a query with no `center_id` is `400`: the whole-graph overview needs the most-connected-nodes seed this engine does not compute. The hosted query hides `origin = 'auto'` edges and this one does not — here those edges *are* the graph, and hiding them would disagree with `relate` |
 | `PATCH /api/documents/{id}` `{"pinned": 0\|1}` | `manageMemory` pin/unpin | `pin`/`unpin` (WP1) |
 | `POST /api/documents/{id}/rate` `{"rating": n}` | `manageMemory` rate | `rate` (WP4) |
 | `POST /api/documents/{id}/{action}` | `manageMemory` archive/restore/forget/approve/reject | WP4 + WP5 verbs |
@@ -2463,8 +2629,20 @@ opinion invented here would be a fourth implementation of a format nobody owns.
 | `GET /api/workspaces/{id}/context?topic` | `getWorkspaceContext` | partial — pinned + recent + kinds, composable from WP1/WP2 |
 | `POST /api/memories/{id}/revert` | `manageMemory` revert | ❌ `unsupported_locally` — this engine keeps no revision history |
 | `GET /api/workspaces/{id}/briefings/latest` | `getLatestBriefing` | ❌ `unsupported_locally` — briefings are a hosted composition, and §10 says never locally |
+| `GET /api/documents/{id}/links` | `getMemoryRelations` | ✅ answered — not in this table before WP9, and it is how the hosted MCP client reads relations: an **array** of `{target_id, relation, title, excerpt}` rows, with `target_id` meaning "the other end" so a directed edge reads correctly from either side |
+| `POST /api/documents/{id}/link` | — | ✅ answered — `{target_id}` in, `{linked, created}` out. The local retraction is `POST /api/documents/{id}/unlink` with a body, because the hosted `DELETE …/links/{targetId}` cannot name which of two edges between the same pair to remove |
+| `GET /api/memories?status=` | — | ✅ answered — `{memories, status, count}`; `pending_approval` is the review inbox |
+| `GET /health` | — | ✅ answered — `{ok, version, routes}`, the one route with no database behind it. Not a hosted route; it is what a supervisor and `serve --once` read |
 
 Auth: `X-API-Key` or `Authorization: Bearer`. The client refuses to construct without one,
-so `serve` accepts any non-empty key on a loopback bind and separately requires its own
-token file; there is nothing local to validate a key against, and inventing an account
-model to have something to check would be the tenancy §9-D6 refused from the start.
+so `serve` requires one — and its *value* is the local token from `<data dir>/serve.token`,
+not a hosted API key: there is nothing local to validate a key against, and inventing an
+account model to have something to check would be the tenancy §9-D6 refused from the start.
+A present-but-wrong value is refused, which is one step stricter than "any non-empty key" and
+one step cheaper than an account system.
+
+**Shipped in WP9 (2026-10-21).** Every row above either answers or returns
+`unsupported_locally`, and which one is asserted in `tests/serve.rs`. The acceptance criterion
+that was *not* met is the SDK suites themselves — those repositories are not in this tree, so
+the wire is asserted against transcriptions of the code they talk to, and the plan's WP9
+record says so rather than calling it done.

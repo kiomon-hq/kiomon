@@ -21,7 +21,10 @@
 
 mod cli;
 mod commands;
+mod http;
+mod mcp;
 mod out;
+mod service;
 
 use std::process::ExitCode;
 

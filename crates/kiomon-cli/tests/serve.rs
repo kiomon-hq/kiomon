@@ -1,0 +1,872 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! End-to-end assertions on `kiomon serve`: the HTTP surface, through the binary.
+//!
+//! What is tested here is what only a process and a socket can show: the handshake line a
+//! supervisor parses, the three refusals that keep the port private, the status and code of
+//! every route in Appendix C, and the one promise the whole work package rests on — that the
+//! HTTP answer and the CLI answer come from the same read of the same file.
+//!
+//! The client is hand-written over `std::net::TcpStream` rather than pulled in as a dependency:
+//! a server whose tests need an HTTP client crate to check one response is a server that has
+//! made testing it somebody's dependency decision, and this workspace has one dependency
+//! argument at a time.
+
+use std::fmt::Write as _;
+use std::io::{BufRead, BufReader, Read as _, Write as _};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+/// A temporary directory that removes itself when the test ends.
+struct Sandbox {
+    dir: PathBuf,
+}
+
+impl Sandbox {
+    fn new(label: &str) -> Self {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "kiomon-serve-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("a sandbox directory must be creatable");
+        Self { dir }
+    }
+
+    fn db(&self) -> PathBuf {
+        self.dir.join("brain.db")
+    }
+
+    fn db_arg(&self) -> String {
+        self.db().display().to_string()
+    }
+
+    fn token(&self) -> String {
+        std::fs::read_to_string(self.dir.join("serve.token"))
+            .expect("the token file must exist once the server is up")
+            .trim()
+            .to_owned()
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+fn kiomon() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_kiomon"))
+}
+
+fn run(args: &[&str]) -> Output {
+    let mut command = kiomon();
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the binary must be runnable")
+}
+
+fn json(args: &[&str]) -> serde_json::Value {
+    let out = run(args);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let value: serde_json::Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|err| panic!("stdout was not JSON ({err}): {text:?}"));
+    assert_eq!(value["ok"], serde_json::json!(true), "failed: {value}");
+    value
+}
+
+/// A server process, killed when the test ends.
+///
+/// The port is read from the handshake line rather than chosen by the test: `--port 0` is what
+/// the installer and the release workflow use, so the line itself has to be the interface.
+struct Server {
+    child: Child,
+    url: String,
+    token: String,
+}
+
+impl Server {
+    fn start(sandbox: &Sandbox) -> Self {
+        let mut child = kiomon()
+            .args([
+                "--db",
+                &sandbox.db_arg(),
+                "serve",
+                "--port",
+                "0",
+                "--json",
+                "-q",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the server must start");
+        let mut handshake = String::new();
+        BufReader::new(child.stdout.as_mut().expect("stdout"))
+            .read_line(&mut handshake)
+            .expect("the handshake line must arrive");
+        let value: serde_json::Value = serde_json::from_str(handshake.trim())
+            .unwrap_or_else(|err| panic!("the handshake was not JSON ({err}): {handshake:?}"));
+        assert_eq!(value["listening"], serde_json::json!(true), "{value}");
+        let url = value["url"].as_str().expect("a url").to_owned();
+        let token = sandbox.token();
+        Self { child, url, token }
+    }
+
+    fn authority(&self) -> String {
+        self.url.trim_start_matches("http://").to_owned()
+    }
+
+    /// One request, with the token, returning the status and the body.
+    fn call(&self, method: &str, path: &str, body: Option<&str>) -> Reply {
+        self.request(method, path, body, &[("X-API-Key", self.token.as_str())])
+    }
+
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> Reply {
+        let mut head = format!("{method} {path} HTTP/1.1\r\n");
+        // The default header set is what a well-behaved client sends; a test that supplies its
+        // own `Host` is testing the rebinding refusal, and two `Host` headers would make it test
+        // whichever one the parser happened to keep first.
+        if !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("host"))
+        {
+            // `write!` rather than `push_str(&format!(..))`: the latter allocates a second string
+            // per header line, and the lint that says so is right.
+            write!(head, "Host: {}\r\n", self.authority()).expect("a String write cannot fail");
+        }
+        for (name, value) in headers {
+            write!(head, "{name}: {value}\r\n").expect("a String write cannot fail");
+        }
+        if let Some(body) = body {
+            write!(
+                head,
+                "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .expect("a String write cannot fail");
+            head.push_str(body);
+        } else {
+            head.push_str("\r\n");
+        }
+        let mut stream = TcpStream::connect(self.authority()).expect("the port must accept");
+        stream
+            .write_all(head.as_bytes())
+            .expect("the request must be writable");
+        let mut raw = Vec::new();
+        stream
+            .read_to_end(&mut raw)
+            .expect("the response must be readable");
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+        let status: u16 = head
+            .split(' ')
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status line in {head:?}"));
+        Reply {
+            status,
+            body: body.to_owned(),
+            raw: text,
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.child.kill().ok();
+        self.child.wait().ok();
+    }
+}
+
+struct Reply {
+    status: u16,
+    body: String,
+    raw: String,
+}
+
+impl Reply {
+    fn json(&self) -> serde_json::Value {
+        serde_json::from_str(&self.body)
+            .unwrap_or_else(|err| panic!("body was not JSON ({err}): {:?}", self.body))
+    }
+
+    fn code(&self) -> String {
+        self.json()["code"].as_str().unwrap_or_default().to_owned()
+    }
+}
+
+/// A brain with two memories that share vocabulary, so auto-linking has a neighbour to draw.
+fn seed(sandbox: &Sandbox) -> (String, String) {
+    let db = sandbox.db_arg();
+    let first = add(
+        sandbox,
+        &db,
+        "semantic",
+        "Deploys go through the release workflow",
+    );
+    let second = add(sandbox, &db, "procedural", "How to deploy a release");
+    (first, second)
+}
+
+fn add(sandbox: &Sandbox, db: &str, kind: &str, title: &str) -> String {
+    let _ = sandbox;
+    let value = json(&[
+        "add",
+        "--db",
+        db,
+        "--json",
+        "--kind",
+        kind,
+        "--title",
+        title,
+        "--body",
+        "Always \
+         tag first, then let the workflow verify the tagged commit.",
+        "--confidence",
+        "0.9",
+    ]);
+    value["data"]["id"].as_str().expect("an id").to_owned()
+}
+
+fn path_of(url: &str) -> &str {
+    url.split_once("://").map_or(url, |pair| pair.1)
+}
+
+// ---------------------------------------------------------------------------
+// The handshake
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_handshake_is_one_line_on_stdout_and_names_the_port_and_the_token_file() {
+    // A supervisor learns the port from this line, and nothing else in the process writes to
+    // stdout before it. Both facts are asserted because a stray `println!` on a startup path is
+    // how a parseable handshake stops being parseable.
+    let sandbox = Sandbox::new("handshake");
+    let mut child = kiomon()
+        .args([
+            "--db",
+            &sandbox.db_arg(),
+            "serve",
+            "--port",
+            "0",
+            "--json",
+            "-q",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the server must start");
+    let mut line = String::new();
+    BufReader::new(child.stdout.as_mut().expect("stdout"))
+        .read_line(&mut line)
+        .expect("a handshake");
+    child.kill().ok();
+    child.wait().ok();
+
+    let value: serde_json::Value = serde_json::from_str(line.trim()).expect("one JSON line");
+    assert_eq!(value["listening"], serde_json::json!(true));
+    assert!(value["port"].as_u64().expect("a port") > 0);
+    assert!(
+        value["url"]
+            .as_str()
+            .expect("a url")
+            .starts_with("http://127.0.0.1:")
+    );
+    assert!(value["token_created"].as_bool().expect("a flag"));
+    assert!(Path::new(value["token_file"].as_str().expect("a path")).exists());
+}
+
+#[test]
+fn a_second_start_reuses_the_token_instead_of_writing_a_new_one() {
+    // A token that changed on every restart would be a token every client has to be
+    // reconfigured with, which is the opposite of what a credential is for.
+    let sandbox = Sandbox::new("token-reuse");
+    let first = Server::start(&sandbox);
+    let token = first.token.clone();
+    drop(first);
+
+    let second = Server::start(&sandbox);
+    assert_eq!(second.token, token, "the token must survive a restart");
+}
+
+#[test]
+fn a_port_already_in_use_is_an_error_that_names_it() {
+    let sandbox = Sandbox::new("port-busy");
+    let server = Server::start(&sandbox);
+    let port = server.url.rsplit(':').next().expect("a port").to_owned();
+
+    // The human path, because that is where the message goes to stderr: `--json` reports a
+    // failure on stdout as an envelope, and this assertion is about the sentence a person reads.
+    let out = run(&["--db", &sandbox.db_arg(), "serve", "--port", &port]);
+    assert_eq!(out.status.code(), Some(1), "a bind failure is exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains(&port),
+        "the message must name the port: {stderr}"
+    );
+    // And nothing was printed to stdout, so a supervisor that reads the handshake sees an
+    // error rather than a url that does not answer.
+    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+
+    // On the JSON path the failure is one envelope on stdout, which is the contract every
+    // command keeps — and it still names the port.
+    let out = run(&[
+        "--db",
+        &sandbox.db_arg(),
+        "serve",
+        "--port",
+        &port,
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let envelope = String::from_utf8_lossy(&out.stdout).into_owned();
+    let value: serde_json::Value =
+        serde_json::from_str(envelope.trim()).unwrap_or_else(|err| panic!("{err}: {envelope:?}"));
+    assert_eq!(value["ok"], serde_json::json!(false));
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&port)
+    );
+}
+
+#[test]
+fn once_answers_one_request_and_exits_zero() {
+    // The smoke test the release workflow runs: it proves the shipped binary can bind, answer
+    // and stop without a supervisor.
+    let sandbox = Sandbox::new("once");
+    let mut child = kiomon()
+        .args([
+            "--db",
+            &sandbox.db_arg(),
+            "serve",
+            "--port",
+            "0",
+            "--once",
+            "--json",
+            "-q",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the server must start");
+    let mut line = String::new();
+    BufReader::new(child.stdout.as_mut().expect("stdout"))
+        .read_line(&mut line)
+        .expect("a handshake");
+    let value: serde_json::Value = serde_json::from_str(line.trim()).expect("one JSON line");
+    let authority = value["url"]
+        .as_str()
+        .expect("a url")
+        .trim_start_matches("http://")
+        .to_owned();
+    let token = sandbox.token();
+
+    let mut stream = TcpStream::connect(&authority).expect("the port must accept");
+    stream
+        .write_all(
+            format!("GET /health HTTP/1.1\r\nHost: {authority}\r\nX-API-Key: {token}\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("writable");
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).expect("readable");
+    assert!(raw.starts_with("HTTP/1.1 200 OK"), "{raw}");
+
+    let status = child.wait().expect("the process must exit by itself");
+    assert_eq!(status.code(), Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// The three refusals
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_request_without_the_token_is_refused_before_it_can_learn_which_routes_exist() {
+    // A known path and an unknown one answer identically, which is what stops an unauthorised
+    // client from mapping the surface by comparing `401` with `404`.
+    let sandbox = Sandbox::new("no-token");
+    let server = Server::start(&sandbox);
+
+    let known = server.request("GET", "/api/workspaces", None, &[]);
+    let unknown = server.request("GET", "/api/nothing", None, &[]);
+    assert_eq!(known.status, 401);
+    assert_eq!(unknown.status, 401);
+    assert_eq!(known.code(), "unauthorized");
+    assert_eq!(unknown.code(), "unauthorized");
+
+    let wrong = server.request("GET", "/api/workspaces", None, &[("X-API-Key", "nope")]);
+    assert_eq!(wrong.status, 401, "{}", wrong.raw);
+}
+
+#[test]
+fn the_token_is_accepted_in_either_header() {
+    let sandbox = Sandbox::new("two-headers");
+    let server = Server::start(&sandbox);
+    let bearer = format!("Bearer {}", server.token);
+
+    assert_eq!(
+        server
+            .request(
+                "GET",
+                "/health",
+                None,
+                &[("X-API-Key", server.token.as_str())]
+            )
+            .status,
+        200
+    );
+    assert_eq!(
+        server
+            .request(
+                "GET",
+                "/health",
+                None,
+                &[("Authorization", bearer.as_str())]
+            )
+            .status,
+        200
+    );
+}
+
+#[test]
+fn a_foreign_origin_is_refused_and_a_loopback_one_is_not() {
+    // The rule a page in a browser cannot get around: its `Origin` is not forgeable.
+    let sandbox = Sandbox::new("origin");
+    let server = Server::start(&sandbox);
+
+    let foreign = server.request(
+        "GET",
+        "/api/workspaces",
+        None,
+        &[
+            ("X-API-Key", server.token.as_str()),
+            ("Origin", "https://evil.example"),
+        ],
+    );
+    assert_eq!(foreign.status, 403, "{}", foreign.raw);
+    assert_eq!(foreign.code(), "forbidden");
+
+    let local = server.request(
+        "GET",
+        "/api/workspaces",
+        None,
+        &[
+            ("X-API-Key", server.token.as_str()),
+            ("Origin", "http://localhost:5173"),
+        ],
+    );
+    assert_eq!(local.status, 200, "{}", local.raw);
+
+    // Absent is "not a browser", and every SDK in the world omits it.
+    let absent = server.call("GET", "/api/workspaces", None);
+    assert_eq!(absent.status, 200);
+}
+
+#[test]
+fn a_host_header_that_is_not_a_loopback_name_is_refused() {
+    // DNS rebinding: an attacker's domain resolves to 127.0.0.1, the browser sends the
+    // attacker's own `Host`, and everything except this check looks local.
+    let sandbox = Sandbox::new("host");
+    let server = Server::start(&sandbox);
+    let reply = server.request(
+        "GET",
+        "/api/workspaces",
+        None,
+        &[
+            ("X-API-Key", server.token.as_str()),
+            ("Host", "brain.evil.example"),
+        ],
+    );
+    assert_eq!(reply.status, 403, "{}", reply.raw);
+    assert!(
+        reply.json()["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("loopback"),
+        "{}",
+        reply.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Every route in Appendix C
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_appendix_c_route_answers_or_says_unsupported_locally() {
+    // The acceptance criterion, route by route. A route that fell out of the table would be a
+    // `404` that a client reads as "nothing there", which is the failure mode Appendix C exists
+    // to prevent — so the list is asserted here and again in `http.rs`'s unit test.
+    let sandbox = Sandbox::new("routes");
+    let (first, second) = seed(&sandbox);
+    let server = Server::start(&sandbox);
+
+    let answered: [(&str, &str, Option<&str>); 12] = [
+        ("GET", "/api/search?q=deploy&limit=3", None),
+        ("GET", "/api/search?q=deploy&legs=hybrid", None),
+        ("GET", &format!("/api/documents/{first}"), None),
+        ("GET", &format!("/api/documents/{first}/links"), None),
+        ("GET", &format!("/api/graph?center_id={first}"), None),
+        ("GET", "/api/workspaces", None),
+        ("GET", "/api/workspaces/default/context?topic=deploy", None),
+        ("GET", "/api/memories?status=pending_approval", None),
+        (
+            "POST",
+            "/api/retrieve",
+            Some(r#"{"intent":"execute","query":"deploy"}"#),
+        ),
+        ("POST", "/api/documents/{id}/rate", Some(r#"{"rating":1}"#)),
+        ("PATCH", "/api/documents/{id}", Some(r#"{"pinned":1}"#)),
+        ("POST", "/api/documents/{id}/archive", None),
+    ];
+    for (method, target, body) in answered {
+        let target = target.replace("{id}", &second);
+        let target = target.as_str();
+        let reply = server.call(method, target, body);
+        assert!(
+            (200..300).contains(&reply.status),
+            "{method} {target} answered {} {}",
+            reply.status,
+            reply.body
+        );
+    }
+
+    let unsupported: [(&str, &str); 3] = [
+        ("POST", "/api/memories/{id}/revert"),
+        ("GET", "/api/workspaces/default/briefings/latest"),
+        ("GET", "/api/graph?center_id={id}&depth=2"),
+    ];
+    for (method, target) in unsupported {
+        let target = target.replace("{id}", &first);
+        let reply = server.call(method, &target, None);
+        assert_eq!(reply.status, 501, "{method} {target}: {}", reply.body);
+        assert_eq!(
+            reply.code(),
+            "unsupported_locally",
+            "{method} {target}: {}",
+            reply.body
+        );
+        assert!(
+            !reply.body.contains("[]"),
+            "an unsupported route must not answer an empty shape: {}",
+            reply.body
+        );
+    }
+}
+
+#[test]
+fn an_unknown_route_is_a_404_and_a_known_path_with_the_wrong_method_is_a_405() {
+    // The difference matters: one means check the URL, the other means check the verb.
+    let sandbox = Sandbox::new("404-405");
+    let (first, _) = seed(&sandbox);
+    let server = Server::start(&sandbox);
+
+    let unknown = server.call("GET", "/api/nonsense", None);
+    assert_eq!(unknown.status, 404);
+    assert_eq!(unknown.code(), "not_found");
+
+    let wrong = server.call("PUT", "/api/retrieve", Some("{}"));
+    assert_eq!(wrong.status, 405, "{}", wrong.raw);
+    assert!(wrong.body.contains("PUT"), "{}", wrong.body);
+
+    // And the three verbs that share `/api/documents/{id}` all route.
+    let document = format!("/api/documents/{first}");
+    assert_eq!(server.call("GET", &document, None).status, 200);
+    assert_eq!(
+        server
+            .call("PATCH", &document, Some(r#"{"pinned":1}"#))
+            .status,
+        200
+    );
+    assert_eq!(
+        server.call("DELETE", &document, None).status,
+        200,
+        "delete routes through the same pattern"
+    );
+}
+
+#[test]
+fn head_answers_like_get_without_a_body() {
+    let sandbox = Sandbox::new("head");
+    let server = Server::start(&sandbox);
+    let reply = server.call("HEAD", "/health", None);
+    assert_eq!(reply.status, 200);
+    assert!(reply.body.is_empty(), "a HEAD body: {:?}", reply.body);
+    assert!(
+        reply.raw.contains("Content-Length:"),
+        "a HEAD response describes the body it omits: {}",
+        reply.raw
+    );
+}
+
+// ---------------------------------------------------------------------------
+// One verb layer
+// ---------------------------------------------------------------------------
+
+#[test]
+fn search_over_http_returns_the_ids_the_cli_returns() {
+    // The claim the work package makes: two transports, one answer. If this diverges, the
+    // local brain answers differently depending on which door a caller used.
+    let sandbox = Sandbox::new("same-search");
+    seed(&sandbox);
+    let server = Server::start(&sandbox);
+
+    let over_http = server.call("GET", "/api/search?q=deploy&limit=5", None);
+    assert_eq!(over_http.status, 200, "{}", over_http.body);
+    let http_ids: Vec<String> = over_http.json()["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|row| row["id"].as_str().expect("an id").to_owned())
+        .collect();
+
+    let cli = json(&[
+        "search",
+        "--db",
+        &sandbox.db_arg(),
+        "--json",
+        "--limit",
+        "5",
+        "deploy",
+    ]);
+    let cli_ids: Vec<String> = cli["data"]["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|row| row["id"].as_str().expect("an id").to_owned())
+        .collect();
+
+    assert!(!cli_ids.is_empty(), "the fixture must match something");
+    assert_eq!(http_ids, cli_ids);
+}
+
+#[test]
+fn the_packet_over_http_is_the_packet_the_cli_builds() {
+    // `retrieve` returns the packet verbatim, so the two must be equal field for field. The CLI
+    // nests it in an envelope; the route does not, because the hosted route does not.
+    let sandbox = Sandbox::new("same-packet");
+    seed(&sandbox);
+    let server = Server::start(&sandbox);
+
+    let over_http = server.call(
+        "POST",
+        "/api/retrieve",
+        Some(r#"{"intent":"execute","query":"deploy a release","limit":5}"#),
+    );
+    assert_eq!(over_http.status, 200, "{}", over_http.body);
+
+    let cli = json(&[
+        "retrieve",
+        "--db",
+        &sandbox.db_arg(),
+        "--json",
+        "--intent",
+        "execute",
+        "--limit",
+        "5",
+        "--no-record",
+        "deploy a release",
+    ]);
+    let from_cli = cli["data"].clone();
+
+    // `retrieved_ids` is where the two can differ: the HTTP route records the read and the CLI
+    // was told not to, so the field's *content* is compared only for the items.
+    let http = over_http.json();
+    assert_eq!(http["summary"], from_cli["summary"]);
+    assert_eq!(http["facts"], from_cli["facts"]);
+    assert_eq!(http["warnings"], from_cli["warnings"]);
+    assert_eq!(http["conflicts"], from_cli["conflicts"]);
+}
+
+#[test]
+fn a_patch_over_http_is_visible_to_the_cli() {
+    // The other direction of the same claim: a write through one door is a write the other
+    // door reads.
+    let sandbox = Sandbox::new("write-through");
+    let (first, _) = seed(&sandbox);
+    let server = Server::start(&sandbox);
+
+    let patched = server.call(
+        "PATCH",
+        &format!("/api/documents/{first}"),
+        Some(r#"{"title":"Renamed over HTTP","pinned":1}"#),
+    );
+    assert_eq!(patched.status, 200, "{}", patched.body);
+
+    let read = json(&["get", "--db", &sandbox.db_arg(), "--json", &first]);
+    assert_eq!(read["data"]["title"], "Renamed over HTTP");
+    assert_eq!(read["data"]["pinned"], serde_json::json!(true));
+}
+
+// ---------------------------------------------------------------------------
+// Framing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_chunked_body_is_refused_by_name_rather_than_mis_parsed() {
+    let sandbox = Sandbox::new("chunked");
+    seed(&sandbox);
+    let server = Server::start(&sandbox);
+
+    let head = format!(
+        "POST /api/retrieve HTTP/1.1\r\nHost: {}\r\nX-API-Key: {}\r\nTransfer-Encoding: \
+         chunked\r\nContent-Type: application/json\r\n\r\n",
+        server.authority(),
+        server.token
+    );
+    let mut stream = TcpStream::connect(server.authority()).expect("connect");
+    stream.write_all(head.as_bytes()).expect("writable");
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).expect("readable");
+    assert!(raw.starts_with("HTTP/1.1 411"), "{raw}");
+    assert!(raw.contains("Content-Length"), "{raw}");
+}
+
+#[test]
+fn an_absurd_header_block_is_refused_instead_of_allocating() {
+    let sandbox = Sandbox::new("header-cap");
+    let server = Server::start(&sandbox);
+    let mut head = format!(
+        "GET /health HTTP/1.1\r\nHost: {}\r\nX-API-Key: {}\r\n",
+        server.authority(),
+        server.token
+    );
+    for index in 0..2000 {
+        write!(head, "X-Filler-{index}: {}\r\n", "x".repeat(64))
+            .expect("a String write cannot fail");
+    }
+    head.push_str("\r\n");
+    let mut stream = TcpStream::connect(server.authority()).expect("connect");
+    // The server answers and closes before reading all of it, so the write may fail with a
+    // broken pipe — that is the refusal working, not the test failing.
+    stream.write_all(head.as_bytes()).ok();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).expect("readable");
+    assert!(
+        raw.starts_with("HTTP/1.1 431") || raw.starts_with("HTTP/1.1 400"),
+        "{raw}"
+    );
+}
+
+#[test]
+fn a_malformed_json_body_is_a_400_and_the_server_still_answers_the_next_request() {
+    let sandbox = Sandbox::new("bad-json");
+    seed(&sandbox);
+    let server = Server::start(&sandbox);
+
+    let broken = server.call("POST", "/api/retrieve", Some("{not json"));
+    assert_eq!(broken.status, 400, "{}", broken.body);
+    assert_eq!(broken.code(), "validation_failed");
+
+    let unknown_field = server.call(
+        "POST",
+        "/api/retrieve",
+        Some(r#"{"intent":"plan","query":"x","surprise":1}"#),
+    );
+    assert_eq!(unknown_field.status, 400);
+    assert!(
+        unknown_field.body.contains("surprise"),
+        "{}",
+        unknown_field.body
+    );
+
+    let fine = server.call(
+        "POST",
+        "/api/retrieve",
+        Some(r#"{"intent":"plan","query":"deploy"}"#),
+    );
+    assert_eq!(fine.status, 200, "the server must survive a bad frame");
+}
+
+#[test]
+fn a_legs_value_the_hosted_product_accepts_is_accepted_here() {
+    // `hybrid` is the hosted spelling of this engine's `auto`. A caller reading `legs` off a
+    // response asks for it back by the name it saw.
+    let sandbox = Sandbox::new("legs");
+    seed(&sandbox);
+    let server = Server::start(&sandbox);
+    for legs in ["hybrid", "fts", "vector", "auto"] {
+        let reply = server.call("GET", &format!("/api/search?q=deploy&legs={legs}"), None);
+        // `vector` is refused *only* because no embedder is configured, and that is a `503`:
+        // the request was fine and the environment cannot serve it.
+        assert!(
+            reply.status == 200 || reply.status == 503,
+            "legs={legs} answered {} {}",
+            reply.status,
+            reply.body
+        );
+    }
+    let graph = server.call("GET", "/api/search?q=deploy&legs=graph", None);
+    assert_eq!(graph.status, 501, "{}", graph.body);
+    let nonsense = server.call("GET", "/api/search?q=deploy&legs=sideways", None);
+    assert_eq!(nonsense.status, 400, "{}", nonsense.body);
+}
+
+#[test]
+fn the_error_body_carries_a_code_a_client_can_branch_on() {
+    // The hosted contract's rule: `error` is prose, `code` is stable. A client that pattern
+    // matched the prose would break on the next message edit.
+    let sandbox = Sandbox::new("codes");
+    let (first, _) = seed(&sandbox);
+    let server = Server::start(&sandbox);
+
+    for (method, path, body, code) in [
+        (
+            "GET",
+            "/api/documents/k_01NOTHERE".to_owned(),
+            None,
+            "not_found",
+        ),
+        (
+            "POST",
+            "/api/retrieve".to_owned(),
+            Some(r#"{"intent":"nope","query":"x"}"#),
+            "validation_failed",
+        ),
+        ("GET", "/api/graph".to_owned(), None, "bad_request"),
+        (
+            "POST",
+            format!("/api/documents/{first}/rate"),
+            Some(r#"{"rating":3}"#),
+            "bad_request",
+        ),
+    ] {
+        let reply = server.call(method, &path, body);
+        assert_eq!(reply.code(), code, "{method} {path}: {}", reply.body);
+        assert!(
+            reply.json()["error"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "every refusal needs prose: {}",
+            reply.body
+        );
+    }
+}
+
+#[test]
+fn path_of_strips_the_scheme_so_a_test_can_pretend_to_be_a_client() {
+    // Guards the helper the fixtures use: a `url` with the scheme left on it would make every
+    // `TcpStream::connect` call in this file fail for a reason unrelated to the server.
+    assert_eq!(
+        path_of("http://127.0.0.1:1234/api/x"),
+        "127.0.0.1:1234/api/x"
+    );
+}

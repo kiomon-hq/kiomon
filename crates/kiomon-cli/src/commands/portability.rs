@@ -66,7 +66,7 @@ const MAX_REPORTED_ERRORS: usize = 100;
 /// cannot be written, and whatever the store raises.
 pub fn export(cli: &Cli, args: &ExportArgs) -> Result<ExitCode> {
     let db = open(cli)?;
-    let scope = read_scope(&db, cli, args.workspace.as_deref())?;
+    let scope = read_scope(&db, cli.config.as_deref(), args.workspace.as_deref())?;
     let status: Option<Status> = args.status.map_or(Some(Status::Active), Option::from);
 
     match args.format {

@@ -138,6 +138,18 @@ pub enum Command {
     Forget(ForgetArgs),
     /// Write the brain out as JSONL or markdown.
     Export(ExportArgs),
+
+    /// Answer the hosted `/api/*` routes on a loopback port, for the published SDKs.
+    ///
+    /// v1.1. Not a daemon: there is no supervisor, no config watching and no scheduler — it
+    /// answers requests for as long as the terminal it was started in stays open, and the
+    /// CLI keeps being the way to do anything by hand.
+    Serve(ServeArgs),
+    /// Speak the Model Context Protocol on stdin and stdout, for an agent that expects MCP.
+    ///
+    /// The same verbs as the CLI, under the hosted tool names, so an agent's instructions do
+    /// not have to know which brain it is talking to.
+    Mcp(McpArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +704,36 @@ pub struct ExportArgs {
     /// Write here instead of standard output.
     #[arg(long, value_name = "PATH")]
     pub output: Option<PathBuf>,
+}
+
+/// `kiomon serve`
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// Loopback port to listen on. Zero asks the operating system, and the chosen port is
+    /// printed before the first request — which is how a supervisor learns it.
+    #[arg(long, default_value_t = 7321, value_name = "PORT")]
+    pub port: u16,
+
+    /// Where the token lives. Defaults to `serve.token` beside the database.
+    ///
+    /// Beside the database rather than in a global location because two brains are two
+    /// credentials: a token that unlocked every brain a user has would turn one leaked file
+    /// into two lost ones.
+    #[arg(long, value_name = "PATH")]
+    pub token_file: Option<PathBuf>,
+
+    /// Answer one request and exit, for a smoke test.
+    #[arg(long)]
+    pub once: bool,
+}
+
+/// `kiomon mcp`
+#[derive(Debug, Args)]
+pub struct McpArgs {
+    // Deliberately empty. The MCP server has no options a client could set: its database comes
+    // from `--db`, `$KIOMON_DB` and the config file, exactly as every other command's does, and
+    // a second way to point it at a database would be a second thing to get wrong in a client's
+    // configuration.
 }
 
 /// Pinned, or any single memory by id. The verbs that take a list of ids share this.

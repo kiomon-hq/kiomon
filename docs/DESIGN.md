@@ -327,6 +327,126 @@ one volume and 3–5 ms on another for the same binary; a RAM-resident page cach
 second run of anything look fast; and an export's peak *working set* says more about
 `mmap_size` than about the code, so memory claims quote private bytes.
 
+## Two transports, one verb layer
+
+`serve` and `mcp` are in this release and a daemon is not. The distinction is the whole of
+the design: a **transport** answers requests somebody else is already making, and a
+**daemon** is a process the tool depends on. The first is a hundred lines of framing around
+verbs that already exist; the second is a supervisor, a lifecycle, a warm cache and a new
+class of failure — "is the daemon up" — in front of a tool whose promise is that it works
+because the file is there.
+
+So there are three layers and the boundaries are load-bearing:
+
+| Layer | Owns | Never |
+|---|---|---|
+| `kiomon-core` | Every decision: what activates, what a search ranks, what a write stores. | Knows that HTTP or JSON-RPC exists. |
+| `service.rs` | The wire shape: which field, which name, which status. | Decides anything; it calls one core function per verb. |
+| `http.rs` / `mcp.rs` | Framing: bytes in, bytes out. | Reads the database, or knows what a memory is. |
+
+The test of the split is that neither transport owns an answer. `POST /api/retrieve` returns
+the packet's own JSON — not a reshaped copy of it — and `tests/serve.rs` asserts that the
+HTTP packet equals the packet the CLI builds from the same file. A field that appears in one
+door and not the other would be a bug with no place to hide.
+
+### Why the wire is the hosted product's
+
+The published SDKs speak `https://api.kiomon.com`, and `baseUrl` is what points them at a
+local brain. That makes the hosted wire a *contract this engine does not own*: if the local
+`GET /api/graph` spelled its centre `id` while the SDK sent `center_id`, the SDK would work
+online and break offline. So the hosted spellings are primary (`center_id`, `hybrid`,
+`{updated, skipped}`, `review_inbox_url`) and this engine's extras are additive and named —
+never a rename. Where this engine has *more* to say — why a legacy was skipped, which rung
+answered a search, whether a leg degraded — the extra travels beside the hosted field, and
+a hosted client ignores it.
+
+The one place this engine deliberately disagrees is the graph's `origin = 'auto'` filter.
+The hosted query hides auto-links because its auto-link pass is a background scan that
+writes thousands of similarity edges and would flood a drawing; here the only edges most
+brains have are the ≤5 per activation that `add` wrote, so hiding them would make the view
+empty *and* disagree with `relate`, which reads the same rows. `origin` travels on every
+edge, so a client that wants the hosted view can filter — and the divergence is written down
+where a reader of the route will find it.
+
+### The local token, and the three refusals
+
+A loopback socket is not private. Any process on the machine can connect to it; so can a
+page in a browser, which is the one that matters, because a browser can reach `127.0.0.1`
+from a page served by anyone.
+
+Three checks, in order, before routing sees the path:
+
+1. **`Host` must be a loopback name.** DNS rebinding is the attack the token does not stop:
+   `evil.example` resolves to `127.0.0.1`, the browser sends `Host: evil.example`, and the
+   page is now same-origin with this server. The header is the one thing it cannot forge.
+2. **`Origin`, if present, must be loopback.** A cross-origin page's `Origin` is unforgeable;
+   absent means "not a browser", which is what every SDK is.
+3. **The token must match.** `X-API-Key` (what the SDKs send) or `Authorization: Bearer`.
+   This is the check that turns "loopback" into "mine", and it runs before routing so an
+   unauthenticated client cannot map the surface by comparing `401` with `404`.
+
+There is no CORS header, so even a same-origin-in-appearance fetch gets an opaque response.
+The token lives in `<data dir>/serve.token` — beside the database, so two brains are two
+credentials — is created on first run with mode `0600`, and is printed once, because a
+credential nobody can find is a credential nobody uses.
+
+### What a request costs
+
+Measured on the 10 000-memory corpus with `curl` as the client (Python's socket stack costs
+~14 ms per connection on this host, which is bigger than most of the routes, so it is not a
+usable ruler):
+
+| Route | p50 | Note |
+|---|---|---|
+| `GET /health` | 0.5 ms | the transport floor: accept, parse, write |
+| `GET /api/documents/{id}` | 2.3 ms | vs 2.4 ms of `get` work on the CLI |
+| `GET /api/search?q=deploy` | 27.2 ms | vs 26.1 ms of `search` work: the door costs ~1 ms |
+| `POST /api/retrieve` | 31.4 ms | the packet plus the retrieval record |
+
+The server adds about a millisecond to work that already existed, and removes the ~7.5 ms a
+process spawn costs on this platform. That is the argument against a daemon for latency
+reasons: there is nothing left to win. The remaining argument is push (streaming, background
+decay on a timer), and §9-D8 keeps that for v1.2 behind a trigger.
+
+**One connection per request, and a connection per thread.** `rusqlite::Connection` is not
+`Sync`, so a shared handle needs a mutex — and a mutex around the read path serialises the
+one thing worth parallelising. Each request opens the file instead, exactly as a fresh
+`kiomon` process does, into a connection nothing can contend for. Eight workers, one request
+each, `Connection: close`: there is no keep-alive state and no pipelining, which is *why* a
+hand-written parser is safe here rather than foolhardy.
+
+### What is refused by name
+
+`501 unsupported_locally` for `revert` (this engine keeps no revision history), briefings (a
+model composes them), and `depth > 1` on the graph (a path search is not a neighbourhood,
+and answering one with the other is undetectable to the caller). `400` for a graph query with
+no centre, because a whole-graph overview needs a most-connected-nodes ranking this engine
+does not compute.
+
+Every one of those is a route that *exists* in the table and refuses, not a route that falls
+off the end into a `404`. The difference is what a client branches on: "ask again" versus
+"stop asking", and a `404` reads as the first.
+
+### The MCP server
+
+The same verb layer over newline-delimited JSON-RPC on stdin and stdout. Two rules it keeps:
+
+**stdout is the protocol.** Every diagnostic goes to stderr, and the test that proves it
+parses every line the process wrote. A stray `println!` here is not an error a client sees —
+it is a client that hangs, and the failure is a hundred lines away from the cause.
+
+**The tool names are the hosted product's.** An agent's prompt is written against
+`retrieve_memory` and `record_outcome`; a local server that renamed them would make every
+such prompt wrong, and running locally is the thing that is *not* supposed to be visible. The
+three local-only tools (`get_memory_relations`, `link_memories`, `unlink_memories`,
+`list_review_inbox`) are additive, and `get_latest_briefing` is present so that calling it
+says "not available locally" instead of "no such tool" — the same
+absent-versus-not-implemented rule as the routes.
+
+A failed tool answers `isError: true` in its *result*, with the code in `kiomon_error_code`,
+not a JSON-RPC error: a client that receives a protocol error may treat the tool as missing
+rather than as refused, and a model that does that stops using a tool that works.
+
 ## What is deliberately absent
 
 - **A graph leg inside a search.** The graph is here and `relate` walks it, but a walk
@@ -338,14 +458,11 @@ second run of anything look fast; and an export's peak *working set* says more a
   restore comes back with the graph missing, and the export says so. A vector can be
   rebuilt from text; an edge cannot, so this is the one absence in the format that is a real
   loss rather than a saving, and it is recorded as the next thing the format should grow.
-- **A server.** `serve` (loopback HTTP, hosted-compatible routes) and `mcp` (stdio) are v1.1;
-  the daemon trigger is v1.2 and is recorded in §9 of the plan, and any sockets surface must
-  match the hosted `/api/*` contract so the existing SDKs and their conformance tests apply.
-- **Telemetry.** There is none, and no code path that could add one without a dependency
-  appearing in the tree.
-- **An ORM, an async runtime, a datetime crate, a ULID crate, a logging framework.** Each was
-  considered and each is a dependency the budgets did not need to spend: the storage layer is
-  `rusqlite` and hand-written SQL, ids are 40 lines over a CSPRNG, and diagnostics are stderr.
+- **A daemon.** `serve` and `mcp` are transports: they answer requests somebody else is
+  already making, and neither is a process anything depends on. A daemon — warm cache,
+  background decay on a timer, streaming — is §9-D8's v1.2 work behind a trigger, and the
+  measurement is the argument: the transport adds ~1 ms to work that already existed and
+  removes the 7.5 ms a spawn costs, so there is nothing left for a daemon to win on latency.
 
 ## Changing it
 

@@ -19,7 +19,10 @@ pub mod lifecycle;
 pub mod portability;
 pub mod read;
 pub mod setup;
+pub mod transport;
 pub mod write;
+
+use std::path::Path;
 
 use kiomon_core::config;
 use kiomon_core::{Database, Error, ExitCode, Result, Scope};
@@ -62,14 +65,17 @@ pub fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Forget(args) => lifecycle::forget(cli, args),
 
         Command::Export(args) => portability::export(cli, args),
+
+        Command::Serve(args) => transport::serve(cli, args),
+        Command::Mcp(args) => transport::mcp(cli, args),
     }
 }
 
 // WP5 emptied this file of its last caller. `pending` lived here from WP0, when `export`
 // and `import` returned it, and `deferred` from WP4 for the three graph verbs; every verb
 // in the plan's §6.1 now works. `Error::Unimplemented` and `Error::Deferred` stay for the
-// callers that next need them — WP9's `serve` routes and `search --legs graph` — and both
-// are reached from the library rather than from here, because a CLI-level refusal that
+// callers that next need them — `serve`'s unsupported routes and `search --legs graph` — and
+// both are reached from the library rather than from here, because a CLI-level refusal that
 // lived in the dispatch was a refusal with no library behind it.
 
 /// Run the day's decay, if it is due, and report it on stderr.
@@ -121,9 +127,26 @@ pub(crate) fn decay_if_due(db: &Database, scope: &Scope, quiet: bool) {
 /// parse, when its `[embedder]` block is incomplete, and whatever [`Database::open`]
 /// raises.
 pub(crate) fn open(cli: &Cli) -> Result<Database> {
-    let config = config::Config::load(cli.config.as_deref())?;
+    open_paths(cli.db.as_deref(), cli.config.as_deref())
+}
+
+/// The same open, from the two paths rather than from a parsed command line.
+///
+/// `serve` and `mcp` have no `Cli`: they were given a database path at startup and then
+/// answer requests, so the thing they share with the CLI is the two `Option<PathBuf>`s
+/// and not the flag structure. Splitting the function this way is what keeps one
+/// implementation of "where is the brain and which embedder does it have" — the
+/// alternative was a second copy in the transport that would drift on the first change.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] when no path can be resolved, when the config file does not
+/// parse, when its `[embedder]` block is incomplete, and whatever [`Database::open`]
+/// raises.
+pub(crate) fn open_paths(db: Option<&Path>, config_path: Option<&Path>) -> Result<Database> {
+    let config = config::Config::load(config_path)?;
     let embedder = config.embedder()?.map(std::sync::Arc::new);
-    Ok(Database::open(config.resolve_db_path(cli.db.as_deref())?)?.with_embedder(embedder))
+    Ok(Database::open(config.resolve_db_path(db)?)?.with_embedder(embedder))
 }
 
 /// The workspace a command should use when it was not told one.
@@ -136,8 +159,8 @@ pub(crate) fn open(cli: &Cli) -> Result<Database> {
 /// Returns [`Error::Config`] when the config file does not parse. A command that cannot
 /// read the config cannot know which workspace it was meant to use, and guessing is how a
 /// memory lands somewhere its owner will never look.
-pub(crate) fn default_workspace(cli: &Cli) -> Result<String> {
-    let config = config::Config::load(cli.config.as_deref())?;
+pub(crate) fn default_workspace(config_path: Option<&Path>) -> Result<String> {
+    let config = config::Config::load(config_path)?;
     Ok(config::default_workspace(&config))
 }
 
@@ -153,10 +176,14 @@ pub(crate) fn default_workspace(cli: &Cli) -> Result<String> {
 /// # Errors
 ///
 /// Returns [`Error::NotFound`] when the named workspace does not exist.
-pub(crate) fn read_scope(db: &Database, cli: &Cli, workspace: Option<&str>) -> Result<Scope> {
+pub(crate) fn read_scope(
+    db: &Database,
+    config_path: Option<&Path>,
+    workspace: Option<&str>,
+) -> Result<Scope> {
     match workspace.map(str::trim) {
         Some("*") => Ok(Scope::All),
-        other => Ok(Scope::One(write_workspace(db, cli, other)?)),
+        other => Ok(Scope::One(write_workspace(db, config_path, other)?)),
     }
 }
 
@@ -169,7 +196,11 @@ pub(crate) fn read_scope(db: &Database, cli: &Cli, workspace: Option<&str>) -> R
 /// # Errors
 ///
 /// Returns [`Error::Invalid`] for `'*'`, and [`Error::NotFound`] for an unknown name.
-pub(crate) fn write_workspace(db: &Database, cli: &Cli, workspace: Option<&str>) -> Result<String> {
+pub(crate) fn write_workspace(
+    db: &Database,
+    config_path: Option<&Path>,
+    workspace: Option<&str>,
+) -> Result<String> {
     let requested = match workspace.map(str::trim) {
         Some("*") => {
             return Err(Error::Invalid(
@@ -179,7 +210,7 @@ pub(crate) fn write_workspace(db: &Database, cli: &Cli, workspace: Option<&str>)
             ));
         }
         Some(name) if !name.is_empty() => name.to_owned(),
-        _ => default_workspace(cli)?,
+        _ => default_workspace(config_path)?,
     };
     Ok(db.resolve_workspace(&requested)?.id)
 }

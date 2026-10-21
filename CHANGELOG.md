@@ -11,6 +11,23 @@ Every release that changes what a caller can rely on gets an entry here. The for
 
 ### Added
 
+- **`kiomon serve`.** Loopback HTTP/1.1 answering the hosted product's `/api/*` routes, so
+  the published Python and TypeScript SDKs work against a local brain by pointing their
+  `baseUrl` at it. `--port 0` prints the port it chose on one line of stdout, before the
+  first request. A token file beside the database (`X-API-Key` or `Authorization: Bearer`)
+  plus a loopback-only `Host` and `Origin` keep the port to this machine and its agents.
+  Routes this engine cannot answer — `revert`, briefings, a graph walk deeper than one hop —
+  answer `501` with `code: "unsupported_locally"` rather than an empty success, and every
+  route in the plan's Appendix C is asserted route by route.
+- **`kiomon mcp`.** The same verbs as MCP tools on stdin and stdout, under the hosted tool
+  names (`retrieve_memory`, `draft_memory`, `record_outcome`, …) plus three this engine has
+  verbs for and the hosted toolset does not (`get_memory_relations`, `link_memories`,
+  `unlink_memories`). stdout carries protocol frames only; a failed tool is a result with
+  `isError`, not a protocol error, so a client never mistakes a refusal for a missing tool.
+- `GET /api/search` reports this engine's extras beside the hosted fields — which rung
+  answered, which legs ran, and a `warning` when one did not — so a degraded answer cannot
+  be read as "nothing matched".
+
 - **The graph.** Typed directed edges (`derived_from`, `supports`, `contradicts`,
   `supersedes`, `related_to`, `precedes`, `follows`, `part_of`) with `link`, `unlink`,
   `relate` (one hop, with each neighbour's relation, direction, score, title and excerpt)
@@ -29,6 +46,13 @@ Every release that changes what a caller can rely on gets an entry here. The for
 
 ### Changed
 
+- A memory's `workspace_id` cannot be changed by `PATCH /api/documents/{id}`: a workspace is
+  a read boundary and no verb crosses one, so the patch is refused (`501`) rather than
+  half-applied. The hosted route accepts the field; this one says why it does not.
+- `GET /api/graph` does not hide `origin = "auto"` edges the way the hosted query does. A
+  hosted auto-link is a background scan that writes thousands of similarity edges; here the
+  only edges most brains have are the handful `add` wrote, and hiding them would make the
+  route disagree with `relate`, which reads the same rows. `origin` travels on every edge.
 - `link`, `unlink`, `relate` and `get --relations` no longer refuse. The vocabulary grew by
   `supersedes` — the packet had been reading a relation nothing could write — which needed
   migration `0004`, and `link --relation` now takes the wire spellings

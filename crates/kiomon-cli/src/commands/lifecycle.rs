@@ -53,7 +53,7 @@ pub fn review(cli: &Cli, args: &ReviewArgs) -> Result<ExitCode> {
     match &args.command {
         ReviewCommand::List(list) => {
             let query = PendingQuery {
-                scope: read_scope(&db, cli, list.workspace.as_deref())?,
+                scope: read_scope(&db, cli.config.as_deref(), list.workspace.as_deref())?,
                 limit: list.limit,
                 min_confidence: list.min_confidence,
             };
@@ -126,7 +126,7 @@ pub fn review(cli: &Cli, args: &ReviewArgs) -> Result<ExitCode> {
 pub fn outcome(cli: &Cli, args: &OutcomeArgs) -> Result<ExitCode> {
     let db = open(cli)?;
     let scope = if args.workspace.is_some() {
-        read_scope(&db, cli, args.workspace.as_deref())?
+        read_scope(&db, cli.config.as_deref(), args.workspace.as_deref())?
     } else {
         Scope::All
     };
@@ -162,7 +162,7 @@ pub fn decay(cli: &Cli, args: &DecayArgs) -> Result<ExitCode> {
     let scope = if args.all_workspaces {
         Scope::All
     } else {
-        read_scope(&db, cli, None)?
+        read_scope(&db, cli.config.as_deref(), None)?
     };
 
     let outcome = db.decay(&scope, args.dry_run)?;
@@ -301,7 +301,7 @@ pub fn reindex(cli: &Cli, args: &ReindexArgs) -> Result<ExitCode> {
         ));
     }
     let db = open(cli)?;
-    let scope = read_scope(&db, cli, args.workspace.as_deref())?;
+    let scope = read_scope(&db, cli.config.as_deref(), args.workspace.as_deref())?;
     let report = db.reindex_embeddings(&scope, Some(args.limit), args.dry_run)?;
 
     for error in &report.errors {

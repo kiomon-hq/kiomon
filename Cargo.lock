@@ -208,6 +208,7 @@ name = "kiomon-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "getrandom",
  "kiomon-core",
  "serde",
  "serde_json",

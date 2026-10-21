@@ -138,6 +138,26 @@ jobs:
           "$bin" add --db "$tmp/brain.db" --kind semantic --title "smoke test" --body "installed and ran" --confidence 0.9
           "$bin" search --db "$tmp/brain.db" --legs fts smoke | grep -q "smoke test"
 
+          # Both transports, because a release that cannot open its doors is not releasable and
+          # neither door is exercised by the loop above. `mcp` needs no client: one frame in, one
+          # frame out. `serve --once` binds, answers one request and exits, so the handshake is
+          # read and checked without a background server to reap.
+          printf '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n' \
+            | "$bin" --db "$tmp/brain.db" mcp -q | grep -q retrieve_memory
+
+          "$bin" --db "$tmp/brain.db" serve --port 0 --once --json -q > "$tmp/handshake.json" &
+          server=$!
+          for _ in $(seq 1 50); do
+            [ -s "$tmp/handshake.json" ] && break
+            sleep 0.1
+          done
+          url=$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' "$tmp/handshake.json")
+          token=$(tr -d '[:space:]' < "$tmp/serve.token")
+          [ -n "$url" ] || { echo "::error::serve printed no url"; kill "$server" 2>/dev/null; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$url/health" -H "X-API-Key: $token")
+          [ "$code" = "200" ] || { echo "::error::/health answered $code"; kill "$server" 2>/dev/null; exit 1; }
+          wait "$server"
+
       - name: Package
         shell: bash
         run: |

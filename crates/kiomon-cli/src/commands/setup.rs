@@ -80,7 +80,7 @@ pub fn doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
             path: path.display().to_string(),
             schema_version,
             expected_schema_version: Database::target_schema_version(),
-            workspace: super::default_workspace(cli)?,
+            workspace: super::default_workspace(cli.config.as_deref())?,
             environment_db: std::env::var(config::ENV_DB).ok(),
             environment_workspace: std::env::var(config::ENV_WORKSPACE).ok(),
             config: config.source.as_ref().map_or_else(
@@ -265,7 +265,7 @@ fn render_doctor(report: &DoctorReport) {
 /// Whatever opening the database or reading the counts raises.
 pub fn stats(cli: &Cli, args: &StatsArgs) -> Result<ExitCode> {
     let db = open(cli)?;
-    let scope = read_scope(&db, cli, args.workspace.as_deref())?;
+    let scope = read_scope(&db, cli.config.as_deref(), args.workspace.as_deref())?;
     let kinds: Vec<MemoryKind> = args.kind.iter().copied().map(MemoryKind::from).collect();
     let stats = db.stats(&scope, &kinds)?;
 

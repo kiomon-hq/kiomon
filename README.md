@@ -26,12 +26,14 @@ That is the whole product: **save once, query forever**, locally.
 
 **Pre-alpha, and it works.** `init`, `doctor`, `stats`, `add`, `update`, `export`,
 `import`, `get`, `list`, `search`, `retrieve`, `reindex`, `review`, `rate`, `outcome`,
-`decay`, `pin`, `archive`, `restore`, `forget`, `link`, `unlink` and `relate` all run end to
-end against a real SQLite file. The core loop — save something, find it again by a sentence
-or by meaning, ask for what to use next, tell it whether what you found helped, let what
-nobody uses fade, watch what relates to what, and get the whole thing out as a file you own —
-is complete. What is left is the version after this one: `kiomon serve` and `kiomon mcp`
-(v1.1), and a graph *leg* inside a search, which is a ranking walk rather than a read.
+`decay`, `pin`, `archive`, `restore`, `forget`, `link`, `unlink`, `relate`, `serve` and `mcp`
+all run end to end against a real SQLite file. The core loop — save something, find it again
+by a sentence or by meaning, ask for what to use next, tell it whether what you found helped,
+let what nobody uses fade, watch what relates to what, and get the whole thing out as a file
+you own — is complete, and both doors into it are open: `serve` answers the hosted `/api/*`
+routes on a loopback port so the published SDKs work offline, and `mcp` speaks the Model
+Context Protocol on stdin. What is left is a graph *leg* inside a search — a ranking walk,
+not a read — and a daemon, which nothing measures a need for.
 
 The work packages in [`plans/001-local-v1-core.md`](plans/001-local-v1-core.md) §8 are
 being executed in order, and the plan records where reality contradicted it rather than
@@ -74,10 +76,16 @@ long, and one memory in seven containing the word `deploy`.
 | `kiomon retrieve "deploy"` (context packet, lexical) | 24.1 ms | 37.3 ms | 35.8 ms |
 | `kiomon relate <id>` (five neighbours, planted corpus graph) | 2.9 ms | 5.5 ms | 10.8 ms |
 
-Binary **4.1 MiB** from **49** transitive crates. The plan's gates are `open` p50 ≤ 5 ms,
+Binary **4.4 MiB** from **49** transitive crates. The plan's gates are `open` p50 ≤ 5 ms,
 `add` p95 ≤ 40 ms, `search` p95 ≤ 60 ms (lexical) and ≤ 250 ms (hybrid) at ten thousand
 memories: all met, with the first write to a brand-new database file the one number that is
 genuinely expensive — **16.6 ms**, against 3 ms for the next write into the same file.
+
+The two doors cost about the same. `GET /api/search?q=deploy` over loopback is **27.2 ms**
+p50 for the whole request — measured with `curl`, so the socket replaces the 8.2 ms spawn —
+against 34.9 ms total for the same search through the CLI, and `GET /health`, which does no
+work at all, is 0.5 ms. The transport costs a millisecond; a daemon has nothing left to win
+on latency.
 
 The two vector rows come from a later session than the rest of the table, on the same
 machine — its spawn floor was 10.9 ms against 8.2 ms, which is the drift the harness prints
@@ -219,6 +227,11 @@ kiomon relate k_01JC9W5K2Q                # what else is connected to this
 kiomon link k_01JC9W5K2Q k_01JC9W5K3 --relation contradicts
 kiomon export --output brain.jsonl        # the brain as a file you own
 kiomon import --db other.db brain.jsonl   # and back, ids and statuses intact (no edges)
+
+# Both doors, for agents that expect one of the hosted surfaces:
+kiomon serve --port 0                     # /api/search, /api/retrieve, … on loopback
+kiomon mcp                                # the same verbs as MCP tools, over stdio
+
 kiomon doctor                             # integrity, schema version, index agreement
 kiomon stats
 kiomon bench --gate                       # measure this machine against the budget

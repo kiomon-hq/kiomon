@@ -37,6 +37,10 @@ clap = { version = "4.6", default-features = false, features = [
 ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# The serve token, from the operating system's random source. The same version `kiomon-core`
+# already depends on for ULIDs, so this adds no crate to the tree — only the ability to ask
+# for bytes from the binary, which is the one place a long-lived credential is generated.
+getrandom = "0.4"
 
 [lints]
 workspace = true

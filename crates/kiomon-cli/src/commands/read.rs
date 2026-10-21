@@ -28,7 +28,7 @@ use crate::out;
 /// unknown workspace.
 pub fn search(cli: &Cli, args: &SearchArgs) -> Result<ExitCode> {
     let db = open(cli)?;
-    let scope = read_scope(&db, cli, args.workspace.as_deref())?;
+    let scope = read_scope(&db, cli.config.as_deref(), args.workspace.as_deref())?;
 
     // The embedder is asked for one query vector, and it is the only call on this path
     // that can take longer than the whole rest of the command. `--legs fts` exists for
@@ -115,7 +115,7 @@ pub fn search(cli: &Cli, args: &SearchArgs) -> Result<ExitCode> {
 /// whatever the candidate search raises.
 pub fn retrieve(cli: &Cli, args: &RetrieveArgs) -> Result<ExitCode> {
     let db = open(cli)?;
-    let scope = read_scope(&db, cli, args.workspace.as_deref())?;
+    let scope = read_scope(&db, cli.config.as_deref(), args.workspace.as_deref())?;
 
     let packet = db.retrieve(&RetrieveQuery {
         intent: args.intent.into(),
@@ -223,7 +223,7 @@ pub fn relate(cli: &Cli, args: &RelateArgs) -> Result<ExitCode> {
 /// Returns [`Error::NotFound`] for an unknown workspace, and whatever the query raises.
 pub fn list(cli: &Cli, args: &ListArgs) -> Result<ExitCode> {
     let db = open(cli)?;
-    let scope = read_scope(&db, cli, args.workspace.as_deref())?;
+    let scope = read_scope(&db, cli.config.as_deref(), args.workspace.as_deref())?;
 
     // Absent `--status` means `active`, never "everything": a bare `list` must not mix a
     // user's review inbox into their library. `--status any` is how you ask for both.
