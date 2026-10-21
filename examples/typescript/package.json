@@ -1,0 +1,12 @@
+{
+  "name": "kiomon-examples-typescript",
+  "private": true,
+  "type": "module",
+  "description": "The Kiomon TypeScript SDK against a local kiomon serve.",
+  "scripts": {
+    "start": "node quickstart.mjs"
+  },
+  "dependencies": {
+    "@kiomon/kiomon": "^0.1.0"
+  }
+}

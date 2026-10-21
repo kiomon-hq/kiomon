@@ -30,10 +30,25 @@ Every release that changes what a caller can rely on gets an entry here. The for
 - **`DELETE /api/documents/{id}/links/{target}`.** The hosted retraction, engraved with the
   rest of the surface: relation-less, and idempotent — a delete that matched nothing is
   `200 {deleted: false}` rather than the `409` a POST that moved nothing earns.
+- **`examples/` — six working programs, one per door.** `cli-tour.sh` walks the lifecycle with
+  `init`/`add`/`search`/`retrieve`/`link`/`review`/`decay`/`export` on a throwaway brain;
+  `curl.sh` is the HTTP wire with no SDK; `python/` and `typescript/` drive the published SDKs
+  against a `serve` they start themselves; `mcp/` is the config to paste into an MCP host plus a
+  JSON-RPC session that runs; and `crates/kiomon-core/examples/quickstart.rs` is the in-process
+  Rust path. Every one of them was run, and each uses a temporary database so it cannot touch a
+  real brain.
 - **`scripts/sdk_conformance.py` and `scripts/sdk_conformance_ts.mjs`.** The two published
   SDKs, their real transports, and a live `serve`: the check that "the SDKs work against
   `127.0.0.1`" needed, because both suites hand their client a `FakeTransport` and never
   open a socket.
+
+### Fixed
+
+- **`POST /api/memories/batch-draft` accepts `entities`, `claims` and `domain` per learning.**
+  The local request struct was stricter than the hosted schema, so the fields both published
+  SDKs document — the ones that skip a paid extraction pass — were answered with a `400`. Found
+  by the first `draft_memory` call in the Python example rather than by the conformance harness,
+  which only exercised the read routes: a suite is only as wide as the calls it makes.
 
 ### Changed
 

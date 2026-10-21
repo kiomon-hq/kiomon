@@ -1060,6 +1060,56 @@ fn a_pin_written_as_the_integer_the_sdk_sends_reads_back_as_that_integer() {
 }
 
 #[test]
+fn a_draft_may_declare_the_entities_claims_and_domain_the_sdks_send() {
+    // Both published SDKs document these three as the way to skip a paid extraction pass, and
+    // both send them. The local request struct was `deny_unknown_fields` without them, so the
+    // write path answered `400` for a body the hosted product accepts — found by the first
+    // `draft_memory` call in `examples/python/quickstart.py`, not by the conformance harness,
+    // which only made read calls until this test's fix widened it.
+    //
+    // Asserted both ways: the write is accepted *and* the envelope is stored. Silently dropping
+    // the fields would be a quieter version of the same bug.
+    let sandbox = Sandbox::new("wire-draft-metadata");
+    let server = Server::start(&sandbox);
+
+    let reply = server.call(
+        "POST",
+        "/api/memories/batch-draft",
+        Some(
+            r#"{"workspace_id":"default","learnings":[{
+                "kind":"semantic",
+                "title":"A reflection that names its evidence",
+                "body":"The worker retries twice before dead-lettering.",
+                "confidence":0.9,
+                "entities":["worker"],
+                "claims":["a failed job retries twice"],
+                "domain":"infra"
+            }]}"#,
+        ),
+    );
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let body = reply.json();
+    let memory_id = body["memories"][0]["id"]
+        .as_str()
+        .expect("the accepted draft must come back with its id")
+        .to_owned();
+
+    let document = server.call("GET", &format!("/api/documents/{memory_id}"), None);
+    assert_eq!(document.status, 200, "{}", document.body);
+    let document = document.json();
+    assert_eq!(
+        document["memory_metadata"]["entities"],
+        serde_json::json!(["worker"]),
+        "the entities a draft declared were not stored: {}",
+        document["memory_metadata"]
+    );
+    assert_eq!(
+        document["memory_metadata"]["domain"],
+        serde_json::json!("infra")
+    );
+}
+
+#[test]
 fn the_hosted_link_retraction_is_idempotent_rather_than_a_conflict() {
     // `DELETE /api/documents/{id}/links/{targetId}` is in the hosted surface, so it is here:
     // the SDK's own escape hatch reaches it, and a `501` would be a hole for no gain. Two

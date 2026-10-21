@@ -1,0 +1,5 @@
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "session.jsonl", "version": "1.0.0"}}}
+{"jsonrpc": "2.0", "method": "notifications/initialized"}
+{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "draft_memory", "arguments": {"kind": "procedural", "title": "Roll back a bad deploy", "body": "Promote the previous tag, then run the migrations that tag expects.", "tags": ["deploy", "rollback"], "confidence": 0.9}}}
+{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "retrieve_memory", "arguments": {"intent": "execute", "query": "how do I roll back a bad deploy?"}}}
+{"jsonrpc": "2.0", "id": 4, "method": "tools/list"}

@@ -1678,7 +1678,7 @@ path and one `ok: false` envelope on the JSON one; the token survives a restart;
 answers one request and exits `0` (which the release workflow now runs on every target, next
 to one MCP frame).
 
-### The SDK conformance run, and the fifteen things it found
+### The SDK conformance run, and the sixteen things it found
 
 Run 2026-10-21 against `500282a`'s binary, then against the fixed one. The Python run reported
 13 divergences and the TypeScript run 12, overlapping on most; the union is fifteen, and every
@@ -1701,6 +1701,7 @@ one of them is a field a published client declares and this server did not answe
 | 13 | hits carried no `is_large` | the flag that says "fetch the body separately" |
 | 14 | hits carried no `type` | a document facet this engine has no column for, so `null` — but present |
 | 15 | `DELETE /api/documents/{id}/links/{target}` was `501` | the hosted retraction is reachable from an SDK's escape hatch, and a `501` there is a hole, not a decision |
+| 16 | `batch-draft` refused `entities`/`claims`/`domain` | found by the first `draft_memory` call in the Python example, not by the harness: the local request struct was stricter than the hosted schema, so the SDK's documented "skip the extraction pass" fields were a `400` |
 
 **Why the earlier transcription missed them.** Appendix C's tables were written from the
 hosted *routes* — method, path, status — and a route table does not carry a response body. The
@@ -1708,6 +1709,18 @@ required-field lists live one level down, in `types.py` and `types.ts`, and read
 handlers instead of the type declarations is exactly how a summary loses `author`. The fix in
 each case went into `service.rs`'s two renderers (`document_json`, `wire_hits`), so the wire
 shape is now written once and every route that returns a document or a hit uses it.
+
+**A sixteenth, found the next day by writing the examples.** The Python quickstart's first
+`draft_memory` call was refused: `unknown field entities, expected one of kind, title, body,
+excerpt, confidence, tags, source_refs`. The local `Learning` struct had `deny_unknown_fields`
+and the hosted schema does not — `platform/worker/src/routes/memories.ts` takes `entities`,
+`claims` and `domain` per learning, and the TypeScript SDK's `ReflectLearning` documents them as
+"supplying entities, claims and domain skips a paid extraction pass". Both SDKs send them, so
+the 400 was a hole in the write path that no conformance script caught: the harness only ever
+called `search`, `get` and `retrieve`. Three fields and a `metadata::assemble` call in
+`batch_draft` fixed it, and the lesson belongs in the record rather than a commit message:
+**a conformance suite is only as wide as the calls it makes**, and the door most likely to
+diverge is the write one, because it is the only one with a schema on the far side.
 
 **What the second run then found, which reading could not.** Nothing — but only because the
 run before it had already forced the fields into existence. The one class of bug that survived

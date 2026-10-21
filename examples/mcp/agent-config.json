@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "kiomon-local": {
+      "command": "/REPLACE/WITH/ABSOLUTE/PATH/TO/kiomon",
+      "args": ["mcp"],
+      "env": {
+        "KIOMON_DB": "/REPLACE/WITH/ABSOLUTE/PATH/TO/brain.db"
+      }
+    }
+  }
+}

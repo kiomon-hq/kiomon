@@ -137,6 +137,24 @@ jobs:
                         f"{gate['percentile']} <= {gate['limit_ms']} ms")
           EOF
 
+  examples:
+    # The examples are documentation that can rot silently: a flag renamed, a route reshaped,
+    # and the tour keeps "working" only in the reader's imagination. The two that need nothing
+    # but the binary run here on every push. The SDK examples cannot — their clients live in
+    # other repositories — which is what `scripts/sdk_conformance*.{py,mjs}` are for, run by
+    # hand against a machine that has those checkouts.
+    name: examples still run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: The CLI tour, end to end
+        run: bash examples/cli-tour.sh
+      - name: The HTTP door with curl
+        run: bash examples/curl.sh
+
   audit:
     name: security advisories
     runs-on: ubuntu-latest

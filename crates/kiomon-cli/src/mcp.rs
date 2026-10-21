@@ -369,6 +369,12 @@ impl Session<'_> {
                 confidence: arguments.get("confidence").and_then(Value::as_f64),
                 tags: strings(arguments, "tags"),
                 source_refs: strings(arguments, "source_refs"),
+                entities: strings(arguments, "entities"),
+                claims: strings(arguments, "claims"),
+                domain: arguments
+                    .get("domain")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             }],
         };
         Ok(render_draft(&self.service.batch_draft(&request)?))
@@ -542,6 +548,12 @@ fn learning_from(learning: &Value) -> crate::service::Learning {
         confidence: learning.get("confidence").and_then(Value::as_f64),
         tags: string_list(learning, "tags"),
         source_refs: string_list(learning, "source_refs"),
+        entities: string_list(learning, "entities"),
+        claims: string_list(learning, "claims"),
+        domain: learning
+            .get("domain")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     }
 }
 

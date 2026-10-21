@@ -813,6 +813,25 @@ impl Service {
 
         for learning in &request.learnings {
             let kind = parse_kind(&learning.kind)?;
+            let envelope = kiomon_core::metadata::assemble(vec![
+                (
+                    kiomon_core::metadata::KEY_DOMAIN,
+                    learning
+                        .domain
+                        .as_deref()
+                        .map_or(serde_json::Value::Null, |domain| {
+                            serde_json::Value::String(domain.to_owned())
+                        }),
+                ),
+                (
+                    kiomon_core::metadata::KEY_ENTITIES,
+                    kiomon_core::metadata::string_list(&learning.entities),
+                ),
+                (
+                    kiomon_core::metadata::KEY_CLAIMS,
+                    kiomon_core::metadata::string_list(&learning.claims),
+                ),
+            ]);
             let mut new = NewMemory::new(kind, learning.title.clone())
                 .workspace(workspace.clone())
                 .body(learning.body.clone())
@@ -820,6 +839,7 @@ impl Service {
                 .tags(learning.tags.clone())
                 .source("agent_reflection".to_owned())
                 .derived_from(learning.source_refs.clone())
+                .metadata(envelope)
                 .confidence(learning.confidence.unwrap_or(0.5));
             new = new.force(false);
             let outcome = db.add(&new)?;
@@ -1325,6 +1345,20 @@ pub struct Learning {
     /// Ids this learning was reasoned from, wired as `derived_from` edges.
     #[serde(default)]
     pub source_refs: Vec<String>,
+    /// Key entities, when the caller already knows them.
+    ///
+    /// These three are the hosted schema's escape hatch from a paid extraction pass
+    /// (`platform/worker/src/routes/memories.ts`), and both SDKs send them, so refusing
+    /// them here would be a `400` on a request the hosted product accepts. They become the
+    /// same per-kind metadata `add --entities/--claims/--domain` writes.
+    #[serde(default)]
+    pub entities: Vec<String>,
+    /// Verifiable facts the caller already extracted.
+    #[serde(default)]
+    pub claims: Vec<String>,
+    /// Topic label.
+    #[serde(default)]
+    pub domain: Option<String>,
 }
 
 /// `POST /api/memories/batch-draft`

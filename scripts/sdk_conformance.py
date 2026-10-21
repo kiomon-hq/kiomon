@@ -268,6 +268,13 @@ def run(binary: Path, sdk_src: Path) -> int:
                             "confidence": 0.9,
                             "tags": ["conformance"],
                             "source_refs": [hit["id"]],
+                            # The three fields that skip a paid extraction pass. Both SDKs
+                            # document them and both send them, and the local server refused
+                            # them for a day because nothing in this harness ever wrote with
+                            # them: a suite is only as wide as the calls it makes.
+                            "entities": ["worker"],
+                            "claims": ["a conformance run should be able to write"],
+                            "domain": "conformance",
                         }
                     ]
                 )
@@ -275,6 +282,14 @@ def run(binary: Path, sdk_src: Path) -> int:
                 typed(drafted.get("drafted"), "BatchDraftResult.drafted", int)
                 if drafted["memories"]:
                     required(drafted["memories"][0], ["id", "title", "kind"], "BatchDraftMemory")
+                # The envelope the writer sent must survive: if `entities` were silently
+                # dropped rather than refused, that is still a broken write.
+                written = client.get_memory(drafted["memories"][0]["id"])
+                if written.get("memory_metadata"):
+                    check(
+                        "worker" in (written["memory_metadata"].get("entities") or []),
+                        "the entities a draft declared were not stored",
+                    )
 
             # ── context: the orientation read, shape server-defined ──────────────
             context = client.get_workspace_context(topic="deploy")

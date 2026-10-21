@@ -7,5 +7,12 @@
 *.db-shm
 .kiomon/
 
+# The TypeScript example's optional `npm install`.
+node_modules/
+
+# Running the Python examples leaves bytecode behind.
+__pycache__/
+*.pyc
+
 .DS_Store
 Thumbs.db

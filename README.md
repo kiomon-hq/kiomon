@@ -241,6 +241,25 @@ Every command takes `--json`, and `--quiet` on a command that has nothing to say
 means the memory is gone, a `1` means try again, and a `4` means this build cannot serve
 the request — with a message saying why. `docs/CONTRACT.md` is the whole of it.
 
+## Examples
+
+[`examples/`](examples/README.md) is the long form of the quickstart: six working programs, one
+per door, each of which starts what it needs and cleans up after itself.
+
+| Example | Run it |
+|---|---|
+| The CLI lifecycle, annotated | `bash examples/cli-tour.sh` |
+| The HTTP wire with only `curl` | `bash examples/curl.sh` |
+| The Python SDK against a local brain | `python examples/python/quickstart.py` |
+| The same loop an agent should run | `python examples/python/agent_loop.py` |
+| The TypeScript SDK | `node examples/typescript/quickstart.mjs` |
+| MCP over stdio, config and frames | `python examples/mcp/session.py` |
+| The Rust SDK (in process, no socket) | `cargo run --example quickstart -p kiomon-core` |
+
+They use a throwaway database unless you tell them otherwise, so running one cannot touch your
+real brain. [What to remember, and what to expect back](examples/README.md#4-what-to-remember-and-what-to-expect-back)
+is the part worth reading even if you skip the code.
+
 ## Building
 
 ```sh
@@ -257,9 +276,10 @@ cargo fmt --check
 | Database | `--db <PATH>`, else `$KIOMON_DB`, else the platform data directory, else `~/.kiomon/brain.db` |
 | Default workspace | `$KIOMON_WORKSPACE`, else `default` |
 
-Flags beat the environment. There is no config file yet — the embedder (v1.1) is the first
-thing that needs one, and it will bring a real TOML dependency rather than a hand-rolled
-subset.
+Flags beat the environment, and the config file comes last. The config file is
+`<data dir>/config.toml` (`--config` or `$KIOMON_CONFIG` to move it) and holds the default
+workspace and the `[embedder]` block; `kiomon doctor` prints the path it resolved. A brain with
+no config file is a full-text brain, not an error.
 
 ## Contributing
 
