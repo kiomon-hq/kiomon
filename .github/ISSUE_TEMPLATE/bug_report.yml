@@ -27,7 +27,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: `kiomon --version`
+      label: "`kiomon --version`"
       description: The version **and** the git commit, because a bug report needs both.
       placeholder: 0.1.0 (git 1a2b3c4)
     validations:
@@ -57,7 +57,7 @@ body:
   - type: textarea
     id: doctor
     attributes:
-      label: `kiomon doctor` output
+      label: "`kiomon doctor` output"
       description: >
         Redact anything private first — it prints the database path and the config path.
         If `doctor` itself cannot run, say so and skip this field; that is the bug.

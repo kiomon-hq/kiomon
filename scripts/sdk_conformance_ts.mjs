@@ -36,8 +36,9 @@ const argOf = (name, fallback) => {
 };
 const here = dirname(fileURLToPath(import.meta.url));
 const binary = resolve(argOf("bin", join(here, "..", "target", "release", "kiomon")));
-// The SDKs live beside this project (`MEMORY-INFRASTRUCTURE/SDK`), one level above the
-// `KIOMON` directory this repository sits in — so the default climbs out of both.
+// The default climbs out of this repository into the maintainer's checkout, where the SDKs
+// sit in a sibling directory. Anybody else passes `--client` pointing at a clone of
+// kiomon-hq/typescript-sdk's sdk/dist/index.js; that is why the flag exists.
 const clientPath = resolve(argOf("client", join(here, "..", "..", "..", "SDK", "kiomon-ts", "sdk", "dist", "index.js")));
 
 const home = mkdtempSync(join(tmpdir(), "kiomon-conformance-ts-"));

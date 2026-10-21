@@ -11,7 +11,10 @@ user would use the SDK: construct it, call the methods, read the fields.
 Run it against a build:
 
     python3 scripts/sdk_conformance.py --bin target/release/kiomon \
-        --sdk ../SDK/kiomon-py/src
+        --sdk ../python-sdk/src
+
+`--sdk` is a clone of `kiomon-hq/python-sdk`; its default climbs out of this repository
+into the maintainer's checkout, where the SDKs sit in a sibling directory.
 
 It starts its own `serve` on `--port 0`, writes into a temporary directory, and exits non-zero
 with a list of divergences. Every check names the SDK field it is standing on, so a failure
