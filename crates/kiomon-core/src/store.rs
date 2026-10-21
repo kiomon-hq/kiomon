@@ -1285,9 +1285,14 @@ fn find_duplicate_near(
 ) -> Option<Memory> {
     let mut statement = conn
         .prepare(&format!(
+            // `mem_id` and not `id` as the last tiebreak: it is the rowid, so it is
+            // insertion order by construction. `id` is a ULID, whose ordering inside one
+            // millisecond is the random half — two writes in the same millisecond would
+            // otherwise report the newer row as the existing one, and the older row is the
+            // one carrying the retrievals and ratings this answer is about.
             "SELECT {MEMORY_COLUMNS} FROM memories
              WHERE workspace_id = ?1 AND content_hash = ?2
-             ORDER BY (status = 'active') DESC, created_at ASC, id ASC
+             ORDER BY (status = 'active') DESC, created_at ASC, mem_id ASC
              LIMIT 1"
         ))
         .ok()?;

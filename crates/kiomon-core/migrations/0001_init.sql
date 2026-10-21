@@ -22,8 +22,10 @@ CREATE TABLE workspaces (
 --
 -- `mem_id` is an INTEGER PRIMARY KEY because it is the rowid, and every index and
 -- every join in the read path prefers an integer over a 26-character string. `id`
--- is the agent-facing handle, `k_<ulid>`, and it is time-sortable so `ORDER BY id`
--- is `ORDER BY created_at` without the second column.
+-- is the agent-facing handle, `k_<ulid>`, time-prefixed to the millisecond: for rows
+-- more than a millisecond apart `ORDER BY id` is `ORDER BY created_at`, and inside one
+-- millisecond the order is the random half — stable, not chronological. Anything that
+-- means "the row that was here first" orders by `mem_id`.
 -- ---------------------------------------------------------------------------
 CREATE TABLE memories (
     mem_id            INTEGER PRIMARY KEY,

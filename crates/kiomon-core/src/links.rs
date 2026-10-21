@@ -16,10 +16,12 @@
 //! same statement, and the table's `UNIQUE (source_id, target_id, relation)` cannot prevent
 //! both rows existing — the constraint does not know that the reverse pair is the same
 //! edge. So a symmetric edge is canonicalised before it is written: the lexicographically
-//! smaller id is the source. ULIDs sort by creation time, so the rule reads as "the older
-//! memory is the source", and it makes the write idempotent from either end. `relate` reads
-//! both columns, so the canonicalisation is invisible to a caller and only visible in the
-//! stored row.
+//! smaller id is the source. Ids are time-prefixed, so for two memories written more than a
+//! millisecond apart that is also the older one — and inside a single millisecond it is
+//! merely a stable choice, because a ULID's ordering there comes from its random half. That
+//! is enough, and it is all the rule claims: the canonicalisation exists to make the write
+//! idempotent from either end, not to record an age. `relate` reads both columns and reports
+//! no direction for a symmetric relation, so nothing a caller sees depends on which end won.
 //!
 //! **A draft has no edges, in either direction.** The review inbox's promise is that a
 //! memory waiting for approval cannot be found by *any* read path, and an edge is a read
@@ -270,8 +272,8 @@ impl Database {
                         )
                     })?;
                 // The stored direction is only a fact for a directed relation. For
-                // `related_to` it is a canonicalisation, and reporting it would tell the
-                // caller that the older memory "is related out to" the newer one.
+                // `related_to` it is a canonicalisation, and reporting it would invent a
+                // direction the caller never wrote.
                 let directed: i64 = row.get(1)?;
                 Ok(Neighbour {
                     memory_id: row.get(5)?,
@@ -578,13 +580,20 @@ mod tests {
         let first = testing::add(&db, MemoryKind::Semantic, "first", "a");
         let second = testing::add(&db, MemoryKind::Semantic, "second", "b");
 
-        // Written from the later memory towards the earlier one, which is the order the
-        // canonicalisation has to reverse.
+        // Whichever end wins is the smaller id, not the earlier write: two ids minted in
+        // the same millisecond order by their random half. So the expectation is computed
+        // rather than assumed, and the property under test is that the pair is the same
+        // sorted pair from either direction.
+        let (smaller, larger) = if first < second {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
         let outcome = link_to(&db, &second, &first, Relation::RelatedTo);
         assert_eq!(
             (outcome.source_id.as_str(), outcome.target_id.as_str()),
-            (first.as_str(), second.as_str()),
-            "the smaller id — the older memory — is the stored source"
+            (smaller.as_str(), larger.as_str()),
+            "the smaller id is the stored source, and the pair is written in that order"
         );
 
         // The other order is the same edge, not a second one.
@@ -1048,10 +1057,11 @@ mod tests {
     }
 
     #[test]
-    fn the_canonical_order_is_the_older_memory() {
-        // ULIDs sort by creation time, so "smaller id first" is "the memory that was here
-        // first", which is a rule a reader can state. The three cases below pin the rule
-        // rather than the sort.
+    fn the_canonical_order_is_the_smaller_id() {
+        // The rule is lexical, and it is stated lexically: an id carries a millisecond, so
+        // inside one millisecond "smaller" is the random half and says nothing about age.
+        // A rule that claims to be about age would be wrong on a fast machine. The three
+        // cases below pin the rule rather than the sort.
         assert_eq!(
             canonical_pair("k_02", "k_01", Relation::RelatedTo),
             ("k_01".to_owned(), "k_02".to_owned())

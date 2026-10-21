@@ -246,10 +246,13 @@ fn platform_data_dir() -> Option<PathBuf> {
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg).join(APP_DIR));
-            }
+        // A `let` chain, so this reads as one condition: the variable is set *and* it names
+        // a directory. An empty `XDG_DATA_HOME` is set-but-unusable, and falling through to
+        // `~/.local/share` is the behaviour the XDG spec asks for.
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
+            && !xdg.is_empty()
+        {
+            return Some(PathBuf::from(xdg).join(APP_DIR));
         }
         home_dir().map(|home| home.join(".local").join("share").join(APP_DIR))
     }
